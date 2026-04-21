@@ -1,0 +1,45 @@
+{
+  "network": "preprod",
+  "materios": {
+    "rpcWs": "wss://materios.fluxpointstudios.com/preprod-rpc",
+    "genesisHash": "0xbc0531cb311281565036fb397a376f0e0fa37005589655f97a7924b2729a164c",
+    "chainId": "bc0531cb311281565036fb397a376f0e0fa37005589655f97a7924b2729a164c",
+    "blockTimeSec": 6
+  },
+  "cardano": {
+    "network": "Preprod",
+    "ogmiosUrl": "https://preprod.saturnswap.io/ogmios",
+    "kupoUrl": "https://preprod.saturnswap.io/kupo",
+    "blockfrostProjectId": "preprodPLACEHOLDER",
+    "explorerTxBase": "https://preprod.cexplorer.io/tx",
+    "explorerAddrBase": "https://preprod.cexplorer.io/address",
+    "metadataLabels": {
+      "batchAnchor": 8746,
+      "poiAnchor": 2222
+    }
+  },
+  "aegisValidators": {
+    "aegisPolicyV1ScriptHash": "__TEAM_B_WILL_POPULATE__",
+    "aegisPolicyV1Address": "__TEAM_B_WILL_POPULATE__",
+    "premiumCollectorScriptHash": "__TEAM_B_WILL_POPULATE__",
+    "premiumCollectorAddress": "__TEAM_B_WILL_POPULATE__",
+    "poolCustodyScriptHash": "__TEAM_B_WILL_POPULATE__",
+    "poolCustodyAddress": "__TEAM_B_WILL_POPULATE__",
+    "deployedInTx": "__TEAM_B_WILL_POPULATE__"
+  },
+  "testAccounts": {
+    "submitter": {
+      "materiosSs58": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+      "comment": "//Alice — dev chain account. Replace with real preprod faucet-funded account for production demo."
+    }
+  },
+  "committee": {
+    "threshold": 2,
+    "comment": "Pulled live from pallet_committee_governance::Members at demo-start; this is just the expected config."
+  },
+  "charli3": {
+    "preprodFeedPolicyId": "__OPEN_ITEM_#1_FETCH_FROM_CHARLI3_DOCS__",
+    "preprodFeedAssetName": "ADAUSD",
+    "stalenessBoundSlots": 300
+  }
+}
