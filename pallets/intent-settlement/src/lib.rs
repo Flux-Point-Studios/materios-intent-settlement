@@ -20,6 +20,7 @@ extern crate alloc;
 
 pub use pallet::*;
 pub mod types;
+pub mod voucher_canonicalize;
 
 #[cfg(test)]
 mod tests;
