@@ -1,0 +1,5 @@
+[toolchain]
+channel = "1.85.0"
+components = ["rustc", "cargo", "rust-std"]
+targets = []
+profile = "minimal"
