@@ -1,0 +1,58 @@
+{
+  "_readme": "Canonical test vectors for Materios Intent-Settlement Layer spec v1. All hashes = Blake2b-256 (sp_core::hashing::blake2_256). See docs/spec-v1.md \u00a71 for pre-image layouts. Team A pallets and Team B Aiken validator must both reproduce these byte-for-byte.",
+  "intent_id": {
+    "_description": "IntentKind::BuyPolicy variant. Pre-image: b'INTT' || submitter || nonce(LE64) || scale(kind) || submitted_block(LE32).",
+    "submitter_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+    "nonce": 42,
+    "submitted_block": 100,
+    "kind": {
+      "variant": "BuyPolicy",
+      "product_id_hex": "abababababababababababababababababababababababababababababababab",
+      "strike": 500000,
+      "term_slots": 86400,
+      "premium_ada": 2000000,
+      "addr_hex": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"
+    },
+    "expected_hex": "b454028020a329e99955950396e0bd8cfe397e3fbcca73839ddcc72b47d8fd12"
+  },
+  "committee_set_digest": {
+    "_description": "Pre-image: b'CMTT' || scale(Vec<[u8;32]>) || threshold(LE32).",
+    "pubkeys_hex": [
+      "0101010101010101010101010101010101010101010101010101010101010101",
+      "0202020202020202020202020202020202020202020202020202020202020202",
+      "0303030303030303030303030303030303030303030303030303030303030303"
+    ],
+    "threshold": 2,
+    "expected_hex": "601ec5129f7e1c7324155c5c7f6a455ede0fa1514ac22620f99a277d95ea58cb"
+  },
+  "bfpr_digest": {
+    "_description": "Pre-image: b'BFPR' || scale(BatchFairnessProof). Fields per \u00a71.6.",
+    "batch_block_range": [
+      1,
+      3
+    ],
+    "sorted_intent_ids_hex": [
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ],
+    "requested_amounts_ada": [
+      1000000
+    ],
+    "pool_balance_ada": 100000000,
+    "pro_rata_scale_bps": 10000,
+    "awarded_amounts_ada": [
+      1000000
+    ],
+    "expected_hex": "72f31833636eac4e54908cb1597c7ebb4d5a99838e7645833262f729b65f891a"
+  },
+  "voucher_digest": {
+    "_description": "Pre-image: b'VCHR' || claim_id || policy_id || scale(addr) || amount(LE64) || bfpr_digest || issued_block(LE32) || expiry_slot(LE64). Per \u00a71.7, addr is SCALE-encoded as BoundedVec<u8> (compact-len prefix).",
+    "claim_id_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "policy_id_hex": "9999999999999999999999999999999999999999999999999999999999999999",
+    "addr_hex": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+    "amount_ada": 2000000,
+    "bfpr_digest_hex": "72f31833636eac4e54908cb1597c7ebb4d5a99838e7645833262f729b65f891a",
+    "issued_block": 4,
+    "expiry_slot_cardano": 100000,
+    "expected_hex": "7c58312ac808c92e089d0f16d1a58939b009aefffeb4a125acd96088726c479e"
+  }
+}

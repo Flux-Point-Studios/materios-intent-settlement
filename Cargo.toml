@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "pallets/intent-settlement",
+    "pallets/committee-governance",
+]
+
+[workspace.package]
+authors = ["Flux Point Studios <noreply@anthropic.com>"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Flux-Point-Studios/materios-intent-settlement"
+
+[workspace.dependencies]
+# Parity SCALE codec
+parity-scale-codec = { version = "3.6.12", default-features = false, features = ["derive"] }
+scale-info = { version = "2.11", default-features = false, features = ["derive"] }
+
+# Substrate / polkadot-sdk (pinned to Materios main: polkadot-stable2409-4)
+frame-support = { git = "https://github.com/paritytech/polkadot-sdk.git", tag = "polkadot-stable2409-4", default-features = false }
+frame-system = { git = "https://github.com/paritytech/polkadot-sdk.git", tag = "polkadot-stable2409-4", default-features = false }
+frame-benchmarking = { git = "https://github.com/paritytech/polkadot-sdk.git", tag = "polkadot-stable2409-4", default-features = false }
+pallet-balances = { git = "https://github.com/paritytech/polkadot-sdk.git", tag = "polkadot-stable2409-4", default-features = false }
+sp-api = { git = "https://github.com/paritytech/polkadot-sdk.git", tag = "polkadot-stable2409-4", default-features = false }
+sp-core = { git = "https://github.com/paritytech/polkadot-sdk.git", tag = "polkadot-stable2409-4", default-features = false }
+sp-runtime = { git = "https://github.com/paritytech/polkadot-sdk.git", tag = "polkadot-stable2409-4", default-features = false }
+sp-std = { git = "https://github.com/paritytech/polkadot-sdk.git", tag = "polkadot-stable2409-4", default-features = false }
+sp-io = { git = "https://github.com/paritytech/polkadot-sdk.git", tag = "polkadot-stable2409-4", default-features = false }
+sp-keyring = { git = "https://github.com/paritytech/polkadot-sdk.git", tag = "polkadot-stable2409-4" }
+
+# Local crates
+pallet-intent-settlement = { path = "pallets/intent-settlement", default-features = false }
+pallet-committee-governance = { path = "pallets/committee-governance", default-features = false }
+
+# Misc
+log = { version = "0.4", default-features = false }
+hex-literal = "0.4"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false }
+
+# Dev deps
+proptest = "1.4"
+assert_matches = "1.5"
+
+# Pin `url` to 2.5.x so the resolver picks idna <1.0 (Rust 1.85 compatibility, matches Materios main)
+url = ">=2.5, <2.6"
+idna = ">=0.5, <1"
+ahash = ">=0.8, <0.8.12"
+jobserver = ">=0.1, <0.1.33"
+tempfile = ">=3, <3.19"
+time = ">=0.3, <0.3.40"
+
+[patch.crates-io]
+
