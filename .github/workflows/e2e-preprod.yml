@@ -1,0 +1,123 @@
+name: e2e-preprod
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow the aegis-parametric-insurance-dev repo (Team B) to dispatch
+  # an E2E run when their Aiken validators redeploy to preprod.
+  repository_dispatch:
+    types: [team-b-validators-redeployed]
+  workflow_dispatch:
+    inputs:
+      live:
+        description: 'If "true", execute the full E2E against preprod. Else just unit-tests.'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: e2e-preprod-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────
+  # Always-on: unit tests + coverage gate (≥80%) for Team D helpers.
+  # ──────────────────────────────────────────────────────────────────────
+  unit:
+    name: unit tests + coverage (≥80%)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: e2e
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: e2e/pnpm-lock.yaml
+
+      - name: install
+        run: pnpm install --frozen-lockfile || pnpm install
+
+      - name: typecheck
+        run: pnpm typecheck
+
+      - name: unit tests + coverage
+        run: pnpm test:coverage
+
+      - name: upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.run_id }}
+          path: e2e/coverage/
+          retention-days: 14
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Setup-script idempotency test.
+  # ──────────────────────────────────────────────────────────────────────
+  setup-idempotent:
+    name: setup-preprod.sh is idempotent
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: e2e/pnpm-lock.yaml
+      - name: first run
+        run: cd e2e && ./scripts/setup-preprod.sh
+      - name: second run (must not error)
+        run: cd e2e && ./scripts/setup-preprod.sh
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Live preprod run — opt-in only (workflow_dispatch with live=true,
+  # or repository_dispatch from Team B). Does NOT run on every PR to
+  # avoid rate-limiting the Materios preprod RPC.
+  # ──────────────────────────────────────────────────────────────────────
+  live:
+    name: live preprod E2E (opt-in)
+    runs-on: ubuntu-latest
+    needs: [unit, setup-idempotent]
+    if: >-
+      github.event_name == 'repository_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.live == 'true')
+    defaults:
+      run:
+        working-directory: e2e
+    env:
+      MATERIOS_E2E_LIVE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: e2e/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile || pnpm install
+      - name: setup preprod environment
+        run: ./scripts/setup-preprod.sh
+      - name: full demo (capture artifacts)
+        run: ./scripts/demo-reel.sh
+      - name: upload demo artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-run-${{ github.run_id }}
+          path: e2e/artifacts/
+          retention-days: 30
