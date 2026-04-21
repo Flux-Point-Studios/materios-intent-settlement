@@ -45,6 +45,7 @@ export {
   intentIdPreimage,
   encodeIntentKind,
   voucherDigest,
+  voucherDigestWithAddress,
   fairnessProofDigest,
   validateFairnessProof,
   domainHash,
@@ -54,6 +55,24 @@ export {
   u32LE,
   compactCompactLen,
 } from "./hashing.js";
+
+export {
+  encodeType0AddressCbor,
+  splitType0AddressBytes,
+} from "./cardano-address.js";
+export type { Type0AddressHashes } from "./cardano-address.js";
+
+export {
+  buildAegisPolicyParams,
+  buildPremiumDepositDatum,
+  buildRefundCredit,
+  buildRefundDeposit,
+  buildSinglePointValidityRange,
+  assertSinglePointValidityRange,
+  collectMintSignatories,
+  canonicalVoucherBody,
+} from "./builders.js";
+export type { ISignerWallet } from "./builders.js";
 
 export {
   computeKeeperFeeLovelace,
@@ -90,4 +109,10 @@ export type {
   CommitteeDaemonConfig,
   DaemonState,
   DirectClaimParams,
+  // Team B merged Aiken schema (round-2 additions)
+  ScriptHash,
+  AegisPolicyParams,
+  PremiumDepositDatum,
+  RefundRedeemerFields,
+  ValidityRange,
 } from "./types.js";
