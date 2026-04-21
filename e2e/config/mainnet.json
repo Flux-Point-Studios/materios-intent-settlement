@@ -1,0 +1,19 @@
+{
+  "network": "mainnet",
+  "_comment": "Empty placeholder. Populated only after audit + committee expansion to 5-of-11 (spec §6.6). DO NOT run the E2E demo against mainnet until this file is reviewed and signed off.",
+  "materios": {
+    "rpcWs": "__GATED_ON_MAINNET_LAUNCH__",
+    "genesisHash": "__GATED_ON_MAINNET_LAUNCH__"
+  },
+  "cardano": {
+    "network": "Mainnet",
+    "ogmiosUrl": "__GATED_ON_AUDIT__",
+    "kupoUrl": "__GATED_ON_AUDIT__",
+    "explorerTxBase": "https://cexplorer.io/tx",
+    "metadataLabels": {
+      "batchAnchor": 8746,
+      "poiAnchor": 2222
+    }
+  },
+  "aegisValidators": {}
+}
