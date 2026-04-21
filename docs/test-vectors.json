@@ -47,7 +47,7 @@
     "payment_vk_hash_hex": "957887100ebe5f9b0f9f24968f021ef705b25c7aaa633258e288e0ae",
     "stake_vk_hash_hex": "1fe36222d4d45a1c70bfb94b65b3b8ce1adf2a94913d67c32212694c",
     "beneficiary_address_cbor_hex": "d8799fd8799f581c957887100ebe5f9b0f9f24968f021ef705b25c7aaa633258e288e0aeffd8799fd8799fd8799f581c1fe36222d4d45a1c70bfb94b65b3b8ce1adf2a94913d67c32212694cffffffff",
-    "_beneficiary_address_cbor_note": "Plutus V3 CBOR: constr-0 of [constr-0(VK payment_hash), constr-0(constr-0(constr-0(VK stake_hash)))]. Uses INDEFINITE-LENGTH array encoding (0xd8799f...ff), NOT definite (0xd87982...). Length = 85 bytes.",
+    "_beneficiary_address_cbor_note": "Plutus V3 CBOR: constr-0 of [constr-0(VK payment_hash), constr-0(constr-0(constr-0(VK stake_hash)))]. Uses INDEFINITE-LENGTH array encoding (0xd8799f...ff), NOT definite (0xd87982...). Length = 80 bytes.",
 
     "claim_id_hex": "cc00000000000000000000000000000000000000000000000000000000000000",
     "policy_id_hex": "abcd000000000000000000000000000000000000000000000000000000000000",
@@ -63,7 +63,7 @@
     "fee_lovelace": 500000,
     "_fee_lovelace_note": "Not in the canonical voucher pre-image (fee is a separate keeper-fee redeemer field). Included here for Team A/C builder reference only.",
 
-    "_canonical_body_layout": "claim_id(32B) || policy_id(32B) || beneficiary_address_cbor(85B) || amount_ada_u64_le(8B) || bfpr_digest(32B) || issued_block_u32_le(4B) || expiry_slot_cardano_u64_le(8B) = 201B total",
+    "_canonical_body_layout": "claim_id(32B) || policy_id(32B) || beneficiary_address_cbor(80B) || amount_ada_u64_le(8B) || bfpr_digest(32B) || issued_block_u32_le(4B) || expiry_slot_cardano_u64_le(8B) = 196B total",
 
     "expected_hex": "ae73d78970eb486376fb9d5e4d00cba0a5b2a2200c935d942cc258b12a7f8405",
     "_expected_hex_note": "blake2b_256(tag_voucher ++ canonical_body) = blake2b_256(b\"VCHR\" ++ body). Aiken pinned source-of-truth: test_vectors.ak::vec_pinned_vchr_with_address."
