@@ -1151,8 +1151,10 @@ fn test_vectors_match_json() {
         include_str!("../../../docs/test-vectors.json");
     let v: serde_json::Value = serde_json::from_str(vectors).unwrap();
 
-    // intent_id vector
-    let iv = &v["intent_id"];
+    // intent_id vector (moved under `teamA_realistic_vectors` namespace in
+    // docs/test-vectors.json v1.1 when the three-way voucher_digest_with_address
+    // anchor landed — see commit f189092).
+    let iv = &v["teamA_realistic_vectors"]["intent_id"];
     let submitter: [u8; 32] = hex::decode(iv["submitter_hex"].as_str().unwrap())
         .unwrap()
         .try_into()
@@ -1182,8 +1184,8 @@ fn test_vectors_match_json() {
         .unwrap();
     assert_eq!(got.as_bytes(), &expected, "intent_id vector mismatch");
 
-    // committee_set_digest vector
-    let cv = &v["committee_set_digest"];
+    // committee_set_digest vector (same relocation as above).
+    let cv = &v["teamA_realistic_vectors"]["committee_set_digest"];
     let mut pubkeys = Vec::new();
     for entry in cv["pubkeys_hex"].as_array().unwrap() {
         let b: [u8; 32] = hex::decode(entry.as_str().unwrap())
