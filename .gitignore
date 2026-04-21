@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+coverage/
+.DS_Store
+.env
+.env.local
+.env.*.local
+daemon-state.json
+keeper-state.json
+*.tsbuildinfo

@@ -1,0 +1,78 @@
+{
+  "name": "@fluxpointstudios/materios-intent-settlement-keeper",
+  "version": "0.1.0",
+  "description": "Permissionless keeper + committee daemon for Materios intent-settlement. Reads Materios via RPC, batches intents, submits Cardano txs, settles back.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./daemon": {
+      "import": {
+        "types": "./dist/daemon/index.d.ts",
+        "default": "./dist/daemon/index.js"
+      }
+    }
+  },
+  "bin": {
+    "materios-keeper": "./dist/cli/keeper.js",
+    "aegis-committee-daemon": "./dist/cli/daemon.js"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "start:keeper": "node --enable-source-maps dist/cli/keeper.js",
+    "start:daemon": "node --enable-source-maps dist/cli/daemon.js",
+    "test": "vitest run",
+    "test:unit": "vitest run src",
+    "test:integration": "vitest run tests/integration",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "clean": "rimraf dist"
+  },
+  "keywords": [
+    "materios",
+    "cardano",
+    "keeper",
+    "relayer",
+    "committee",
+    "aegis",
+    "intent-settlement"
+  ],
+  "author": "Flux Point Studios",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@fluxpointstudios/materios-intent-settlement-sdk": "workspace:*",
+    "@fluxpointstudios/orynq-sdk-anchors-materios": "^0.3.0",
+    "@meshsdk/core": "^1.8.0",
+    "@polkadot/api": "^14.0.0",
+    "@polkadot/keyring": "^13.0.0",
+    "@polkadot/util": "^13.0.0",
+    "@polkadot/util-crypto": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@vitest/coverage-v8": "^2.1.0",
+    "rimraf": "^5.0.10",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
