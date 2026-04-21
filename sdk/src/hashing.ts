@@ -179,6 +179,45 @@ export function voucherDigest(voucher: Voucher): HexString {
 }
 
 /**
+ * Voucher digest with beneficiary as Plutus V3 Data CBOR (three-way parity).
+ *
+ * Matches Team B's merged Aiken `canonical_voucher_body` which raw-concats
+ * the CBOR-encoded beneficiary (NO SCALE length prefix). Use this for any
+ * voucher that will be verified against aegis-policy-v1 on Cardano.
+ *
+ * Anchored in `docs/test-vectors.json::voucher_digest_with_address` at
+ * `ae73d78970eb486376fb9d5e4d00cba0a5b2a2200c935d942cc258b12a7f8405`.
+ */
+export function voucherDigestWithAddress(args: {
+  claimId: HexString;
+  policyId: HexString;
+  /** Plutus V3 Data CBOR of the beneficiary Address — use `encodeType0AddressCbor`. */
+  beneficiaryAddressCbor: Uint8Array;
+  amountAda: bigint;
+  batchFairnessProofDigest: HexString;
+  issuedBlock: number;
+  expirySlotCardano: bigint;
+}): HexString {
+  const claimId = hexToU8a(args.claimId);
+  const policyId = hexToU8a(args.policyId);
+  const bfpr = hexToU8a(args.batchFairnessProofDigest);
+  if (claimId.length !== 32) throw new Error("claimId must be 32B");
+  if (policyId.length !== 32) throw new Error("policyId must be 32B");
+  if (bfpr.length !== 32) throw new Error("bfpr digest must be 32B");
+
+  const body = u8aConcat(
+    claimId,
+    policyId,
+    args.beneficiaryAddressCbor,
+    u64LE(args.amountAda),
+    bfpr,
+    u32LE(args.issuedBlock),
+    u64LE(args.expirySlotCardano),
+  );
+  return domainHashHex(DomainTag.Voucher, body);
+}
+
+/**
  * BatchFairnessProof digest (§1.6):
  *   domain_hash(b"BFPR", scale_encode(BatchFairnessProof))
  *

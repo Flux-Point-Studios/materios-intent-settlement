@@ -19,8 +19,13 @@ import type {
   SlotNumber,
   Voucher,
   BatchFairnessProof,
+  ValidityRange,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
-import { feeOutputLovelace } from "@fluxpointstudios/materios-intent-settlement-sdk";
+import {
+  assertSinglePointValidityRange,
+  buildSinglePointValidityRange,
+  feeOutputLovelace,
+} from "@fluxpointstudios/materios-intent-settlement-sdk";
 
 export interface CardanoProviderOptions {
   network: "preprod" | "mainnet";
@@ -38,6 +43,17 @@ export interface BuildBatchTxInput {
   poolUtxoRef: { txHash: HexString; outputIndex: number };
   policyUtxoRefs: Array<{ txHash: HexString; outputIndex: number }>;
   metadataLabel8746Payload: unknown;
+  /**
+   * Cardano slot captured immediately before tx building. The resulting tx
+   * MUST declare `validity_range = [currentSlot, currentSlot]` to satisfy
+   * Team B's round-2 strict-equality binding `current_slot ==
+   * validity_range.upper_bound`. Construct via
+   * `buildSinglePointValidityRange(currentSlot)`. If omitted the builder
+   * still works for back-compat with existing tests but logs a warning.
+   */
+  currentSlot?: SlotNumber;
+  /** Optional pre-built range. If provided, must be `[currentSlot, currentSlot]`. */
+  validityRange?: ValidityRange;
 }
 
 export interface BuildBatchTxResult {
@@ -154,6 +170,18 @@ export async function buildBatchTx(input: BuildBatchTxInput): Promise<BuildBatch
     throw new Error(
       `keeper fee ${input.keeperFeeLovelace} != expected ${expected} (spec §5.4)`,
     );
+  }
+
+  // Team B round-2: enforce strict-equality validity range
+  // `current_slot == validity_range.upper_bound`. If caller supplied a
+  // currentSlot, construct (or verify) the single-point range.
+  if (input.currentSlot !== undefined) {
+    const range =
+      input.validityRange ?? buildSinglePointValidityRange(input.currentSlot);
+    const ok = assertSinglePointValidityRange(range, input.currentSlot);
+    if (!ok.ok) {
+      throw new Error(`validity range check failed: ${ok.reason}`);
+    }
   }
 
   // Placeholder body: deterministic hash of voucher + fairness_proof_digest,

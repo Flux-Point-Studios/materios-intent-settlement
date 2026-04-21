@@ -129,6 +129,14 @@ export interface KeeperConfig {
   pollIntervalMs: number; // default 6000 (one block)
   maxBatchSize: number; // default 32
   dryRun: boolean;
+  /**
+   * Team B round-2 addition: the deployed `aegis_policy_v1` script hash
+   * (post `aiken blueprint apply`). Nullable until the blueprint lands on
+   * preprod / mainnet; when set, the keeper stamps it into every
+   * AegisPolicyParams it builds and rejects tx submission if the
+   * subsidiary scripts were compiled with a different hash.
+   */
+  aegisPolicyV1ScriptHash?: HexString | null;
 }
 
 /** Committee daemon config. */
@@ -151,6 +159,110 @@ export interface DirectClaimParams {
   oracleUtxoRef: { txHash: HexString; outputIndex: number };
   cardanoProviderUrl: string;
   beneficiaryAddr: string;
+}
+
+// ---------------------------------------------------------------------------
+// Team B merged Aiken schema (aegis-policy-v1 on aegis-parametric-insurance-dev main).
+// These types mirror `validators/aegis-policy-v1/lib/aegis/types.ak`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Cardano script hash (Blake2b-224), 28 bytes hex-encoded. Written as a
+ * `HexString` to keep compile-time homogeneity with other hashes; callers
+ * should ensure the payload is 56 hex chars (28 bytes).
+ */
+export type ScriptHash = HexString;
+
+/**
+ * Compile-time parameters baked into `aegis_policy_v1`. Mirrors Aiken's
+ * `AegisPolicyParams`. The `aegisPolicyV1ScriptHash` field is the new B-4/B-5
+ * /B-7 fix added in Team B round 2 and MUST be set before deploy; pre-blueprint
+ * it's nullable so tests and stub harnesses compile.
+ */
+export interface AegisPolicyParams {
+  committeePubkeySet: HexString[]; // list of 32-byte ed25519 pubkeys
+  committeeThreshold: number;
+  minFairnessProofSigCount: number;
+  charli3OracleRef: { txHash: HexString; outputIndex: number };
+  charli3FeedPolicyId: HexString;
+  charli3FeedAssetName: HexString;
+  materiosChainId: HexString; // 32-byte genesis hash
+  poolCustodyScriptHash: ScriptHash;
+  premiumCollectorScriptHash: ScriptHash;
+  /**
+   * B-4/B-5/B-7 fix: the deployed `aegis_policy_v1` script hash, used by
+   * subsidiary validators to bind tx-level authorization. Nullable until
+   * `aiken blueprint apply` produces the real hash.
+   */
+  aegisPolicyV1ScriptHash: ScriptHash | null;
+  settlementVersion: number;
+  oracleFreshnessSlots: number;
+}
+
+/**
+ * Datum on the premium-collector UTxO (§4.2). The `depositorCardanoAddr` and
+ * `amountAda` fields are the B-8 fix added in Team B round 2 — refunds MUST
+ * return to the address that funded the deposit, and the validator checks
+ * `amount_ada <= datum.amount_ada`.
+ *
+ * `depositorCardanoAddr` is the raw 57-byte CIP-0019 type-0 address buffer
+ * (header || payment_hash || stake_hash); the validator CBOR-encodes it for
+ * voucher-pre-image binding.
+ */
+export interface PremiumDepositDatum {
+  depositorMateriosAccount: HexString; // 32-byte SS58 pubkey
+  /**
+   * B-8 fix: the Cardano address that funded the deposit. Raw 57-byte
+   * CIP-0019 type-0 address buffer. Refund flows pin this as the
+   * authorizative destination.
+   */
+  depositorCardanoAddr: Uint8Array;
+  depositedAtSlot: bigint;
+  depositId: HexString; // blake2b_256(tx_hash || output_index)
+  /**
+   * B-8 fix: amount (lovelace) this deposit UTxO is denominated at. Enables
+   * `amount_ada <= datum.amount_ada` enforcement on refund paths.
+   */
+  amountAda: AdaLovelace;
+  productId: HexString;
+}
+
+/**
+ * Common explicit fields shared by both `RefundCredit` (aegis-policy-v1) and
+ * `RefundDeposit` (premium-collector) redeemers. Mirrors the B-8 fix that
+ * adds `beneficiary_bytes` + `policy_id` to the explicit fields.
+ */
+export interface RefundRedeemerFields {
+  /** SCALE-encoded voucher bytes (opaque to Aiken). */
+  voucherBytes: Uint8Array;
+  /** List of (pubkey, sig) committee signatures over the voucher digest. */
+  sigs: Array<{ pubkey: CommitteePubkey; sig: CommitteeSig }>;
+  amountAda: AdaLovelace;
+  /** Raw 57-byte CIP-0019 type-0 beneficiary address. */
+  beneficiary: Uint8Array;
+  /**
+   * B-8 fix: Plutus V3 Data CBOR of `beneficiary` — MUST equal
+   * `encodeType0AddressCbor(splitType0AddressBytes(beneficiary))`. The Aiken
+   * validator reconstructs the voucher body from this field.
+   */
+  beneficiaryBytes: Uint8Array;
+  /** B-8 fix: policy_id bound into the voucher pre-image. */
+  policyId: PolicyId;
+  issuedBlock: BlockNumber;
+  expirySlotCardano: SlotNumber;
+  claimId: ClaimId;
+  bfpDigest: HexString;
+  currentSlot: SlotNumber;
+}
+
+/**
+ * A Cardano slot range. When used with the strict-equality binding
+ * (Team B round-2 addition), `lower === upper === currentSlot` — see
+ * `buildSinglePointValidityRange`.
+ */
+export interface ValidityRange {
+  lowerBound: SlotNumber;
+  upperBound: SlotNumber;
 }
 
 export interface DaemonState {

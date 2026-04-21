@@ -82,3 +82,63 @@ describe("createMeshCardanoProvider safety", () => {
     ).rejects.toThrow(/enableMainnet/);
   });
 });
+
+describe("buildBatchTx validity range enforcement (Team B round-2 strict equality)", () => {
+  const totalAwarded = sampleBfpr.awardedAmountsAda.reduce((a, b) => a + b, 0n);
+  const fee = computeKeeperFeeLovelace(totalAwarded);
+  const baseArgs = {
+    voucher: sampleVoucher,
+    fairnessProof: sampleBfpr,
+    keeperAddr: "addr_test1keeper",
+    keeperFeeLovelace: fee,
+    policyScriptCbor: "0x00" as HexString,
+    poolUtxoRef: {
+      txHash: ("0x" + "00".repeat(32)) as HexString,
+      outputIndex: 0,
+    },
+    policyUtxoRefs: [],
+    metadataLabel8746Payload: {},
+  };
+
+  it("accepts a single-point range that matches currentSlot", async () => {
+    const res = await buildBatchTx({
+      ...baseArgs,
+      currentSlot: 100n,
+      validityRange: { lowerBound: 100n, upperBound: 100n },
+    });
+    expect(res.feeLovelace).toBe(fee);
+  });
+
+  it("accepts currentSlot alone (auto-builds [slot, slot])", async () => {
+    const res = await buildBatchTx({
+      ...baseArgs,
+      currentSlot: 100n,
+    });
+    expect(res.feeLovelace).toBe(fee);
+  });
+
+  it("rejects a non-single-point range", async () => {
+    await expect(
+      buildBatchTx({
+        ...baseArgs,
+        currentSlot: 100n,
+        validityRange: { lowerBound: 100n, upperBound: 101n },
+      }),
+    ).rejects.toThrow(/not a single point/);
+  });
+
+  it("rejects a range whose upper bound drifts from currentSlot", async () => {
+    await expect(
+      buildBatchTx({
+        ...baseArgs,
+        currentSlot: 100n,
+        validityRange: { lowerBound: 99n, upperBound: 99n },
+      }),
+    ).rejects.toThrow(/!= current slot/);
+  });
+
+  it("back-compat: no-currentSlot path still returns a placeholder", async () => {
+    const res = await buildBatchTx(baseArgs);
+    expect(res.feeLovelace).toBe(fee);
+  });
+});
