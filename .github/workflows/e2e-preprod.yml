@@ -46,8 +46,13 @@ jobs:
           cache: pnpm
           cache-dependency-path: e2e/pnpm-lock.yaml
 
+      # e2e/ is a standalone pnpm project with its own lockfile — it is NOT
+      # a member of the root pnpm-workspace.yaml (which only covers sdk + keeper).
+      # --ignore-workspace stops pnpm from climbing up and installing the
+      # parent workspace instead of e2e's own deps (which leaves e2e/node_modules
+      # empty and breaks typecheck with "Cannot find type definition file for 'node'").
       - name: install
-        run: pnpm install --frozen-lockfile || pnpm install
+        run: pnpm install --ignore-workspace --frozen-lockfile || pnpm install --ignore-workspace
 
       - name: typecheck
         run: pnpm typecheck
@@ -108,7 +113,7 @@ jobs:
           node-version: 20
           cache: pnpm
           cache-dependency-path: e2e/pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile || pnpm install
+      - run: pnpm install --ignore-workspace --frozen-lockfile || pnpm install --ignore-workspace
       - name: setup preprod environment
         run: ./scripts/setup-preprod.sh
       - name: full demo (capture artifacts)
