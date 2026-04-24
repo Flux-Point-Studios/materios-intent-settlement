@@ -31,13 +31,15 @@ jobs:
       run:
         working-directory: e2e
     steps:
-      - uses: actions/checkout@v4
+      # Third-party actions pinned to full commit SHAs (defender-in-depth vs.
+      # tag hijack). Rotate via `gh api /repos/<org>/<repo>/git/ref/tags/v<N>`.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1 as of 2026-04-24
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0 as of 2026-04-24
         with:
           version: 9
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 as of 2026-04-24
         with:
           node-version: 20
           cache: pnpm
@@ -54,7 +56,7 @@ jobs:
 
       - name: upload coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2 as of 2026-04-24
         with:
           name: coverage-${{ github.run_id }}
           path: e2e/coverage/
@@ -68,11 +70,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: unit
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1 as of 2026-04-24
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0 as of 2026-04-24
         with:
           version: 9
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 as of 2026-04-24
         with:
           node-version: 20
           cache: pnpm
@@ -100,11 +102,11 @@ jobs:
     env:
       MATERIOS_E2E_LIVE: '1'
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1 as of 2026-04-24
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0 as of 2026-04-24
         with:
           version: 9
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 as of 2026-04-24
         with:
           node-version: 20
           cache: pnpm
@@ -116,7 +118,7 @@ jobs:
         run: ./scripts/demo-reel.sh
       - name: upload demo artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2 as of 2026-04-24
         with:
           name: demo-run-${{ github.run_id }}
           path: e2e/artifacts/
