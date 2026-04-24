@@ -20,7 +20,7 @@ import {
   encodeType0AddressCbor,
   splitType0AddressBytes,
 } from "./cardano-address.js";
-import { voucherDigestWithAddress } from "./hashing.js";
+import { u32LE, u64LE, voucherDigestWithAddress } from "./hashing.js";
 import type {
   AdaLovelace,
   AegisPolicyParams,
@@ -272,35 +272,20 @@ export function canonicalVoucherBody(args: {
   issuedBlock: BlockNumber;
   expirySlotCardano: SlotNumber;
 }): Uint8Array {
-  // Delegate to the hashing module's body construction: for convenience we
-  // re-expose it here since call sites typically want the body bytes (for
-  // tx-level metadata / logging) before hashing.
-  const digest = voucherDigestWithAddress(args);
-  // The digest is post-hash; the body itself is built inside
-  // `voucherDigestWithAddress` but not exposed. Construct it directly:
+  // Construct the body bytes directly. Callers that want the post-hash digest
+  // should call `voucherDigestWithAddress` (re-exported above) — we do NOT
+  // hash here since this helper exists for tx-metadata / logging use cases.
+  //
+  // Width-encoders (`u64LE` / `u32LE`) are imported from `hashing.ts`, which
+  // provides overflow checks (throws on negatives / out-of-range values)
+  // instead of silently wrapping. See hashing.ts for the canonical
+  // implementations.
   const hexToU8a = (s: string): Uint8Array => {
     const hex = s.startsWith("0x") ? s.slice(2) : s;
     const out = new Uint8Array(hex.length / 2);
     for (let i = 0; i < out.length; i++) {
       out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
     }
-    return out;
-  };
-  const u64le = (v: bigint): Uint8Array => {
-    const out = new Uint8Array(8);
-    let x = v;
-    for (let i = 0; i < 8; i++) {
-      out[i] = Number(x & 0xffn);
-      x >>= 8n;
-    }
-    return out;
-  };
-  const u32le = (v: number): Uint8Array => {
-    const out = new Uint8Array(4);
-    out[0] = v & 0xff;
-    out[1] = (v >>> 8) & 0xff;
-    out[2] = (v >>> 16) & 0xff;
-    out[3] = (v >>> 24) & 0xff;
     return out;
   };
   const claimId = hexToU8a(args.claimId);
@@ -316,15 +301,13 @@ export function canonicalVoucherBody(args: {
   o += 32;
   body.set(args.beneficiaryAddressCbor, o);
   o += args.beneficiaryAddressCbor.length;
-  body.set(u64le(args.amountAda), o);
+  body.set(u64LE(args.amountAda), o);
   o += 8;
   body.set(bfpr, o);
   o += 32;
-  body.set(u32le(args.issuedBlock), o);
+  body.set(u32LE(args.issuedBlock), o);
   o += 4;
-  body.set(u64le(args.expirySlotCardano), o);
-  // Touch digest to suppress "unused var" lint noise — caller can re-hash if needed.
-  void digest;
+  body.set(u64LE(args.expirySlotCardano), o);
   return body;
 }
 

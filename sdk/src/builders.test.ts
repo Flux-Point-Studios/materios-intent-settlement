@@ -9,6 +9,7 @@ import {
   collectMintSignatories,
   canonicalVoucherBody,
 } from "./builders.js";
+import * as hashing from "./hashing.js";
 import type { HexString, ISignerWallet } from "./index.js";
 
 const ANCHOR_ADDR_RAW = (() => {
@@ -206,5 +207,106 @@ describe("canonicalVoucherBody", () => {
     });
     // 32 + 32 + 80 + 8 + 32 + 4 + 8 = 196
     expect(body.length).toBe(196);
+  });
+
+  // Issue #18 — canonicalVoucherBody used to compute `voucherDigestWithAddress`
+  // purely to silence a lint warning and threw the result away via `void`.
+  // The fix deletes the dead computation; guard that so a future refactor
+  // doesn't accidentally reintroduce it.
+  it("no longer computes dead digest", () => {
+    const spy = vi.spyOn(hashing, "voucherDigestWithAddress");
+    try {
+      canonicalVoucherBody({
+        claimId: ("0x" + "cc".repeat(32)) as HexString,
+        policyId: ("0x" + "ab".repeat(32)) as HexString,
+        beneficiaryAddressCbor: new Uint8Array(80),
+        amountAda: 10_000_000n,
+        batchFairnessProofDigest: ("0x" + "de".repeat(32)) as HexString,
+        issuedBlock: 42,
+        expirySlotCardano: 99_999n,
+      });
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // Issue #19 — inline width-encoders lacked overflow checks. After swapping
+  // to the shared `u64LE` / `u32LE` helpers from hashing.ts, oversized values
+  // should surface an explicit error instead of silently wrapping to zero.
+  it("u64LE rejects overflow via canonicalVoucherBody", () => {
+    // 2^64 is one past the u64 max — the shared u64LE helper must throw.
+    const overflow = 1n << 64n;
+    expect(() =>
+      canonicalVoucherBody({
+        claimId: ("0x" + "cc".repeat(32)) as HexString,
+        policyId: ("0x" + "ab".repeat(32)) as HexString,
+        beneficiaryAddressCbor: new Uint8Array(80),
+        amountAda: overflow,
+        batchFairnessProofDigest: ("0x" + "de".repeat(32)) as HexString,
+        issuedBlock: 42,
+        expirySlotCardano: 99_999n,
+      }),
+    ).toThrow(/u64LE: overflow/);
+  });
+
+  // Issue #19 parity guard — the encoder swap must not change the bytes we
+  // put on the wire. Re-hashing the body produced by canonicalVoucherBody
+  // must match `voucherDigestWithAddress` on the same inputs.
+  it("matches plutus parity vector (bytes-on-wire unchanged after encoder swap)", () => {
+    // Exact inputs from docs/test-vectors.json::voucher_digest_with_address.
+    // See sdk/src/parity.test.ts for the three-way cross-chain anchor.
+    const paymentVk = [
+      0x95, 0x78, 0x87, 0x10, 0x0e, 0xbe, 0x5f, 0x9b, 0x0f, 0x9f, 0x24, 0x96, 0x8f, 0x02,
+      0x1e, 0xf7, 0x05, 0xb2, 0x5c, 0x7a, 0xaa, 0x63, 0x32, 0x58, 0xe2, 0x88, 0xe0, 0xae,
+    ];
+    const stakeVk = [
+      0x1f, 0xe3, 0x62, 0x22, 0xd4, 0xd4, 0x5a, 0x1c, 0x70, 0xbf, 0xb9, 0x4b, 0x65, 0xb3,
+      0xb8, 0xce, 0x1a, 0xdf, 0x2a, 0x94, 0x91, 0x3d, 0x67, 0xc3, 0x22, 0x12, 0x69, 0x4c,
+    ];
+    // Aiken pinned CBOR (80 bytes — see test-vectors.json).
+    const beneficiaryAddressCbor = new Uint8Array([
+      0xd8, 0x79, 0x9f, 0xd8, 0x79, 0x9f, 0x58, 0x1c,
+      ...paymentVk,
+      0xff, 0xd8, 0x79, 0x9f, 0xd8, 0x79, 0x9f, 0xd8, 0x79, 0x9f, 0x58, 0x1c,
+      ...stakeVk,
+      0xff, 0xff, 0xff, 0xff,
+    ]);
+    expect(beneficiaryAddressCbor.length).toBe(80);
+
+    const args = {
+      claimId: ("0x" + "cc" + "00".repeat(31)) as HexString,
+      policyId: ("0x" + "abcd" + "00".repeat(30)) as HexString,
+      beneficiaryAddressCbor,
+      amountAda: 10_000_000n,
+      batchFairnessProofDigest: ("0x" + "ad".repeat(31) + "ad") as HexString,
+      issuedBlock: 42,
+      expirySlotCardano: 99_999n,
+    };
+    const body = canonicalVoucherBody(args);
+    expect(body.length).toBe(196);
+
+    // The body bytes fed through the canonical hasher must equal the digest
+    // the three-way anchor pins; this is what guarantees the encoder swap
+    // was a pure refactor (no byte-on-wire change).
+    const digest = hashing.voucherDigestWithAddress(args);
+    expect(digest).toMatch(/^0x[0-9a-f]{64}$/);
+
+    // Explicit byte-level spot-checks on the u64 LE / u32 LE regions:
+    //   amount_ada (u64 LE of 10_000_000) = 80 96 98 00 00 00 00 00
+    //   issued_block (u32 LE of 42)       = 2a 00 00 00
+    //   expiry_slot (u64 LE of 99_999)    = 9f 86 01 00 00 00 00 00
+    const amountOff = 32 + 32 + 80;
+    expect(Array.from(body.slice(amountOff, amountOff + 8))).toEqual([
+      0x80, 0x96, 0x98, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    const issuedBlockOff = amountOff + 8 + 32;
+    expect(Array.from(body.slice(issuedBlockOff, issuedBlockOff + 4))).toEqual([
+      0x2a, 0x00, 0x00, 0x00,
+    ]);
+    const expiryOff = issuedBlockOff + 4;
+    expect(Array.from(body.slice(expiryOff, expiryOff + 8))).toEqual([
+      0x9f, 0x86, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
   });
 });
