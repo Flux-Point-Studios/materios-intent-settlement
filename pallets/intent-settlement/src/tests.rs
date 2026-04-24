@@ -1727,6 +1727,114 @@ fn test_multisig_payload_hashers_domain_separated() {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-layer parity fixtures for the multisig payload hashers.
+//
+// The TS SDK (`sdk/src/multisig.test.ts`) asserts these exact hex digests
+// against its `creditDepositPayload` / `settleClaimPayload` helpers, so any
+// future drift in either side (endianness, field order, domain tag) fails
+// loudly in both Rust and TS CI runs instead of silently sending
+// unverifiable bundles to the pallet.
+//
+// Inputs + expected hex here were produced by `sp_core::hashing::blake2_256`
+// running against the domain-tagged canonical bodies defined in
+// `lib.rs::credit_deposit_payload` / `settle_claim_payload`. If either
+// function's pre-image format changes, regenerate these hex values and the
+// matching SDK fixtures in lockstep.
+// ---------------------------------------------------------------------------
+
+fn hex_32(h: [u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in h.iter() {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+#[test]
+fn test_credit_deposit_payload_parity_fixture_a() {
+    // Fixture A — matches SDK test "creditDepositPayload matches Rust fixture A".
+    let target = [0x07u8; 32];
+    let amount: u64 = 1_000;
+    let tx = [0x01u8; 32];
+    let digest = credit_deposit_payload(&target, amount, &tx);
+    assert_eq!(
+        hex_32(digest),
+        "d61b0438a19adc712cd0d01b4fee1174f5a8eb5df931918dac9ae0e2f32d51db",
+        "CRDP fixture A digest drifted — regenerate SDK fixtures too"
+    );
+}
+
+#[test]
+fn test_credit_deposit_payload_parity_fixture_b() {
+    // Fixture B — structured target/tx, 2M lovelace. Matches SDK test
+    // "creditDepositPayload matches Rust fixture B".
+    let mut target = [0u8; 32];
+    for i in 0..32 {
+        target[i] = (i as u8).wrapping_mul(7).wrapping_add(3);
+    }
+    let amount: u64 = 2_000_000;
+    let mut tx = [0u8; 32];
+    for i in 0..32 {
+        tx[i] = ((i as u8) ^ 0xAB).wrapping_add(1);
+    }
+    let digest = credit_deposit_payload(&target, amount, &tx);
+    assert_eq!(
+        hex_32(digest),
+        "56e006017231f0f62d48ed5739446e31fbfaab94ad3e68117ca57393b3db8c4f",
+        "CRDP fixture B digest drifted — regenerate SDK fixtures too"
+    );
+}
+
+#[test]
+fn test_settle_claim_payload_parity_fixture_c_and_d() {
+    // Fixture C/D — same inputs, both booleans, to pin the settled_direct
+    // byte in the pre-image. Matches SDK tests
+    // "settleClaimPayload matches Rust fixture C/D".
+    let claim = H256::from([0x07u8; 32]);
+    let tx = [0x01u8; 32];
+    let digest_false = settle_claim_payload(&claim, &tx, false);
+    let digest_true = settle_claim_payload(&claim, &tx, true);
+    assert_eq!(
+        hex_32(digest_false),
+        "59be22f98eb07437195ca49bda86e1ff6ba495c8d19a0ac11d207e20d2dff285",
+        "STCL fixture C (direct=false) digest drifted"
+    );
+    assert_eq!(
+        hex_32(digest_true),
+        "ae3761839a7a605a75d9643427e2b768436316e2cdda877e9f4c508ec6374b08",
+        "STCL fixture D (direct=true) digest drifted"
+    );
+    assert_ne!(digest_false, digest_true);
+}
+
+#[test]
+fn test_settle_claim_payload_parity_fixture_e() {
+    // Fixture E — structured claim/tx, both direct flags. Matches SDK test
+    // "settleClaimPayload matches Rust fixture E".
+    let mut claim_bytes = [0u8; 32];
+    for i in 0..32 {
+        claim_bytes[i] = ((i as u8).wrapping_mul(5)) ^ 0x5A;
+    }
+    let claim = H256::from(claim_bytes);
+    let mut tx = [0u8; 32];
+    for i in 0..32 {
+        tx[i] = ((i as u8) ^ 0xCC).wrapping_add(1);
+    }
+    let digest_false = settle_claim_payload(&claim, &tx, false);
+    let digest_true = settle_claim_payload(&claim, &tx, true);
+    assert_eq!(
+        hex_32(digest_false),
+        "7493705c88435cdf3faf46b1f5031281b777c6320ec3b71375ca06bb5b427e4a",
+        "STCL fixture E (direct=false) digest drifted"
+    );
+    assert_eq!(
+        hex_32(digest_true),
+        "94b4d41f29528f1b00cf3de7df4f5bd22f27521d769f04547bb69f3b459862d6",
+        "STCL fixture E (direct=true) digest drifted"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test vectors against docs/test-vectors.json
 // ---------------------------------------------------------------------------
 
