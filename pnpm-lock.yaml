@@ -4,6 +4,14 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  axios@<1.11.0: ^1.11.0
+  undici@<6.24.0: ^6.24.0
+  tar-fs@<2.1.4: ^2.1.4
+  tar-fs@>=3.0.0 <3.0.8: ^3.0.8
+  ip: ^2.0.1
+  elliptic: ^6.6.0
+
 importers:
 
   .: {}
@@ -641,10 +649,6 @@ packages:
 
   '@fabianbormann/meerkat@1.0.18':
     resolution: {integrity: sha512-4QuyhlpouIJvcwqlItn91ugl8uC/L1muuN3XFLuO38qMrUucyV0+yykAp1RlzwOlO7YvDYZEaJ8kCa+/MU7UCg==}
-
-  '@fastify/busboy@2.1.1':
-    resolution: {integrity: sha512-vBZP4NlzfOlerQTnba4aqZoMhE/a9HY7HRqoOPaETQcSQuWEIyZMHGfVu6w9wGtGK5fED5qRs2DteVCjOH60sA==}
-    engines: {node: '>=14'}
 
   '@floating-ui/core@1.7.5':
     resolution: {integrity: sha512-1Ih4WTWyw0+lKyFMcBHGbb5U5FtuHJuujoyyr5zTaWS5EYMeT6Jb2AuDeftsCsEuchO+mM2ij5+q9crhydzLhQ==}
@@ -1622,9 +1626,6 @@ packages:
   available-typed-arrays@1.0.7:
     resolution: {integrity: sha512-wvUjBtSGN7+7SjNpq/9M2Tg350UZD3q62IFZLbRAR1bSMlCo1ZaeW+BJ+D090e4hIIZLBcTDWe4Mh4jvUDajzQ==}
     engines: {node: '>= 0.4'}
-
-  axios@0.28.1:
-    resolution: {integrity: sha512-iUcGA5a7p0mVb4Gm/sy+FSECNkPFT4y7wt6OM/CDpO/OnNCvSs3PoMG8ibrC9jRoGYU0gUK5pXVC4NPXq6lHRQ==}
 
   axios@1.15.1:
     resolution: {integrity: sha512-WOG+Jj8ZOvR0a3rAn+Tuf1UQJRxw5venr6DgdbJzngJE3qG7X0kL83CZGpdHMxEm+ZK3seAbvFsw4FfOfP9vxg==}
@@ -2835,9 +2836,6 @@ packages:
     resolution: {integrity: sha512-vGrhOavPSTz4QVNuBNdcNXePNdNMaO1xj9yBeH1ScQPjk/rhg9sSlCXPhMkFuaNNW/syTvYqsnbIJxMBfRbbag==}
     engines: {node: '>= 8'}
 
-  proxy-from-env@1.1.0:
-    resolution: {integrity: sha512-D+zkORCbA9f1tdWRK0RaCR3GPv50cMxcrz4X8k5LTSUD1Dkw47mKJEZQNunItRTkWwgtaUSo1RVFRIG9ZXiFYg==}
-
   proxy-from-env@2.1.0:
     resolution: {integrity: sha512-cJ+oHTW1VAEa8cJslgmUZrc+sjRKgAKl3Zyse6+PV38hZe/V6Z14TbCuXcan9F9ghlz4QrFr2c92TNF82UkYHA==}
     engines: {node: '>=10'}
@@ -3145,9 +3143,6 @@ packages:
     peerDependencies:
       tailwindcss: '>=3.0.0 || insiders'
 
-  tar-fs@2.0.1:
-    resolution: {integrity: sha512-6tzWDMeroL87uF/+lin46k+Q+46rAJ0SyPGz7OW7wTgblI273hsBqk2C1j0/xNadNLKDTUL9BukSjB7cwgmlPA==}
-
   tar-fs@2.1.4:
     resolution: {integrity: sha512-mDAjwmZdh7LTT6pNleZ05Yt65HC3E+NiQzl672vQG38jIrehtJk/J3mNwIg+vShQPcLF/LV7CMnDW6vjj6sfYQ==}
 
@@ -3307,9 +3302,9 @@ packages:
   undici-types@6.21.0:
     resolution: {integrity: sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==}
 
-  undici@5.29.0:
-    resolution: {integrity: sha512-raqeBD6NQK4SkWhQzeYKd1KmIG6dllBOTt55Rmkt4HtI9mwdWtJljnrXjAFUBLTSN67HWrOIZ3EPF4kjUw80Bg==}
-    engines: {node: '>=14.0'}
+  undici@6.25.0:
+    resolution: {integrity: sha512-ZgpWDC5gmNiuY9CnLVXEH8rl50xhRCuLNA97fAUnKi8RRuV4E6KG31pDTsLVUKnohJE0I3XDrTeEydAXRw47xg==}
+    engines: {node: '>=18.17'}
 
   unordered-array-remove@1.0.2:
     resolution: {integrity: sha512-45YsfD6svkgaCBNyvD+dFHm4qFX9g3wRSIVgWVPtm2OCnphvPxzJoe20ATsiNpNJrmzHifnxm+BN5F7gFT/4gw==}
@@ -3923,7 +3918,7 @@ snapshots:
       '@cardano-sdk/key-management': 0.21.2(bufferutil@4.1.0)(utf-8-validate@6.0.6)
       '@cardano-sdk/util': 0.15.4
       '@types/dockerode': 3.3.47
-      axios: 0.28.1
+      axios: 1.15.1
       delay: 5.0.0
       dockerode: 3.3.5
       dockerode-utils: 0.0.7
@@ -4003,7 +3998,7 @@ snapshots:
     dependencies:
       '@bufbuild/protobuf': 1.10.1
       '@connectrpc/connect': 1.4.0(@bufbuild/protobuf@1.10.1)
-      undici: 5.29.0
+      undici: 6.25.0
 
   '@connectrpc/connect-web@1.4.0(@bufbuild/protobuf@1.10.1)(@connectrpc/connect@1.4.0(@bufbuild/protobuf@1.10.1))':
     dependencies:
@@ -4198,8 +4193,6 @@ snapshots:
       - bare-url
       - react-native-b4a
       - supports-color
-
-  '@fastify/busboy@2.1.1': {}
 
   '@floating-ui/core@1.7.5':
     dependencies:
@@ -5423,14 +5416,6 @@ snapshots:
     dependencies:
       possible-typed-array-names: 1.1.0
 
-  axios@0.28.1:
-    dependencies:
-      follow-redirects: 1.16.0
-      form-data: 4.0.5
-      proxy-from-env: 1.1.0
-    transitivePeerDependencies:
-      - debug
-
   axios@1.15.1:
     dependencies:
       follow-redirects: 1.16.0
@@ -5894,7 +5879,7 @@ snapshots:
     dependencies:
       '@balena/dockerignore': 1.0.2
       docker-modem: 3.0.8
-      tar-fs: 2.0.1
+      tar-fs: 2.1.4
     transitivePeerDependencies:
       - supports-color
 
@@ -6656,8 +6641,6 @@ snapshots:
 
   propagate@2.0.1: {}
 
-  proxy-from-env@1.1.0: {}
-
   proxy-from-env@2.1.0: {}
 
   pump@3.0.4:
@@ -7019,13 +7002,6 @@ snapshots:
 
   tailwindcss-animate@1.0.7: {}
 
-  tar-fs@2.0.1:
-    dependencies:
-      chownr: 1.1.4
-      mkdirp-classic: 0.5.3
-      pump: 3.0.4
-      tar-stream: 2.2.0
-
   tar-fs@2.1.4:
     dependencies:
       chownr: 1.1.4
@@ -7199,9 +7175,7 @@ snapshots:
 
   undici-types@6.21.0: {}
 
-  undici@5.29.0:
-    dependencies:
-      '@fastify/busboy': 2.1.1
+  undici@6.25.0: {}
 
   unordered-array-remove@1.0.2: {}
 

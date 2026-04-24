@@ -84,10 +84,25 @@ export class CommitteeDaemon {
   }
 
   async initialize(): Promise<void> {
-    const srKeyring = new Keyring({ type: "sr25519" });
-    this.sr25519 = srKeyring.addFromUri(this.config.sr25519Uri);
-    const edKeyring = new Keyring({ type: "ed25519" });
-    this.ed25519 = edKeyring.addFromUri(this.config.ed25519Uri);
+    // Load keys WITHOUT letting the raw URI or @polkadot/keyring's error
+    // message escape into logs. polkadot-js's addFromUri echoes the offending
+    // suri string (or part of it) in thrown errors; journald would then
+    // permanently capture a mnemonic. We sanitize here and never re-throw
+    // the original error.
+    try {
+      const srKeyring = new Keyring({ type: "sr25519" });
+      this.sr25519 = srKeyring.addFromUri(this.config.sr25519Uri);
+    } catch (err: unknown) {
+      this.log("error", `Invalid SR25519_URI: ${sanitizeKeyringError(err)}`);
+      throw new Error("Invalid SR25519_URI (see sanitized reason above)");
+    }
+    try {
+      const edKeyring = new Keyring({ type: "ed25519" });
+      this.ed25519 = edKeyring.addFromUri(this.config.ed25519Uri);
+    } catch (err: unknown) {
+      this.log("error", `Invalid ED25519_URI: ${sanitizeKeyringError(err)}`);
+      throw new Error("Invalid ED25519_URI (see sanitized reason above)");
+    }
 
     // Rehydrate daemon-state.json if present.
     try {
@@ -152,7 +167,7 @@ export class CommitteeDaemon {
         extendAllTtlsBy: step.transition.elapsedSeconds + 3600,
       };
       await this.publishDegradationExtension(payload).catch((err) =>
-        this.log("error", "publishDegradationExtension failed", err),
+        this.log("error", `publishDegradationExtension failed: ${sanitizeKeyringError(err)}`),
       );
       extensionPublished = payload;
     }
@@ -203,7 +218,11 @@ export class CommitteeDaemon {
       try {
         await this.runOnce();
       } catch (err) {
-        this.log("error", "daemon runOnce errored", err);
+        // Never pass the raw error object to the logger — we route through the
+        // same sanitizer to prevent any secrets in nested .cause chains or
+        // Error.message from hitting journald. The sanitizer drops suri-looking
+        // strings, BIP-39 word sequences, and long hex blobs.
+        this.log("error", `daemon runOnce errored: ${sanitizeKeyringError(err)}`);
       }
       await new Promise((r) => setTimeout(r, this.config.pollIntervalMs));
     }
@@ -265,6 +284,46 @@ function defaultLogger(level: "info" | "warn" | "error", msg: string, meta?: unk
   const fn = level === "error" ? console.error : level === "warn" ? console.warn : console.log;
   if (meta !== undefined) fn(`[daemon][${level}] ${msg}`, meta);
   else fn(`[daemon][${level}] ${msg}`);
+}
+
+/**
+ * Strip anything that could be a BIP-39 seed phrase or a polkadot-js
+ * derivation path (//foo///bar) from an error surfaced by keyring.addFromUri.
+ *
+ * Returns ONLY the error class name plus a scrubbed message. Never returns the
+ * raw error, never returns the suri bytes, never logs meta via defaultLogger.
+ *
+ * @internal exported for test visibility
+ */
+export function sanitizeKeyringError(err: unknown): string {
+  const klass =
+    err instanceof Error
+      ? err.name || "Error"
+      : typeof err === "object" && err !== null && "name" in err
+      ? String((err as { name: unknown }).name)
+      : "Error";
+  const rawMsg =
+    err instanceof Error
+      ? err.message
+      : typeof err === "string"
+      ? err
+      : "";
+  // Strip anything that looks like a suri derivation path, including soft/hard
+  // (// or ///) variants and password segments.
+  let scrubbed = rawMsg.replace(/\/{2,3}[^\s'"`]+/g, "<redacted-path>");
+  // Strip sequences of 4+ consecutive lowercase words (BIP-39 phrases are
+  // 12/15/18/21/24 words; 4+ is a conservative lower bound).
+  scrubbed = scrubbed.replace(
+    /\b([a-z]{3,8}(?:\s+[a-z]{3,8}){3,})\b/g,
+    "<redacted-mnemonic>",
+  );
+  // Don't echo hex blobs either (private keys, public keys, seed hex).
+  scrubbed = scrubbed.replace(/0x[0-9a-fA-F]{16,}/g, "<redacted-hex>");
+  scrubbed = scrubbed.replace(/\b[0-9a-fA-F]{32,}\b/g, "<redacted-hex>");
+  // Keep the output short; an attacker who can induce a specific error message
+  // could otherwise feed suri fragments to the regex.
+  if (scrubbed.length > 80) scrubbed = scrubbed.slice(0, 80) + "...";
+  return scrubbed ? `${klass}: ${scrubbed}` : klass;
 }
 
 export type { DaemonState, HaltState };

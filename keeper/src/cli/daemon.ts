@@ -12,7 +12,7 @@
  */
 
 import { MateriosRpcClient } from "@fluxpointstudios/materios-intent-settlement-sdk";
-import { CommitteeDaemon } from "../daemon/index.js";
+import { CommitteeDaemon, sanitizeKeyringError } from "../daemon/index.js";
 import { createMeshCardanoProvider } from "../cardano.js";
 
 async function main(): Promise<void> {
@@ -70,6 +70,8 @@ function required(name: string): string {
 }
 
 main().catch((err) => {
-  console.error(err);
+  // Sanitize: connect()/addFromUri errors from @polkadot/keyring can include
+  // suri fragments in .message; never echo the raw err to stderr/journald.
+  console.error(`[committee-daemon] fatal: ${sanitizeKeyringError(err)}`);
   process.exit(1);
 });

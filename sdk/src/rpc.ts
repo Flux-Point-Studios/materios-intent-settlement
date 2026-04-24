@@ -42,7 +42,16 @@ export class MateriosRpcClient {
     this.api = await ApiPromise.create({ provider: this.provider, throwOnConnect: true });
     if (this.signerUri) {
       const keyring = new Keyring({ type: "sr25519" });
-      this.signer = keyring.addFromUri(this.signerUri);
+      try {
+        this.signer = keyring.addFromUri(this.signerUri);
+      } catch (err: unknown) {
+        // @polkadot/keyring throws Error messages that may echo the offending
+        // suri fragment. Never let the raw error propagate — callers that
+        // log err.message or err would otherwise leak a mnemonic. Throw a
+        // scrubbed error with a stable tag so CLIs can surface a safe reason.
+        const name = err instanceof Error ? err.name || "Error" : "Error";
+        throw new Error(`Invalid signerUri (${name}) — raw keyring error suppressed`);
+      }
     }
   }
 

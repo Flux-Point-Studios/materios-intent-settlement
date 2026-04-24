@@ -18,6 +18,7 @@ import { MateriosRpcClient } from "@fluxpointstudios/materios-intent-settlement-
 import { Keeper } from "../keeper.js";
 import { KeeperStateStore } from "../state.js";
 import { createMeshCardanoProvider } from "../cardano.js";
+import { sanitizeKeyringError } from "../daemon/index.js";
 
 async function main(): Promise<void> {
   const materiosRpcUrl = required("MATERIOS_RPC_URL");
@@ -84,6 +85,9 @@ function required(name: string): string {
 }
 
 main().catch((err) => {
-  console.error(err);
+  // Sanitize — MateriosRpcClient.connect() wraps addFromUri errors, but any
+  // other layer that happens to stringify a KEEPER_MNEMONIC-containing value
+  // would still leak here. Always scrub.
+  console.error(`[keeper] fatal: ${sanitizeKeyringError(err)}`);
   process.exit(1);
 });
