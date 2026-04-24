@@ -6,7 +6,12 @@
  *   MATERIOS_RPC_URL       — wss://materios.fluxpointstudios.com/preprod-rpc
  *   CARDANO_OGMIOS_URL     — wss://ogmios.saturnswap.io  (preprod: wss://ogmios-preprod.saturnswap.io)
  *   CARDANO_KUPO_URL       — https://kupo.saturnswap.io  (preprod: https://kupo-preprod.saturnswap.io)
- *   KEEPER_MNEMONIC        — sr25519 mnemonic for Materios settle_claim extrinsics
+ *   KEEPER_MNEMONIC        — sr25519 mnemonic for Materios settle_claim extrinsics.
+ *                            MUST be a current committee member: pallet's
+ *                            settle_claim gate requires the caller's pubkey to
+ *                            appear in the signature bundle (pallet issue #7,
+ *                            wave 2 W2.1). Ship as M=1 for now; multi-operator
+ *                            sig collection is wave 2 W2.b follow-up.
  *   KEEPER_CARDANO_ADDR    — Cardano addr that receives keeper fee output
  *   POLICY_SCRIPT_CBOR     — compiled aegis-policy-v1 CBOR (hex)
  *   NETWORK                — "preprod" | "mainnet" (mainnet requires ENABLE_MAINNET=1)

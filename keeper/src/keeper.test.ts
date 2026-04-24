@@ -160,12 +160,35 @@ describe("Keeper.runOnce — happy path", () => {
     expect(metricsSecond.batchesConfirmed).toBeGreaterThanOrEqual(1);
     expect(metricsSecond.batchesSettled).toBeGreaterThanOrEqual(1);
 
-    // settle_claim extrinsic was called
+    // settle_claim extrinsic was called with the full 4-arg shape
+    // (claimId, cardanoTxHash, settledDirect, signatures).
     expect(rpc.submitExtrinsic).toHaveBeenCalledWith(
       "intentSettlement",
       "settleClaim",
       expect.arrayContaining([expect.any(String)]),
     );
+    const settleCall = rpc.submitExtrinsic.mock.calls.find(
+      (c) => c[0] === "intentSettlement" && c[1] === "settleClaim",
+    );
+    expect(settleCall).toBeDefined();
+    const [, , args] = settleCall!;
+    expect(args).toHaveLength(4);
+    // args[2] = settled_direct boolean (M=1 keeper path always false —
+    // settled_direct=true is reserved for the 10-min direct-path fallback
+    // spec §5.7, not the keeper-batch path).
+    expect(args[2]).toBe(false);
+    // args[3] = signatures Vec<(CommitteePubkey, CommitteeSig)>. M=1 for
+    // now: the keeper's own mnemonic signs the canonical payload and that
+    // single entry must satisfy the pallet's threshold (runtime sets
+    // DefaultMinSignerThreshold = 1 initially).
+    const signatures = args[3] as Array<[string, string]>;
+    expect(Array.isArray(signatures)).toBe(true);
+    expect(signatures).toHaveLength(1);
+    const [pubkey, sig] = signatures[0]!;
+    // sr25519 pubkeys are 32 bytes = 66 hex chars incl. "0x".
+    expect(pubkey).toMatch(/^0x[0-9a-f]{64}$/);
+    // sr25519 sigs are 64 bytes = 130 hex chars incl. "0x".
+    expect(sig).toMatch(/^0x[0-9a-f]{128}$/);
   });
 });
 

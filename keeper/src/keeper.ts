@@ -10,10 +10,13 @@
 
 import {
   MateriosRpcClient,
+  buildSigBundle,
   computeKeeperFeeLovelace,
+  settleClaimPayload,
   validateFairnessProof,
   voucherDigest,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
+import { u8aToHex } from "@polkadot/util";
 import type {
   BatchPayload,
   BlockNumber,
@@ -304,11 +307,32 @@ export class Keeper {
 
       this.metrics.batchesConfirmed += 1;
       // Settle on Materios. Idempotent per §2.2 #5.
+      //
+      // Wave 2 W2.1 (Option C interim): pallet's settle_claim now requires an
+      // M-of-N committee sig bundle (issue #7, PR #23). Keeper ships as M=1 —
+      // signs with its own KEEPER_MNEMONIC which MUST be a current committee
+      // member. Settlement-daemon (B) that collects sigs from multiple
+      // committee peers is a follow-up once the pallet is live on a runtime.
+      const settledDirect = false;
+      const payload = settleClaimPayload({
+        claimId: sub.claimId,
+        cardanoTxHash: sub.cardanoTxHash,
+        settledDirect,
+      });
+      const bundle = buildSigBundle({
+        callerSeed: this.config.keeperMnemonic,
+        cosignerSeeds: [],
+        payload,
+      });
+      const signatures = bundle.map(
+        (e) => [u8aToHex(e.pubkey), u8aToHex(e.sig)] as [HexString, HexString],
+      );
       try {
         await this.deps.rpc.submitExtrinsic("intentSettlement", "settleClaim", [
           sub.claimId,
           sub.cardanoTxHash,
-          false,
+          settledDirect,
+          signatures,
         ]);
         this.deps.state.markSettled(sub.claimId, sub.cardanoTxHash);
         this.metrics.batchesSettled += 1;
