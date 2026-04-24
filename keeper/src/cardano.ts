@@ -48,10 +48,15 @@ export interface BuildBatchTxInput {
    * MUST declare `validity_range = [currentSlot, currentSlot]` to satisfy
    * Team B's round-2 strict-equality binding `current_slot ==
    * validity_range.upper_bound`. Construct via
-   * `buildSinglePointValidityRange(currentSlot)`. If omitted the builder
-   * still works for back-compat with existing tests but logs a warning.
+   * `buildSinglePointValidityRange(currentSlot)`.
+   *
+   * REQUIRED as of issue #16: a missing slot produces a tx with no
+   * validity-range binding, which Aiken's strict-equality check rejects
+   * silently. Callers MUST capture the tip via `cardano.getCurrentSlot()`
+   * immediately before this call. Slot drift between capture and submit
+   * is handled by the retry wrapper in `keeper.ts` (issue #17).
    */
-  currentSlot?: SlotNumber;
+  currentSlot: SlotNumber;
   /** Optional pre-built range. If provided, must be `[currentSlot, currentSlot]`. */
   validityRange?: ValidityRange;
 }
@@ -173,15 +178,20 @@ export async function buildBatchTx(input: BuildBatchTxInput): Promise<BuildBatch
   }
 
   // Team B round-2: enforce strict-equality validity range
-  // `current_slot == validity_range.upper_bound`. If caller supplied a
-  // currentSlot, construct (or verify) the single-point range.
-  if (input.currentSlot !== undefined) {
-    const range =
-      input.validityRange ?? buildSinglePointValidityRange(input.currentSlot);
-    const ok = assertSinglePointValidityRange(range, input.currentSlot);
-    if (!ok.ok) {
-      throw new Error(`validity range check failed: ${ok.reason}`);
-    }
+  // `current_slot == validity_range.upper_bound`. The slot is REQUIRED
+  // (issue #16) — a missing slot previously produced a tx with no validity
+  // range that Aiken silently rejected. Runtime guard catches permissive
+  // `as any` / JS callers that bypass the TypeScript requirement.
+  if (input.currentSlot === undefined || input.currentSlot === null) {
+    throw new Error(
+      "buildBatchTx: currentSlot is required (see issue #16); capture via cardano.getCurrentSlot() immediately before calling",
+    );
+  }
+  const range =
+    input.validityRange ?? buildSinglePointValidityRange(input.currentSlot);
+  const ok = assertSinglePointValidityRange(range, input.currentSlot);
+  if (!ok.ok) {
+    throw new Error(`validity range check failed: ${ok.reason}`);
   }
 
   // Placeholder body: deterministic hash of voucher + fairness_proof_digest,

@@ -33,6 +33,17 @@ export type { HaltState, HaltTransition, HaltDetectorConfig } from "./halt.js";
 
 export { retryWithBackoff, feeBumpFactor } from "./retry.js";
 
+export {
+  buildAndSubmitWithSlotRetry,
+  isSlotDriftError,
+  SlotDriftExhaustedError,
+  SLOT_ERROR_SIGNATURES,
+} from "./slot-retry.js";
+export type {
+  SlotDriftRetryOptions,
+  SlotDriftAttemptFailure,
+} from "./slot-retry.js";
+
 export { CommitteeDaemon } from "./daemon/index.js";
 export type {
   CommitteeDaemonDeps,
