@@ -35,6 +35,7 @@ describe("buildBatchTx", () => {
         poolUtxoRef: { txHash: ("0x" + "00".repeat(32)) as HexString, outputIndex: 0 },
         policyUtxoRefs: [],
         metadataLabel8746Payload: {},
+        currentSlot: 100n,
       }),
     ).rejects.toThrow(/spec §5.4/);
   });
@@ -52,6 +53,7 @@ describe("buildBatchTx", () => {
       poolUtxoRef: { txHash: ("0x" + "00".repeat(32)) as HexString, outputIndex: 0 },
       policyUtxoRefs: [],
       metadataLabel8746Payload: {},
+      currentSlot: 100n,
     });
 
     expect(res.feeLovelace).toBe(fee);
@@ -66,6 +68,7 @@ describe("buildBatchTx", () => {
       poolUtxoRef: { txHash: ("0x" + "00".repeat(32)) as HexString, outputIndex: 0 },
       policyUtxoRefs: [],
       metadataLabel8746Payload: {},
+      currentSlot: 100n,
     });
     expect(res.unsignedTxCborHex).toBe(res2.unsignedTxCborHex);
   });
@@ -135,10 +138,5 @@ describe("buildBatchTx validity range enforcement (Team B round-2 strict equalit
         validityRange: { lowerBound: 99n, upperBound: 99n },
       }),
     ).rejects.toThrow(/!= current slot/);
-  });
-
-  it("back-compat: no-currentSlot path still returns a placeholder", async () => {
-    const res = await buildBatchTx(baseArgs);
-    expect(res.feeLovelace).toBe(fee);
   });
 });

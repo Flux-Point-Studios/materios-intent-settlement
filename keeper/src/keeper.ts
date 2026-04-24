@@ -30,6 +30,11 @@ import type { ICardanoProvider, BuildBatchTxInput } from "./cardano.js";
 import { buildBatchTx } from "./cardano.js";
 import { initialHaltState, stepHaltDetector, shouldPauseAttestations } from "./halt.js";
 import type { HaltState } from "./halt.js";
+import {
+  buildAndSubmitWithSlotRetry,
+  isSlotDriftError,
+  SlotDriftExhaustedError,
+} from "./slot-retry.js";
 
 export interface KeeperDeps {
   rpc: MateriosRpcClient;
@@ -194,7 +199,9 @@ export class Keeper {
     const totalAwarded = bfpr.awardedAmountsAda.reduce((a, b) => a + b, 0n);
     const feeOutput = computeKeeperFeeLovelace(totalAwarded);
 
-    const buildInput: BuildBatchTxInput = {
+    // Base build input — `currentSlot` is filled in by the slot-drift retry
+    // wrapper on each attempt so the tx is always pinned to a fresh tip.
+    const buildInputBase: Omit<BuildBatchTxInput, "currentSlot"> = {
       voucher,
       fairnessProof: bfpr,
       keeperAddr: this.deps.keeperCardanoAddr,
@@ -211,16 +218,34 @@ export class Keeper {
 
     this.deps.state.updateSubmission(claimId, { state: "submitting", attempts: (sub?.attempts ?? 0) });
 
+    // Nested retry strategy:
+    //   outer (fee-spike, retryWithBackoff): handles generic submit failures
+    //     like fee-too-low, network blips, etc. Fee-bump factor scales here.
+    //   inner (slot-drift, buildAndSubmitWithSlotRetry): handles Aiken's
+    //     strict-equality current_slot check — each attempt re-reads the tip
+    //     and rebuilds the tx pinned to it. Slot-drift errors do NOT consume
+    //     the outer fee-spike budget; other errors propagate outward.
     const result = await retryWithBackoff(
       async (attempt) => {
-        const built = await buildBatchTx(buildInput);
-        // If submitter is in dry-run, don't actually submit.
+        const bump = feeBumpFactor(attempt);
+        if (bump !== 1) this.metrics.feeSpikeRetries += 1;
+
+        // Dry-run: no real provider call, skip slot-drift retry too.
         if (this.config.dryRun) {
           return { txHash: ("0x" + "00".repeat(32)) as HexString, submittedAtSlot: 0n };
         }
-        const bump = feeBumpFactor(attempt);
-        if (bump !== 1) this.metrics.feeSpikeRetries += 1;
-        return this.deps.cardano.submitTx(built.unsignedTxCborHex);
+
+        const { submitted } = await buildAndSubmitWithSlotRetry(
+          this.deps.cardano,
+          async (currentSlot) => {
+            const built = await buildBatchTx({ ...buildInputBase, currentSlot });
+            return this.deps.cardano.submitTx(built.unsignedTxCborHex);
+          },
+          {
+            logger: (level, msg, meta) => this.log(level, msg, meta),
+          },
+        );
+        return submitted;
       },
       {
         maxAttempts: this.config.feeSpikeMaxAttempts,
@@ -228,7 +253,13 @@ export class Keeper {
         maxDelayMs: this.config.feeSpikeBackoffMs * 10,
       },
     ).catch((err) => {
-      this.log("error", "tx submit failed after max attempts", err);
+      // SlotDriftExhaustedError is terminal — don't mask it as a generic
+      // "submit failed after max attempts"; preserve the per-attempt detail.
+      if (err instanceof SlotDriftExhaustedError || isSlotDriftError(err)) {
+        this.log("error", "slot-drift retries exhausted", err);
+      } else {
+        this.log("error", "tx submit failed after max attempts", err);
+      }
       this.deps.state.updateSubmission(claimId, {
         state: "failed",
         lastError: err instanceof Error ? err.message : String(err),
