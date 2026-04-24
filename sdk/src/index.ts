@@ -86,6 +86,15 @@ export {
   ExpiryReason,
 } from "./types.js";
 
+export {
+  settleClaimPayload,
+  creditDepositPayload,
+  signPayload,
+  buildSigBundle,
+  TAG_CRDP,
+  TAG_STCL,
+} from "./multisig.js";
+
 export type {
   HexString,
   IntentId,
