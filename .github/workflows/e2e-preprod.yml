@@ -35,9 +35,10 @@ jobs:
       # tag hijack). Rotate via `gh api /repos/<org>/<repo>/git/ref/tags/v<N>`.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1 as of 2026-04-24
 
+      # pnpm version is taken from root package.json's `packageManager` field
+      # (pnpm@9.12.0). Do NOT also pass `with: version:` — action-setup@v4.3+
+      # errors on conflict (ERR_PNPM_BAD_PM_VERSION).
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0 as of 2026-04-24
-        with:
-          version: 9
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 as of 2026-04-24
         with:
@@ -72,8 +73,6 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1 as of 2026-04-24
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0 as of 2026-04-24
-        with:
-          version: 9
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 as of 2026-04-24
         with:
           node-version: 20
@@ -104,8 +103,6 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1 as of 2026-04-24
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0 as of 2026-04-24
-        with:
-          version: 9
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 as of 2026-04-24
         with:
           node-version: 20
