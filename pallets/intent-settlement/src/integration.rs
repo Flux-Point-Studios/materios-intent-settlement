@@ -15,12 +15,13 @@
 #![cfg(test)]
 
 use crate as pallet_intent_settlement;
-use crate::pallet::IsCommitteeMember;
+use crate::pallet::{IsCommitteeMember, VerifyCommitteeSignature};
 use crate::types::*;
+use crate::{credit_deposit_payload, settle_claim_payload};
 use codec::Encode;
 use frame_support::{
     assert_ok, construct_runtime, derive_impl, parameter_types,
-    traits::{ConstU32, Hooks},
+    traits::Hooks,
     BoundedVec,
 };
 use parity_scale_codec as codec;
@@ -48,6 +49,8 @@ parameter_types! {
     pub const MaxExpirePerBlock: u32 = 256;
     pub const DefaultIntentTTL: u32 = 600;
     pub const DefaultClaimTTL: u32 = 28_800;
+    pub const MaxPendingBatches: u32 = 16;
+    pub const DefaultMinSignerThreshold: u32 = 2;
 }
 
 /// Static committee: Alice/Bob/Charlie by sr25519 dev-key AccountId. Threshold 2.
@@ -78,6 +81,41 @@ impl IsCommitteeMember<sp_runtime::AccountId32> for CommitteeFromStorage {
     fn member_count() -> u32 {
         3
     }
+    fn pubkey_of(who: &sp_runtime::AccountId32) -> CommitteePubkey {
+        // AccountId32 encodes as its raw 32 bytes — the public key.
+        let bytes: &[u8; 32] = who.as_ref();
+        *bytes
+    }
+    fn account_of_pubkey(pubkey: &CommitteePubkey) -> Option<sp_runtime::AccountId32> {
+        let candidate = sp_runtime::AccountId32::from(*pubkey);
+        if Self::is_member(&candidate) {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+}
+
+/// Integration-test signature verifier: accepts iff signer's real sr25519
+/// signature over the payload. Using real crypto here is fine because
+/// sp-keyring dev keys are in scope (sp_io::TestExternalities initializes
+/// the keystore automatically for verification).
+pub struct IntegrationSigVerifier;
+impl VerifyCommitteeSignature for IntegrationSigVerifier {
+    fn verify(pubkey: &CommitteePubkey, sig: &CommitteeSig, msg: &[u8]) -> bool {
+        let pk = sp_core::sr25519::Public::from_raw(*pubkey);
+        let sg = sp_core::sr25519::Signature::from_raw(*sig);
+        sp_io::crypto::sr25519_verify(&sg, msg, &pk)
+    }
+}
+
+/// Integration helper: produce a real sr25519 signature over `msg` for the
+/// given dev-seed (e.g. "//Alice"). Used by the M-of-N gate on
+/// `credit_deposit` / `settle_claim`.
+fn sign_with(seed: &str, msg: &[u8]) -> (CommitteePubkey, CommitteeSig) {
+    let pair = sp_core::sr25519::Pair::from_string(seed, None).unwrap();
+    let sig = pair.sign(msg);
+    (pair.public().0, sig.0)
 }
 
 impl pallet_intent_settlement::pallet::Config for Testnet {
@@ -87,6 +125,9 @@ impl pallet_intent_settlement::pallet::Config for Testnet {
     type DefaultIntentTTL = DefaultIntentTTL;
     type DefaultClaimTTL = DefaultClaimTTL;
     type CommitteeMembership = CommitteeFromStorage;
+    type MaxPendingBatches = MaxPendingBatches;
+    type DefaultMinSignerThreshold = DefaultMinSignerThreshold;
+    type SigVerifier = IntegrationSigVerifier;
 }
 
 fn user_account() -> sp_runtime::AccountId32 {
@@ -111,6 +152,7 @@ fn new_ext() -> sp_io::TestExternalities {
                 outstanding_coverage_ada: 0,
             },
         );
+        pallet_intent_settlement::pallet::MinSignerThreshold::<Testnet>::put(2u32);
     });
     ext
 }
@@ -121,12 +163,26 @@ fn full_lifecycle_submit_attest_voucher_settle() {
         let (alice, bob, _charlie) = committee_accounts();
         let user = user_account();
 
-        // Block 1: committee credits deposit for user.
+        // Block 1: committee credits deposit for user — now requires a
+        // valid 2-of-3 signature envelope (Issue #7).
+        let cardano_tx = [0xAA; 32];
+        let mut target_bytes = [0u8; 32];
+        target_bytes.copy_from_slice(&user.encode()[..32]);
+        let deposit_payload = credit_deposit_payload(
+            &target_bytes,
+            10_000_000u64,
+            &cardano_tx,
+        );
+        let deposit_sigs = vec![
+            sign_with("//Alice", &deposit_payload),
+            sign_with("//Bob", &deposit_payload),
+        ];
         assert_ok!(IntentSettlement::credit_deposit(
             RuntimeOrigin::signed(alice.clone()),
             user.clone(),
             10_000_000u64,
-            [0xAA; 32]
+            cardano_tx,
+            deposit_sigs
         ));
 
         // Block 2: user submits BuyPolicy intent.
@@ -151,17 +207,26 @@ fn full_lifecycle_submit_attest_voucher_settle() {
         assert_eq!(intent.status, IntentStatus::Pending);
 
         // Block 3: alice + bob attest — threshold (2) reached, → Attested.
+        // Issue #4: pubkey must derive from origin's AccountId32.
         System::set_block_number(3);
+        let alice_pk = {
+            let b: &[u8; 32] = alice.as_ref();
+            *b
+        };
+        let bob_pk = {
+            let b: &[u8; 32] = bob.as_ref();
+            *b
+        };
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(alice.clone()),
             expected_id,
-            [1u8; 32],
+            alice_pk,
             [0u8; 64]
         ));
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(bob.clone()),
             expected_id,
-            [2u8; 32],
+            bob_pk,
             [0u8; 64]
         ));
         let intent =
@@ -189,8 +254,8 @@ fn full_lifecycle_submit_attest_voucher_settle() {
             issued_block: 4,
             expiry_slot_cardano: 100_000,
             committee_sigs: BoundedVec::try_from(vec![
-                ([1u8; 32], [0u8; 64]),
-                ([2u8; 32], [0u8; 64]),
+                (alice_pk, [0u8; 64]),
+                (bob_pk, [0u8; 64]),
             ])
             .unwrap(),
         };
@@ -206,13 +271,19 @@ fn full_lifecycle_submit_attest_voucher_settle() {
                 .unwrap();
         assert_eq!(intent.status, IntentStatus::Vouchered);
 
-        // Block 5: committee mirrors Cardano settlement.
+        // Block 5: committee mirrors Cardano settlement — also M-of-N gated.
         System::set_block_number(5);
+        let settle_payload = settle_claim_payload(&claim_id, &[0xDE; 32], false);
+        let settle_sigs = vec![
+            sign_with("//Alice", &settle_payload),
+            sign_with("//Bob", &settle_payload),
+        ];
         assert_ok!(IntentSettlement::settle_claim(
             RuntimeOrigin::signed(alice.clone()),
             claim_id,
             [0xDE; 32],
-            false
+            false,
+            settle_sigs
         ));
         let intent =
             pallet_intent_settlement::pallet::Intents::<Testnet>::get(expected_id)
@@ -245,25 +316,37 @@ fn concurrent_attestation_first_bundle_wins() {
             kind
         ));
 
-        // Block 2 — all three sign.
+        // Block 2 — all three sign; bind pubkey to origin (Issue #4).
         System::set_block_number(2);
+        let alice_pk = {
+            let b: &[u8; 32] = alice.as_ref();
+            *b
+        };
+        let bob_pk = {
+            let b: &[u8; 32] = bob.as_ref();
+            *b
+        };
+        let charlie_pk = {
+            let b: &[u8; 32] = charlie.as_ref();
+            *b
+        };
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(alice),
             iid,
-            [1u8; 32],
+            alice_pk,
             [0; 64]
         ));
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(bob),
             iid,
-            [2u8; 32],
+            bob_pk,
             [0; 64]
         ));
         // Third arrives late — must be a no-op (intent already Attested).
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(charlie),
             iid,
-            [3u8; 32],
+            charlie_pk,
             [0; 64]
         ));
         let intent =

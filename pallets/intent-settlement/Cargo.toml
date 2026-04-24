@@ -15,6 +15,7 @@ frame-system = { workspace = true }
 pallet-balances = { workspace = true }
 sp-api = { workspace = true }
 sp-core = { workspace = true }
+sp-io = { workspace = true }
 sp-runtime = { workspace = true }
 sp-std = { workspace = true }
 log = { workspace = true }
@@ -39,6 +40,7 @@ std = [
     "pallet-balances/std",
     "sp-api/std",
     "sp-core/std",
+    "sp-io/std",
     "sp-runtime/std",
     "sp-std/std",
     "log/std",
