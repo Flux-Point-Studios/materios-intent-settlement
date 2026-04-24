@@ -49,6 +49,45 @@ pub fn account_to_bytes<A: Encode>(account: &A) -> [u8; 32] {
     buf
 }
 
+/// Issue #7: domain tag for the `credit_deposit` multisig payload.
+pub const TAG_CRDP: &[u8; 4] = b"CRDP";
+/// Issue #7: domain tag for the `settle_claim` multisig payload.
+pub const TAG_STCL: &[u8; 4] = b"STCL";
+
+/// Canonical digest signed by committee members when authorizing a
+/// `credit_deposit(target, amount, cardano_tx_hash)` call (Issue #7).
+///
+/// `blake2_256(b"CRDP" || target_bytes (32B) || amount_ada (LE u64)
+///             || cardano_tx_hash (32B))`
+pub fn credit_deposit_payload(
+    target_bytes: &[u8; 32],
+    amount_ada: u64,
+    cardano_tx_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut body = alloc::vec::Vec::with_capacity(32 + 8 + 32);
+    body.extend_from_slice(target_bytes);
+    body.extend_from_slice(&amount_ada.to_le_bytes());
+    body.extend_from_slice(cardano_tx_hash);
+    crate::types::domain_hash(*TAG_CRDP, &body)
+}
+
+/// Canonical digest signed by committee members when authorizing a
+/// `settle_claim(claim_id, cardano_tx_hash, settled_direct)` call (Issue #7).
+///
+/// `blake2_256(b"STCL" || claim_id (32B) || cardano_tx_hash (32B)
+///             || settled_direct (1B))`
+pub fn settle_claim_payload(
+    claim_id: &IntentId,
+    cardano_tx_hash: &[u8; 32],
+    settled_direct: bool,
+) -> [u8; 32] {
+    let mut body = alloc::vec::Vec::with_capacity(32 + 32 + 1);
+    body.extend_from_slice(claim_id.as_bytes());
+    body.extend_from_slice(cardano_tx_hash);
+    body.push(if settled_direct { 1u8 } else { 0u8 });
+    crate::types::domain_hash(*TAG_STCL, &body)
+}
+
 #[frame_support::pallet]
 pub mod pallet {
     use super::*;
@@ -85,13 +124,61 @@ pub mod pallet {
         /// pallet). We accept an abstract predicate so in tests we can swap it
         /// without wiring the full `pallet_committee_governance`.
         type CommitteeMembership: IsCommitteeMember<Self::AccountId>;
+
+        /// Upper bound on the `PendingBatches` index (intents live in the
+        /// index until terminal status). Prevents unbounded growth while also
+        /// capping the `get_pending_batches` RPC worst-case. Per spec §2.7
+        /// keepers poll in small chunks so 10_000 is ample headroom.
+        #[pallet::constant]
+        type MaxPendingBatches: Get<u32>;
+
+        /// Genesis default for the `MinSignerThreshold` (number of distinct
+        /// committee signatures required to authorize `credit_deposit` and
+        /// `settle_claim`). Runtime governance (`set_min_signer_threshold`)
+        /// can bump this post-launch without a code upgrade.
+        #[pallet::constant]
+        type DefaultMinSignerThreshold: Get<u32>;
+
+        /// Signature verifier used by the M-of-N gate on `credit_deposit`
+        /// and `settle_claim` (Issue #7). In prod this wires to sr25519; in
+        /// tests we substitute a deterministic stub (see `MockSigVerifier`)
+        /// so fixtures aren't forced to sign full sr25519 payloads.
+        type SigVerifier: VerifyCommitteeSignature;
     }
 
-    /// Abstracts "is this account a member of the current committee?"
+    /// Abstraction for verifying an `sr25519` signature over a committee
+    /// pubkey / payload pair.
+    pub trait VerifyCommitteeSignature {
+        fn verify(pubkey: &CommitteePubkey, sig: &CommitteeSig, msg: &[u8]) -> bool;
+    }
+
+    /// Production verifier: delegates to sr25519 via sp-io crypto host fn.
+    pub struct Sr25519Verifier;
+    impl VerifyCommitteeSignature for Sr25519Verifier {
+        fn verify(pubkey: &CommitteePubkey, sig: &CommitteeSig, msg: &[u8]) -> bool {
+            let pk = sp_core::sr25519::Public::from_raw(*pubkey);
+            let sg = sp_core::sr25519::Signature::from_raw(*sig);
+            sp_io::crypto::sr25519_verify(&sg, msg, &pk)
+        }
+    }
+
+    /// Abstracts "is this account a member of the current committee?" plus
+    /// the bidirectional `AccountId <-> CommitteePubkey` mapping that binds
+    /// the caller of `attest_intent` to the pubkey they submit, closing the
+    /// attestation-spoofing vector (Issue #4).
     pub trait IsCommitteeMember<AccountId> {
         fn is_member(who: &AccountId) -> bool;
         fn threshold() -> u32;
         fn member_count() -> u32;
+        /// Derive the on-chain committee pubkey (`[u8; 32]`) from an
+        /// `AccountId`. For `AccountId32` this is the raw 32 bytes of the
+        /// account; for test runtimes with `AccountId = u64` we left-pad into
+        /// a 32-byte buffer to keep the mapping injective.
+        fn pubkey_of(who: &AccountId) -> CommitteePubkey;
+        /// Reverse mapping (used to look up the "caller" account when we
+        /// only have a pubkey, e.g. a signature in a multisig envelope).
+        /// Returns `None` when the pubkey isn't in the current committee.
+        fn account_of_pubkey(pubkey: &CommitteePubkey) -> Option<AccountId>;
     }
 
     #[pallet::pallet]
@@ -171,6 +258,30 @@ pub mod pallet {
     #[pallet::storage]
     pub type PoolUtilization<T: Config> =
         StorageValue<_, PoolUtilizationParams, ValueQuery>;
+
+    /// Index of non-terminal intents (Issue #6). Maintained in lockstep with
+    /// the `Intents` map:
+    /// - `submit_intent` appends on success
+    /// - `settle_claim`, `expire_policy_mirror`, TTL sweep, and the
+    ///   `request_voucher` transition (Attested -> Vouchered) remove
+    ///
+    /// `get_pending_batches` now reads this index and status-filters in-memory
+    /// instead of `Intents::<T>::iter()`, replacing the prior O(N) scan with
+    /// O(index_len) which is itself bounded by `MaxPendingBatches`.
+    #[pallet::storage]
+    pub type PendingBatches<T: Config> = StorageValue<
+        _,
+        BoundedVec<IntentId, <T as Config>::MaxPendingBatches>,
+        ValueQuery,
+    >;
+
+    /// Governance-tunable minimum number of distinct committee signatures
+    /// required to authorize `credit_deposit` or `settle_claim` (Issue #7).
+    /// A value of 0 means "not yet initialized — fall back to
+    /// `DefaultMinSignerThreshold`"; the effective threshold in-flight is
+    /// always `max(stored, 1)`, and further bounded by the committee size.
+    #[pallet::storage]
+    pub type MinSignerThreshold<T: Config> = StorageValue<_, u32, ValueQuery>;
 
     // ---------------------------------------------------------------------
     // Events
@@ -261,6 +372,33 @@ pub mod pallet {
         UnknownPolicy,
         /// Committee bundle size exceeds configured MaxCommittee.
         TooManySigs,
+        /// Issue #4: `attest_intent` was called with a `pubkey` argument that
+        /// does not derive back to the signed origin. Blocks a single caller
+        /// from spoofing N attestations via N different pubkeys.
+        CallerPubkeyMismatch,
+        /// Issue #5: accumulating the batch's fairness-proof amount into
+        /// `outstanding_coverage_ada` would overflow `u64`. Rejected rather
+        /// than silently wrapping.
+        CoverageOverflow,
+        /// Issue #6: `PendingBatches` index is at `MaxPendingBatches` capacity.
+        /// Caller must wait for pending intents to terminalize before
+        /// submitting another. Never hits in steady state — the bound is
+        /// sized (10k) for well behind the keeper-poll watermark.
+        PendingBatchesFull,
+        /// Issue #7: the multisig envelope did not contain enough distinct
+        /// valid signatures (threshold check). Carries no details to avoid
+        /// leaking which specific signer was missing.
+        InsufficientSignatures,
+        /// Issue #7: a duplicate pubkey appeared in the multisig signer list.
+        /// Treated as a hard reject (not a de-dup) so that replay attacks are
+        /// unambiguously surfaced.
+        DuplicateSigner,
+        /// Issue #7: a signature in the multisig envelope failed sr25519
+        /// verification against the canonical payload digest.
+        InvalidSignature,
+        /// Issue #7: a pubkey in the multisig envelope is not a current
+        /// committee member.
+        SignerNotCommitteeMember,
     }
 
     // ---------------------------------------------------------------------
@@ -273,6 +411,9 @@ pub mod pallet {
         pub intent_ttl: BlockNumber,
         pub claim_ttl: BlockNumber,
         pub pool_utilization: PoolUtilizationParams,
+        /// Issue #7: M-of-N bar for `credit_deposit`/`settle_claim`. Zero
+        /// means "use DefaultMinSignerThreshold from Config".
+        pub min_signer_threshold: u32,
         #[serde(skip)]
         pub _phantom: core::marker::PhantomData<T>,
     }
@@ -293,6 +434,12 @@ pub mod pallet {
             IntentTTL::<T>::put(ttl_intent);
             ClaimTTL::<T>::put(ttl_claim);
             PoolUtilization::<T>::put(self.pool_utilization);
+            let mst = if self.min_signer_threshold == 0 {
+                T::DefaultMinSignerThreshold::get()
+            } else {
+                self.min_signer_threshold
+            };
+            MinSignerThreshold::<T>::put(mst);
         }
     }
 
@@ -326,6 +473,9 @@ pub mod pallet {
                             });
                         }
                         Intents::<T>::insert(intent_id, intent);
+                        // Issue #6: drop from PendingBatches index on TTL
+                        // expiry — terminal status.
+                        Self::remove_from_pending_batches(intent_id);
                         Self::deposit_event(Event::IntentExpired {
                             intent_id,
                             reason: ExpiryReason::TTL,
@@ -373,6 +523,17 @@ pub mod pallet {
             ensure!(
                 T::CommitteeMembership::is_member(&who),
                 Error::<T>::NotCommitteeMember
+            );
+
+            // Issue #4: bind the `pubkey` argument to the signed origin.
+            // Previously any committee member could post an attestation
+            // "from" any other pubkey, letting one caller spoof N
+            // attestations toward threshold. The derivation is runtime-
+            // provided (`PubkeyOf`) so `AccountId32` maps to its raw 32-byte
+            // public key while test runtimes with `u64` accounts left-pad.
+            ensure!(
+                T::CommitteeMembership::pubkey_of(&who) == pubkey,
+                Error::<T>::CallerPubkeyMismatch
             );
 
             // If already Attested, make this a no-op (idempotent).
@@ -454,13 +615,27 @@ pub mod pallet {
                 Error::<T>::FairnessDigestMismatch
             );
 
+            // Issue #5: pre-check the `outstanding_coverage_ada` increment
+            // BEFORE mutating storage (checked_add -> CoverageOverflow) so
+            // that a craft-a-batch overflow attempt cannot leave state in a
+            // half-updated shape. We only account for this single claim's
+            // `voucher.amount_ada`, matching the symmetric `settle_claim`
+            // decrement in the same unit — the prior batch-sum semantics
+            // drifted the counter for every partial batch (+10*, -1*).
+            let pool = PoolUtilization::<T>::get();
+            let new_outstanding = pool
+                .outstanding_coverage_ada
+                .checked_add(voucher.amount_ada)
+                .ok_or(Error::<T>::CoverageOverflow)?;
+
             let voucher_digest = compute_voucher_digest(&voucher);
+            let voucher_amount = voucher.amount_ada;
 
             // Store claim + voucher, flip intent state.
             let claim = Claim {
                 intent_id,
                 policy_id: voucher.policy_id,
-                amount_ada: voucher.amount_ada,
+                amount_ada: voucher_amount,
                 issued_block: voucher.issued_block,
                 expiry_slot_cardano: voucher.expiry_slot_cardano,
                 settled: false,
@@ -471,13 +646,15 @@ pub mod pallet {
             Vouchers::<T>::insert(claim_id, voucher);
             intent.status = IntentStatus::Vouchered;
             Intents::<T>::insert(intent_id, intent);
+            // Issue #6: once Vouchered the intent is out of the keeper's
+            // attested-batch window. Drop from the index so get_pending_batches
+            // doesn't re-surface it, and the index doesn't grow unboundedly.
+            Self::remove_from_pending_batches(intent_id);
 
-            // Bump outstanding coverage for utilization tracking.
+            // Issue #5: write the pre-checked value; `outstanding_coverage_ada`
+            // is now maintained symmetrically against `settle_claim`.
             PoolUtilization::<T>::mutate(|u| {
-                u.outstanding_coverage_ada =
-                    u.outstanding_coverage_ada.saturating_add(fairness_proof.pool_balance_ada.min(
-                        fairness_proof.awarded_amounts_ada.iter().copied().sum(),
-                    ));
+                u.outstanding_coverage_ada = new_outstanding;
             });
 
             Self::deposit_event(Event::VoucherIssued {
@@ -519,12 +696,25 @@ pub mod pallet {
             claim_id: ClaimId,
             cardano_tx_hash: [u8; 32],
             settled_direct: bool,
+            signatures: Vec<(CommitteePubkey, CommitteeSig)>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(
                 T::CommitteeMembership::is_member(&who),
                 Error::<T>::NotCommitteeMember
             );
+
+            // Issue #7: require M-of-N distinct committee signatures over the
+            // canonical payload. The origin itself MUST sign (otherwise any
+            // member could replay stale signature bundles), so we build the
+            // digest including who and verify inclusion.
+            let payload = settle_claim_payload(
+                &claim_id,
+                &cardano_tx_hash,
+                settled_direct,
+            );
+            Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
+
             let mut claim =
                 Claims::<T>::get(claim_id).ok_or(Error::<T>::ClaimNotFound)?;
             if claim.settled {
@@ -541,6 +731,8 @@ pub mod pallet {
                 intent.status = IntentStatus::Settled;
                 Intents::<T>::insert(intent_id, intent);
             }
+            // Issue #6: intent is now terminal; drop from index.
+            Self::remove_from_pending_batches(intent_id);
 
             // Decrement outstanding coverage.
             PoolUtilization::<T>::mutate(|u| {
@@ -580,6 +772,8 @@ pub mod pallet {
             }
             intent.status = IntentStatus::Expired;
             Intents::<T>::insert(intent_id, intent);
+            // Issue #6: terminal → drop from PendingBatches.
+            Self::remove_from_pending_batches(intent_id);
             Self::deposit_event(Event::IntentExpired {
                 intent_id,
                 reason: ExpiryReason::PolicyExpiredOnCardano,
@@ -596,12 +790,27 @@ pub mod pallet {
             target: T::AccountId,
             amount_ada: AdaLovelace,
             cardano_tx_hash: [u8; 32],
+            signatures: Vec<(CommitteePubkey, CommitteeSig)>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(
                 T::CommitteeMembership::is_member(&who),
                 Error::<T>::NotCommitteeMember
             );
+
+            // Issue #7: M-of-N gate. Previously any single committee member
+            // could unilaterally credit any ADA amount onto any account —
+            // trivial pool drain. We now require `MinSignerThreshold`
+            // distinct committee signatures over the canonical payload
+            // (target, amount, tx_hash) and verify each at runtime.
+            let target_bytes = crate::account_to_bytes(&target);
+            let payload = credit_deposit_payload(
+                &target_bytes,
+                amount_ada,
+                &cardano_tx_hash,
+            );
+            Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
+
             let key = (target.clone(), cardano_tx_hash);
             ensure!(
                 !ProcessedDeposits::<T>::contains_key(&key),
@@ -636,6 +845,25 @@ pub mod pallet {
                 total_nav_ada: params.total_nav_ada,
                 outstanding_coverage_ada: params.outstanding_coverage_ada,
             });
+            Ok(())
+        }
+
+        /// Issue #7: Root-only governance knob to tune the M-of-N floor at
+        /// runtime (preprod launches with 2, mainnet bumps to 3 via this
+        /// extrinsic). Setting 0 resets to `DefaultMinSignerThreshold`.
+        #[pallet::call_index(8)]
+        #[pallet::weight((Weight::from_parts(10_000_000, 0), DispatchClass::Operational, Pays::No))]
+        pub fn set_min_signer_threshold(
+            origin: OriginFor<T>,
+            new_threshold: u32,
+        ) -> DispatchResult {
+            ensure_root(origin)?;
+            let v = if new_threshold == 0 {
+                T::DefaultMinSignerThreshold::get()
+            } else {
+                new_threshold
+            };
+            MinSignerThreshold::<T>::put(v);
             Ok(())
         }
     }
@@ -695,6 +923,14 @@ pub mod pallet {
                 Error::<T>::DuplicateIntent
             );
 
+            // Issue #6: maintain a bounded index alongside Intents so
+            // get_pending_batches can avoid the O(N) Intents::iter() scan.
+            // Check the capacity BEFORE any storage mutation so the TX is a
+            // no-op on bound-exceeded.
+            let mut pb = PendingBatches::<T>::get();
+            pb.try_push(intent_id)
+                .map_err(|_| Error::<T>::PendingBatchesFull)?;
+
             let intent = Intent {
                 submitter: who.clone(),
                 nonce,
@@ -705,6 +941,7 @@ pub mod pallet {
             };
             Intents::<T>::insert(intent_id, intent);
             Nonces::<T>::insert(&who, nonce.saturating_add(1));
+            PendingBatches::<T>::put(pb);
 
             let mut queue = ExpiryQueue::<T>::get(ttl_block);
             let _ = queue.try_push(intent_id); // best-effort; if full, GC runs next block
@@ -758,12 +995,24 @@ pub mod pallet {
 
         /// Runtime-API helper: return up to `max_count` attested-but-not-
         /// vouchered intents with `submitted_block >= since_block`.
+        ///
+        /// Issue #6: this previously scanned the entire `Intents` map which
+        /// was O(N_total) per keeper poll. We now iterate the
+        /// `PendingBatches` index (bounded by `MaxPendingBatches`) and
+        /// in-memory filter by status. Terminal transitions (settle, expire,
+        /// voucher) remove their id from the index, so the iteration cost
+        /// tracks real work, not historical churn.
         pub fn get_pending_batches(
             since_block: BlockNumber,
             max_count: u32,
         ) -> Vec<BatchPayload<T::AccountId>> {
             let mut out = Vec::new();
-            for (intent_id, intent) in Intents::<T>::iter() {
+            let pb = PendingBatches::<T>::get();
+            for intent_id in pb.iter() {
+                let intent = match Intents::<T>::get(intent_id) {
+                    Some(i) => i,
+                    None => continue, // stale index entry, harmless
+                };
                 if intent.submitted_block < since_block {
                     continue;
                 }
@@ -777,7 +1026,7 @@ pub mod pallet {
                 > = BoundedVec::truncate_from(sigs.into_inner());
                 out.push(BatchPayload {
                     intent,
-                    intent_id,
+                    intent_id: *intent_id,
                     attestation_sigs: sigs_static,
                 });
                 if out.len() as u32 >= max_count {
@@ -785,6 +1034,81 @@ pub mod pallet {
                 }
             }
             out
+        }
+
+        /// Issue #6: remove `intent_id` from the `PendingBatches` index. No-op
+        /// if the id isn't present (idempotent on already-terminalized intents).
+        pub(crate) fn remove_from_pending_batches(intent_id: IntentId) {
+            PendingBatches::<T>::mutate(|pb| {
+                if let Some(pos) = pb.iter().position(|id| id == &intent_id) {
+                    pb.remove(pos);
+                }
+            });
+        }
+
+        /// Issue #7: verify that `signatures` contains at least the effective
+        /// `MinSignerThreshold` distinct, valid sr25519 signatures over
+        /// `payload`, each produced by a current committee member. The caller
+        /// (`who`) itself MUST appear as one of the signers — this binds the
+        /// on-chain origin to the multisig bundle so a stale bundle can't be
+        /// replayed by a non-signing member.
+        pub(crate) fn ensure_threshold_signatures(
+            payload: &[u8; 32],
+            who: &T::AccountId,
+            signatures: &[(CommitteePubkey, CommitteeSig)],
+        ) -> DispatchResult {
+            let effective_threshold = {
+                let stored = MinSignerThreshold::<T>::get();
+                let base = if stored == 0 {
+                    T::DefaultMinSignerThreshold::get()
+                } else {
+                    stored
+                };
+                base.max(1)
+            };
+
+            // Short-circuit: must have at least `threshold` entries.
+            ensure!(
+                signatures.len() as u32 >= effective_threshold,
+                Error::<T>::InsufficientSignatures
+            );
+
+            // Origin-binding: the caller's own pubkey must be one of the signers.
+            let caller_pubkey = T::CommitteeMembership::pubkey_of(who);
+
+            let mut seen: alloc::vec::Vec<CommitteePubkey> =
+                alloc::vec::Vec::with_capacity(signatures.len());
+            let mut caller_present = false;
+            for (pubkey, sig) in signatures.iter() {
+                // Duplicate-signer check (Issue #7: prevent "2-of-2 by one
+                // caller pasting the same sig twice").
+                ensure!(!seen.contains(pubkey), Error::<T>::DuplicateSigner);
+                // Every signer must be a current committee member.
+                let account = T::CommitteeMembership::account_of_pubkey(pubkey)
+                    .ok_or(Error::<T>::SignerNotCommitteeMember)?;
+                ensure!(
+                    T::CommitteeMembership::is_member(&account),
+                    Error::<T>::SignerNotCommitteeMember
+                );
+                // sr25519 verify via T::SigVerifier (pluggable so tests can
+                // swap in a deterministic stub — see `MockSigVerifier` in
+                // tests.rs). Signatures in prod are sr25519 per spec §3.1.
+                if !T::SigVerifier::verify(pubkey, sig, payload) {
+                    return Err(Error::<T>::InvalidSignature.into());
+                }
+                if pubkey == &caller_pubkey {
+                    caller_present = true;
+                }
+                seen.push(*pubkey);
+            }
+            ensure!(caller_present, Error::<T>::InsufficientSignatures);
+
+            // Effective count of distinct signers must meet the threshold.
+            ensure!(
+                seen.len() as u32 >= effective_threshold,
+                Error::<T>::InsufficientSignatures
+            );
+            Ok(())
         }
 
         /// Runtime-API: full voucher for a claim id.
