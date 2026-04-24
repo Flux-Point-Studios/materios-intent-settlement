@@ -62,7 +62,7 @@ e2e/
 ## Tech stack
 
 - `@polkadot/api` — Materios preprod RPC client
-- `@meshsdk/core` — (future) Cardano tx-building if the demo ever builds txs itself; currently the keeper (Team C) builds them and this demo only reads Kupo
+- `undici` — HTTP client for Kupo queries (JSON-over-HTTP)
 - `blake2b` — pure-JS Blake2b-256 for domain-tagged hashing
 - `vitest` — unit tests + E2E describe.todo gate
 - `tsx` — run the TS demo without a pre-build step
