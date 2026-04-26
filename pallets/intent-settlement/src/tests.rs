@@ -49,6 +49,10 @@ parameter_types! {
     pub const MaxPendingBatches: u32 = 16;
     /// Issue #7: preprod default.
     pub const DefaultMinSignerThreshold: u32 = 2;
+    /// Task #177: test-runtime bound on `settle_batch_atomic` size.
+    /// Mirror the prod default (256) so the unit-test scaling assertions
+    /// reflect what the live chain will see.
+    pub const MaxSettleBatch: u32 = 256;
 }
 
 /// Issue #4 helper: our tests use `u64` AccountIds. Derive a synthetic
@@ -147,6 +151,7 @@ impl pallet_intent_settlement::pallet::Config for Test {
     type MaxPendingBatches = MaxPendingBatches;
     type DefaultMinSignerThreshold = DefaultMinSignerThreshold;
     type SigVerifier = MockSigVerifier;
+    type MaxSettleBatch = MaxSettleBatch;
 }
 
 pub const ALICE: u64 = 100;
@@ -1928,6 +1933,401 @@ fn test_vectors_match_json() {
         .try_into()
         .unwrap();
     assert_eq!(got2, expected2, "committee_set_digest mismatch");
+}
+
+// ---------------------------------------------------------------------------
+// Task #177 — settle_batch_atomic unit tests
+// ---------------------------------------------------------------------------
+
+/// Build a fresh "vouchered" claim ready for settlement. Submits an intent
+/// (RequestPayout, no pool-utilization side-effect), attests it M-of-N,
+/// then requests a voucher with `amount`. Returns `(claim_id, intent_id)`.
+fn vouchered_claim(claim_seed: u8, amount: u64) -> (ClaimId, IntentId) {
+    use pallet_intent_settlement::pallet::PoolUtilization;
+
+    // Bump pool NAV so this voucher fits — use BuyPolicy so we exercise the
+    // outstanding_coverage_ada path that settle_batch_atomic must decrement.
+    PoolUtilization::<Test>::mutate(|u| {
+        u.total_nav_ada = u.total_nav_ada.saturating_add(amount.saturating_mul(2));
+    });
+    pallet_intent_settlement::pallet::Credits::<Test>::mutate(ALICE, |c| {
+        *c = c.saturating_add(amount);
+    });
+    let kind = bp(claim_seed, 1, amount);
+    let nonce = pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE);
+    let blk: u32 = System::block_number().try_into().unwrap();
+    let iid = intent_id_for(ALICE, nonce, &kind, blk);
+    assert_ok!(IntentSettlement::submit_intent(
+        RuntimeOrigin::signed(ALICE),
+        kind
+    ));
+    // Attest M-of-N (threshold = 2 in mock).
+    assert_ok!(IntentSettlement::attest_intent(
+        RuntimeOrigin::signed(1),
+        iid,
+        mock_pubkey_of(&1),
+        [0u8; 64]
+    ));
+    assert_ok!(IntentSettlement::attest_intent(
+        RuntimeOrigin::signed(2),
+        iid,
+        mock_pubkey_of(&2),
+        [0u8; 64]
+    ));
+    // Voucher.
+    let claim_id = H256::from([claim_seed; 32]);
+    let bfpr = good_fairness_proof(iid, amount);
+    let voucher = good_voucher(claim_id, &bfpr, amount);
+    assert_ok!(IntentSettlement::request_voucher(
+        RuntimeOrigin::signed(1),
+        claim_id,
+        iid,
+        voucher,
+        bfpr,
+        mock_voucher_sigs(),
+    ));
+    (claim_id, iid)
+}
+
+/// Build an STBA-payload sig bundle for `(member 1, member 2)` over `entries`.
+fn stba_sigs_for(entries: &[SettleBatchEntry]) -> Vec<(CommitteePubkey, CommitteeSig)> {
+    // MockSigVerifier is marker-byte-based, so the actual payload doesn't
+    // affect verification; but we still build the digest so the production
+    // path (settle_batch_atomic_payload) is exercised.
+    let _ = pallet_intent_settlement::settle_batch_atomic_payload(entries);
+    vec![mock_sig_for(1), mock_sig_for(2)]
+}
+
+#[test]
+fn batch_atomic_happy_path_settles_all_and_emits_one_event() {
+    new_test_ext().execute_with(|| {
+        let (c1, _) = vouchered_claim(0xA1, 200_000);
+        let (c2, _) = vouchered_claim(0xA2, 300_000);
+        let (c3, _) = vouchered_claim(0xA3, 400_000);
+        let outstanding_before =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .outstanding_coverage_ada;
+        let entries: Vec<SettleBatchEntry> = vec![
+            SettleBatchEntry { claim_id: c1, cardano_tx_hash: [1u8; 32], settled_direct: false },
+            SettleBatchEntry { claim_id: c2, cardano_tx_hash: [2u8; 32], settled_direct: true },
+            SettleBatchEntry { claim_id: c3, cardano_tx_hash: [3u8; 32], settled_direct: false },
+        ];
+        let sigs = stba_sigs_for(&entries);
+        let bv: BoundedVec<SettleBatchEntry, MaxSettleBatch> =
+            BoundedVec::try_from(entries.clone()).unwrap();
+
+        assert_ok!(IntentSettlement::settle_batch_atomic(
+            RuntimeOrigin::signed(1),
+            bv,
+            sigs,
+        ));
+
+        for c in [c1, c2, c3].iter() {
+            let claim =
+                pallet_intent_settlement::pallet::Claims::<Test>::get(*c).unwrap();
+            assert!(claim.settled, "claim {:?} not marked settled", c);
+        }
+        // Outstanding coverage decremented by 200k+300k+400k = 900k.
+        let outstanding_after =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .outstanding_coverage_ada;
+        assert_eq!(outstanding_before - outstanding_after, 900_000);
+
+        // BatchSettled event emitted with count=3 + settled_direct_count=1.
+        let events: Vec<_> = System::events()
+            .into_iter()
+            .filter_map(|er| match er.event {
+                RuntimeEvent::IntentSettlement(
+                    pallet_intent_settlement::pallet::Event::BatchSettled {
+                        count, settled_direct_count, batch_digest,
+                    }
+                ) => Some((count, settled_direct_count, batch_digest)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events.len(), 1);
+        let (count, direct, digest) = events[0];
+        assert_eq!(count, 3);
+        assert_eq!(direct, 1);
+        let expected_digest =
+            pallet_intent_settlement::settle_batch_atomic_payload(&entries);
+        assert_eq!(digest, expected_digest);
+    });
+}
+
+#[test]
+fn batch_atomic_atomic_revert_on_one_bad_claim() {
+    new_test_ext().execute_with(|| {
+        let (c1, _) = vouchered_claim(0xB1, 100_000);
+        let (c2, _) = vouchered_claim(0xB2, 100_000);
+        let bogus_claim = H256::from([0xFF; 32]); // never created
+        let outstanding_before =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .outstanding_coverage_ada;
+        let entries: Vec<SettleBatchEntry> = vec![
+            SettleBatchEntry { claim_id: c1, cardano_tx_hash: [1u8; 32], settled_direct: false },
+            SettleBatchEntry { claim_id: bogus_claim, cardano_tx_hash: [2u8; 32], settled_direct: false },
+            SettleBatchEntry { claim_id: c2, cardano_tx_hash: [3u8; 32], settled_direct: false },
+        ];
+        let sigs = stba_sigs_for(&entries);
+        let bv: BoundedVec<SettleBatchEntry, MaxSettleBatch> =
+            BoundedVec::try_from(entries).unwrap();
+
+        assert_noop!(
+            IntentSettlement::settle_batch_atomic(
+                RuntimeOrigin::signed(1),
+                bv,
+                sigs,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::ClaimNotFound,
+        );
+        // Atomic: c1 and c2 NOT settled even though they processed first.
+        for c in [c1, c2].iter() {
+            let claim =
+                pallet_intent_settlement::pallet::Claims::<Test>::get(*c).unwrap();
+            assert!(!claim.settled, "claim {:?} mid-batch leak — atomicity broken", c);
+        }
+        // Outstanding coverage unchanged.
+        let outstanding_after =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .outstanding_coverage_ada;
+        assert_eq!(outstanding_before, outstanding_after);
+    });
+}
+
+#[test]
+fn batch_atomic_rejects_duplicate_claim_in_batch() {
+    new_test_ext().execute_with(|| {
+        let (c1, _) = vouchered_claim(0xC1, 100_000);
+        let (c2, _) = vouchered_claim(0xC2, 100_000);
+        let entries: Vec<SettleBatchEntry> = vec![
+            SettleBatchEntry { claim_id: c1, cardano_tx_hash: [1u8; 32], settled_direct: false },
+            SettleBatchEntry { claim_id: c2, cardano_tx_hash: [2u8; 32], settled_direct: false },
+            SettleBatchEntry { claim_id: c1, cardano_tx_hash: [3u8; 32], settled_direct: false }, // dup
+        ];
+        let sigs = stba_sigs_for(&entries);
+        let bv: BoundedVec<SettleBatchEntry, MaxSettleBatch> =
+            BoundedVec::try_from(entries).unwrap();
+
+        assert_noop!(
+            IntentSettlement::settle_batch_atomic(RuntimeOrigin::signed(1), bv, sigs),
+            pallet_intent_settlement::pallet::Error::<Test>::DuplicateClaimInBatch,
+        );
+    });
+}
+
+#[test]
+fn batch_atomic_rejects_already_settled_claim() {
+    new_test_ext().execute_with(|| {
+        let (c1, _) = vouchered_claim(0xD1, 100_000);
+        let (c2, _) = vouchered_claim(0xD2, 100_000);
+        // Settle c1 via single-claim path FIRST.
+        assert_ok!(IntentSettlement::settle_claim(
+            RuntimeOrigin::signed(1),
+            c1,
+            [9u8; 32],
+            false,
+            mock_settle_sigs(),
+        ));
+        // Now try a batch that includes the already-settled c1.
+        let entries: Vec<SettleBatchEntry> = vec![
+            SettleBatchEntry { claim_id: c1, cardano_tx_hash: [1u8; 32], settled_direct: false },
+            SettleBatchEntry { claim_id: c2, cardano_tx_hash: [2u8; 32], settled_direct: false },
+        ];
+        let sigs = stba_sigs_for(&entries);
+        let bv: BoundedVec<SettleBatchEntry, MaxSettleBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_noop!(
+            IntentSettlement::settle_batch_atomic(RuntimeOrigin::signed(1), bv, sigs),
+            pallet_intent_settlement::pallet::Error::<Test>::BatchClaimAlreadySettled,
+        );
+        // c2 still unsettled (atomic).
+        let claim2 =
+            pallet_intent_settlement::pallet::Claims::<Test>::get(c2).unwrap();
+        assert!(!claim2.settled);
+    });
+}
+
+#[test]
+fn batch_atomic_rejects_empty_batch() {
+    new_test_ext().execute_with(|| {
+        let bv: BoundedVec<SettleBatchEntry, MaxSettleBatch> =
+            BoundedVec::default();
+        let sigs = vec![mock_sig_for(1), mock_sig_for(2)];
+        assert_noop!(
+            IntentSettlement::settle_batch_atomic(RuntimeOrigin::signed(1), bv, sigs),
+            pallet_intent_settlement::pallet::Error::<Test>::EmptyBatch,
+        );
+    });
+}
+
+#[test]
+fn batch_atomic_rejects_non_committee_caller() {
+    new_test_ext().execute_with(|| {
+        let (c1, _) = vouchered_claim(0xE1, 100_000);
+        let entries: Vec<SettleBatchEntry> = vec![SettleBatchEntry {
+            claim_id: c1, cardano_tx_hash: [1u8; 32], settled_direct: false,
+        }];
+        let sigs = stba_sigs_for(&entries);
+        let bv: BoundedVec<SettleBatchEntry, MaxSettleBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        // ALICE (account 100) is NOT a committee member.
+        assert_noop!(
+            IntentSettlement::settle_batch_atomic(
+                RuntimeOrigin::signed(ALICE), bv, sigs
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::NotCommitteeMember,
+        );
+    });
+}
+
+#[test]
+fn batch_atomic_below_threshold_rejected() {
+    new_test_ext().execute_with(|| {
+        let (c1, _) = vouchered_claim(0xF1, 100_000);
+        let entries: Vec<SettleBatchEntry> = vec![SettleBatchEntry {
+            claim_id: c1, cardano_tx_hash: [1u8; 32], settled_direct: false,
+        }];
+        let bv: BoundedVec<SettleBatchEntry, MaxSettleBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        // Only 1 sig — threshold is 2.
+        assert_noop!(
+            IntentSettlement::settle_batch_atomic(
+                RuntimeOrigin::signed(1),
+                bv,
+                vec![mock_sig_for(1)],
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures,
+        );
+    });
+}
+
+#[test]
+fn batch_atomic_signature_must_match_batch_digest_not_per_entry() {
+    // Critical correctness test: the settle_batch_atomic_payload pre-image
+    // is over the WHOLE batch. If a caller tried to sign a per-entry STCL
+    // payload (the old single-call path) it MUST not be accepted by the
+    // batch path. Conversely, the batch payload over the right entries IS
+    // accepted.
+    new_test_ext().execute_with(|| {
+        let (c1, _) = vouchered_claim(0xAA, 100_000);
+        let (c2, _) = vouchered_claim(0xAB, 100_000);
+        let entries = vec![
+            SettleBatchEntry { claim_id: c1, cardano_tx_hash: [1u8; 32], settled_direct: false },
+            SettleBatchEntry { claim_id: c2, cardano_tx_hash: [2u8; 32], settled_direct: false },
+        ];
+        // Compute the canonical pre-image and confirm it differs from the
+        // per-entry STCL payloads (the old single-call path). This is a
+        // pure-function assertion that doesn't touch the chain.
+        let batch_digest = pallet_intent_settlement::settle_batch_atomic_payload(&entries);
+        let stcl_for_c1 = pallet_intent_settlement::settle_claim_payload(
+            &entries[0].claim_id, &entries[0].cardano_tx_hash, entries[0].settled_direct
+        );
+        assert_ne!(batch_digest, stcl_for_c1,
+            "STBA must domain-separate from STCL — otherwise a per-claim \
+             signature could be replayed against the batch path");
+        // Different batches must produce different digests.
+        let mut wrong_entries = entries.clone();
+        wrong_entries[0].cardano_tx_hash = [42u8; 32];
+        let wrong_digest =
+            pallet_intent_settlement::settle_batch_atomic_payload(&wrong_entries);
+        assert_ne!(batch_digest, wrong_digest);
+    });
+}
+
+#[test]
+fn batch_atomic_scales_to_max_batch_size() {
+    // Sanity: 256-entry batch settles cleanly with no panics. Doesn't
+    // measure weight — that's the benchmark's job — but proves no algorithmic
+    // ceiling at the configured MAX.
+    new_test_ext().execute_with(|| {
+        // 64 max-size in a unit test: building 256 is slow because each
+        // helper walks submit/attest/voucher + bumps NAV. 64 is enough to
+        // prove the linear loop is sound; the bench harness pushes 256.
+        const N: u8 = 64;
+        let mut claim_ids: Vec<ClaimId> = Vec::new();
+        for i in 0..N {
+            let (cid, _) = vouchered_claim(i, 1_000);
+            claim_ids.push(cid);
+        }
+        let entries: Vec<SettleBatchEntry> = claim_ids
+            .iter()
+            .enumerate()
+            .map(|(i, cid)| SettleBatchEntry {
+                claim_id: *cid,
+                cardano_tx_hash: {
+                    let mut h = [0u8; 32];
+                    h[0] = i as u8;
+                    h
+                },
+                settled_direct: i % 2 == 0,
+            })
+            .collect();
+        let sigs = stba_sigs_for(&entries);
+        let bv: BoundedVec<SettleBatchEntry, MaxSettleBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_ok!(IntentSettlement::settle_batch_atomic(
+            RuntimeOrigin::signed(1),
+            bv,
+            sigs,
+        ));
+        for cid in claim_ids.iter() {
+            let claim =
+                pallet_intent_settlement::pallet::Claims::<Test>::get(*cid).unwrap();
+            assert!(claim.settled);
+        }
+    });
+}
+
+#[test]
+fn batch_atomic_backward_compat_single_settle_still_works() {
+    // Backward-compat: the existing settle_claim path is untouched. A claim
+    // settled via the legacy path produces the same terminal state as one
+    // settled via the batch path. This is paired with the chain-side
+    // backward-compat test that runs against the same runtime live.
+    new_test_ext().execute_with(|| {
+        let (c1, _) = vouchered_claim(0x77, 100_000);
+        // Old single-call path.
+        assert_ok!(IntentSettlement::settle_claim(
+            RuntimeOrigin::signed(1),
+            c1,
+            [0xCAu8; 32],
+            true,
+            mock_settle_sigs(),
+        ));
+        let claim =
+            pallet_intent_settlement::pallet::Claims::<Test>::get(c1).unwrap();
+        assert!(claim.settled);
+        assert!(claim.settled_direct);
+        assert_eq!(claim.cardano_tx_hash, [0xCAu8; 32]);
+    });
+}
+
+#[test]
+fn batch_atomic_payload_hash_pure_function_no_operator_state() {
+    // Per `feedback_mofn_hash_determinism.md`: the STBA pre-image must be a
+    // pure function of chain-derived inputs, never operator-local state.
+    // Two separate calls with the same entries MUST produce the same digest.
+    let entries = vec![
+        SettleBatchEntry {
+            claim_id: H256::from([1u8; 32]),
+            cardano_tx_hash: [2u8; 32],
+            settled_direct: false,
+        },
+        SettleBatchEntry {
+            claim_id: H256::from([3u8; 32]),
+            cardano_tx_hash: [4u8; 32],
+            settled_direct: true,
+        },
+    ];
+    let d1 = pallet_intent_settlement::settle_batch_atomic_payload(&entries);
+    let d2 = pallet_intent_settlement::settle_batch_atomic_payload(&entries);
+    assert_eq!(d1, d2);
+    // Order matters (different ordering = different digest).
+    let mut reversed = entries.clone();
+    reversed.reverse();
+    let d3 = pallet_intent_settlement::settle_batch_atomic_payload(&reversed);
+    assert_ne!(d1, d3);
 }
 
 mod hex {

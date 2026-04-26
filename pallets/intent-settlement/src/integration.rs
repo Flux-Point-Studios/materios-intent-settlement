@@ -51,6 +51,8 @@ parameter_types! {
     pub const DefaultClaimTTL: u32 = 28_800;
     pub const MaxPendingBatches: u32 = 16;
     pub const DefaultMinSignerThreshold: u32 = 2;
+    /// Task #177: max settle_batch_atomic size in the integration runtime.
+    pub const MaxSettleBatch: u32 = 256;
 }
 
 /// Static committee: Alice/Bob/Charlie by sr25519 dev-key AccountId. Threshold 2.
@@ -128,6 +130,7 @@ impl pallet_intent_settlement::pallet::Config for Testnet {
     type MaxPendingBatches = MaxPendingBatches;
     type DefaultMinSignerThreshold = DefaultMinSignerThreshold;
     type SigVerifier = IntegrationSigVerifier;
+    type MaxSettleBatch = MaxSettleBatch;
 }
 
 fn user_account() -> sp_runtime::AccountId32 {
