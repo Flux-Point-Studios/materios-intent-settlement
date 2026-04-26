@@ -53,6 +53,11 @@ pub fn account_to_bytes<A: Encode>(account: &A) -> [u8; 32] {
 pub const TAG_CRDP: &[u8; 4] = b"CRDP";
 /// Issue #7: domain tag for the `settle_claim` multisig payload.
 pub const TAG_STCL: &[u8; 4] = b"STCL";
+/// Task #174: domain tag for the `request_voucher` multisig payload. Closes
+/// the M-of-N gap on the voucher-mint stage of the intent pipeline so a
+/// single committee member can no longer unilaterally mint a voucher with
+/// an attestation bundle they posted earlier.
+pub const TAG_RVCH: &[u8; 4] = b"RVCH";
 
 /// Canonical digest signed by committee members when authorizing a
 /// `credit_deposit(target, amount, cardano_tx_hash)` call (Issue #7).
@@ -86,6 +91,43 @@ pub fn settle_claim_payload(
     body.extend_from_slice(cardano_tx_hash);
     body.push(if settled_direct { 1u8 } else { 0u8 });
     crate::types::domain_hash(*TAG_STCL, &body)
+}
+
+/// Task #174: canonical digest signed by committee members when authorizing
+/// a `request_voucher(claim_id, intent_id, voucher, fairness_proof)` call.
+///
+/// `blake2_256(b"RVCH" || claim_id (32B) || intent_id (32B)
+///             || voucher_digest (32B) || bfpr_digest (32B))`
+///
+/// All four 32-byte inputs are deterministic functions of state visible to
+/// every honest operator at the moment of voucher mint:
+///   - `claim_id`, `intent_id`: chosen by the keeper, included verbatim in
+///     the dispatch.
+///   - `voucher_digest`: `compute_voucher_digest(&voucher)`. Pure function of
+///     the voucher struct (which the pallet stores as-is).
+///   - `bfpr_digest`: `compute_fairness_proof_digest(&fairness_proof)`. Pure
+///     function of the fairness-proof struct, and the pallet rejects with
+///     `FairnessDigestMismatch` unless `voucher.batch_fairness_proof_digest`
+///     matches it — so the two digests cross-check.
+///
+/// Per `feedback_mofn_hash_determinism.md` no operator-local state (wall
+/// clock, Cardano epoch, locally-computed verification level) appears in
+/// the pre-image. Replay-across-epoch protection comes from the live
+/// committee-membership check in `ensure_threshold_signatures`: rotated-out
+/// members can no longer pass `is_member`, so old bundles can't be replayed
+/// after a committee rotation.
+pub fn request_voucher_payload(
+    claim_id: &ClaimId,
+    intent_id: &IntentId,
+    voucher_digest: &[u8; 32],
+    bfpr_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut body = alloc::vec::Vec::with_capacity(32 + 32 + 32 + 32);
+    body.extend_from_slice(claim_id.as_bytes());
+    body.extend_from_slice(intent_id.as_bytes());
+    body.extend_from_slice(voucher_digest);
+    body.extend_from_slice(bfpr_digest);
+    crate::types::domain_hash(*TAG_RVCH, &body)
 }
 
 #[frame_support::pallet]
@@ -580,6 +622,19 @@ pub mod pallet {
         /// binding, stores the voucher, and flips the bound intent from
         /// `Attested -> Vouchered`. The Cardano validator re-verifies the
         /// ed25519 signatures.
+        ///
+        /// Task #174: a `signatures` envelope of M-of-N committee sr25519
+        /// signatures over the canonical `request_voucher_payload` digest is
+        /// now required. Without this, any single committee member could
+        /// unilaterally mint a voucher (bypassing the M-of-N threshold) and
+        /// only `settle_claim` would re-check sigs — but by then the audit
+        /// story is already broken because the voucher exists. Verification
+        /// reuses the same `ensure_threshold_signatures` helper used by
+        /// `settle_claim` and `credit_deposit` (caller MUST be one of the
+        /// signers, distinct signers, all in the current committee, all sigs
+        /// must verify). **Breaking on-chain change**: the previous 4-arg
+        /// signature is gone; keepers must upgrade in lockstep with the
+        /// runtime spec bump.
         #[pallet::call_index(2)]
         #[pallet::weight((Weight::from_parts(100_000_000, 0), DispatchClass::Operational, Pays::No))]
         pub fn request_voucher(
@@ -588,6 +643,7 @@ pub mod pallet {
             intent_id: IntentId,
             voucher: Voucher,
             fairness_proof: BatchFairnessProof,
+            signatures: Vec<(CommitteePubkey, CommitteeSig)>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(
@@ -615,6 +671,22 @@ pub mod pallet {
                 Error::<T>::FairnessDigestMismatch
             );
 
+            // Task #174: M-of-N gate on voucher mint. We compute the canonical
+            // pre-image *after* the fairness-proof and digest-binding checks
+            // pass, so honest operators all see the same `(voucher_digest,
+            // bfpr_digest)` pair the pallet just validated — no operator-local
+            // state slips in. The same `ensure_threshold_signatures` routine
+            // used by settle_claim/credit_deposit gives us caller-binding,
+            // distinct-signer, member-only, and per-sig sr25519 verification.
+            let voucher_digest_pre = compute_voucher_digest(&voucher);
+            let voucher_payload = request_voucher_payload(
+                &claim_id,
+                &intent_id,
+                &voucher_digest_pre,
+                &bfpr_digest,
+            );
+            Self::ensure_threshold_signatures(&voucher_payload, &who, &signatures)?;
+
             // Issue #5: pre-check the `outstanding_coverage_ada` increment
             // BEFORE mutating storage (checked_add -> CoverageOverflow) so
             // that a craft-a-batch overflow attempt cannot leave state in a
@@ -628,7 +700,8 @@ pub mod pallet {
                 .checked_add(voucher.amount_ada)
                 .ok_or(Error::<T>::CoverageOverflow)?;
 
-            let voucher_digest = compute_voucher_digest(&voucher);
+            // Reuse the digest we already computed for the M-of-N pre-image.
+            let voucher_digest = voucher_digest_pre;
             let voucher_amount = voucher.amount_ada;
 
             // Store claim + voucher, flip intent state.
@@ -1052,7 +1125,16 @@ pub mod pallet {
         /// (`who`) itself MUST appear as one of the signers — this binds the
         /// on-chain origin to the multisig bundle so a stale bundle can't be
         /// replayed by a non-signing member.
-        pub(crate) fn ensure_threshold_signatures(
+        ///
+        /// Task #174: visibility lifted to `pub` so the sibling
+        /// `settle_batch_atomic` extrinsic (#177) and any future M-of-N call
+        /// in the pallet share one verification routine. The function is
+        /// intentionally NOT hoisted into a separate `sig_verify.rs` module
+        /// because it depends on `T::CommitteeMembership`, `T::SigVerifier`,
+        /// and the pallet-internal `MinSignerThreshold` storage — extracting
+        /// it would only move the call surface, not the dependency graph,
+        /// while creating a merge-conflict footprint for #177.
+        pub fn ensure_threshold_signatures(
             payload: &[u8; 32],
             who: &T::AccountId,
             signatures: &[(CommitteePubkey, CommitteeSig)],

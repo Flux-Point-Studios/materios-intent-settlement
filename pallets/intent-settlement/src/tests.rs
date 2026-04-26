@@ -6,7 +6,7 @@
 use crate as pallet_intent_settlement;
 use crate::pallet::{IsCommitteeMember, VerifyCommitteeSignature};
 use crate::types::*;
-use crate::{credit_deposit_payload, settle_claim_payload};
+use crate::{credit_deposit_payload, request_voucher_payload, settle_claim_payload};
 use codec::Encode;
 use frame_support::{
     assert_noop, assert_ok, construct_runtime, derive_impl, parameter_types,
@@ -122,6 +122,18 @@ pub fn mock_settle_sigs() -> Vec<(CommitteePubkey, CommitteeSig)> {
 
 /// Build a 2-of-3 signature envelope for `credit_deposit` from members 1 and 2.
 pub fn mock_credit_sigs() -> Vec<(CommitteePubkey, CommitteeSig)> {
+    vec![mock_sig_for(1), mock_sig_for(2)]
+}
+
+/// Task #174: build a 2-of-3 signature envelope for `request_voucher` from
+/// members 1 and 2. The MockSigVerifier ignores the payload (accepts iff
+/// `sig[0] == pubkey[0]`) so the same `mock_sig_for` helper works regardless
+/// of which canonical pre-image the pallet hashes — what we're actually
+/// exercising in unit tests is the pallet's threshold + caller-binding +
+/// distinct-signer + member-only checks. The payload-binding is exercised
+/// in `integration.rs` where the IntegrationSigVerifier uses real sr25519
+/// over the canonical pre-image.
+pub fn mock_voucher_sigs() -> Vec<(CommitteePubkey, CommitteeSig)> {
     vec![mock_sig_for(1), mock_sig_for(2)]
 }
 
@@ -479,7 +491,8 @@ fn request_voucher_happy_path() {
             claim_id,
             iid,
             voucher.clone(),
-            bfpr.clone()
+            bfpr.clone(),
+            mock_voucher_sigs()
         ));
 
         let intent =
@@ -507,7 +520,8 @@ fn request_voucher_rejects_pending_intent() {
                 claim_id,
                 iid,
                 voucher,
-                bfpr
+                bfpr,
+                mock_voucher_sigs()
             ),
             pallet_intent_settlement::pallet::Error::<Test>::IntentStatusMismatch
         );
@@ -529,7 +543,8 @@ fn request_voucher_rejects_bad_pro_rata_scale() {
                 claim_id,
                 iid,
                 voucher,
-                bfpr
+                bfpr,
+                mock_voucher_sigs()
             ),
             pallet_intent_settlement::pallet::Error::<Test>::InvalidFairnessProof
         );
@@ -551,7 +566,8 @@ fn request_voucher_rejects_awarded_mismatch() {
                 claim_id,
                 iid,
                 voucher,
-                bfpr
+                bfpr,
+                mock_voucher_sigs()
             ),
             pallet_intent_settlement::pallet::Error::<Test>::InvalidFairnessProof
         );
@@ -578,7 +594,8 @@ fn request_voucher_rejects_awarded_exceeds_pool() {
                 claim_id,
                 iid,
                 voucher,
-                bfpr
+                bfpr,
+                mock_voucher_sigs()
             ),
             pallet_intent_settlement::pallet::Error::<Test>::InvalidFairnessProof
         );
@@ -599,7 +616,8 @@ fn request_voucher_rejects_digest_mismatch() {
                 claim_id,
                 iid,
                 voucher,
-                bfpr
+                bfpr,
+                mock_voucher_sigs()
             ),
             pallet_intent_settlement::pallet::Error::<Test>::FairnessDigestMismatch
         );
@@ -622,7 +640,8 @@ fn request_voucher_rejects_duplicate_claim() {
             claim_id,
             iid1,
             voucher1,
-            bfpr1
+            bfpr1,
+            mock_voucher_sigs()
         ));
 
         // Second attested intent, same claim_id.
@@ -656,7 +675,8 @@ fn request_voucher_rejects_duplicate_claim() {
                 claim_id,
                 iid2,
                 voucher2,
-                bfpr2
+                bfpr2,
+                mock_voucher_sigs()
             ),
             pallet_intent_settlement::pallet::Error::<Test>::DuplicateVoucher
         );
@@ -679,7 +699,8 @@ fn settle_claim_happy_path_flips_state_idempotently() {
             claim_id,
             iid,
             voucher,
-            bfpr
+            bfpr,
+            mock_voucher_sigs()
         ));
         assert_ok!(IntentSettlement::settle_claim(
             RuntimeOrigin::signed(1),
@@ -1010,7 +1031,8 @@ fn runtime_api_get_voucher_roundtrip() {
             claim_id,
             iid,
             voucher.clone(),
-            bfpr
+            bfpr,
+            mock_voucher_sigs()
         ));
         let got = pallet_intent_settlement::pallet::Pallet::<Test>::get_voucher(
             claim_id,
@@ -1052,7 +1074,8 @@ fn request_voucher_on_nonexistent_intent_errors() {
                 H256::from([8u8; 32]),
                 iid,
                 voucher,
-                bfpr
+                bfpr,
+                mock_voucher_sigs()
             ),
             pallet_intent_settlement::pallet::Error::<Test>::IntentNotFound
         );
@@ -1101,7 +1124,8 @@ fn request_voucher_rejects_non_member() {
                 H256::from([1u8; 32]),
                 iid,
                 voucher,
-                bfpr
+                bfpr,
+                mock_voucher_sigs()
             ),
             pallet_intent_settlement::pallet::Error::<Test>::NotCommitteeMember
         );
@@ -1128,7 +1152,8 @@ fn request_voucher_rejects_parallel_vec_mismatch() {
                 H256::from([1u8; 32]),
                 iid,
                 voucher,
-                bfpr
+                bfpr,
+                mock_voucher_sigs()
             ),
             pallet_intent_settlement::pallet::Error::<Test>::InvalidFairnessProof
         );
@@ -1159,7 +1184,8 @@ fn request_voucher_rejects_unsorted_intent_ids() {
                 H256::from([1u8; 32]),
                 iid,
                 voucher,
-                bfpr
+                bfpr,
+                mock_voucher_sigs()
             ),
             pallet_intent_settlement::pallet::Error::<Test>::InvalidFairnessProof
         );
@@ -1185,7 +1211,8 @@ fn request_voucher_rejects_bad_block_range() {
                 H256::from([3u8; 32]),
                 iid,
                 voucher,
-                bfpr
+                bfpr,
+                mock_voucher_sigs()
             ),
             pallet_intent_settlement::pallet::Error::<Test>::InvalidFairnessProof
         );
@@ -1204,7 +1231,8 @@ fn full_settle_decrements_outstanding_coverage() {
             claim_id,
             iid,
             voucher,
-            bfpr
+            bfpr,
+            mock_voucher_sigs()
         ));
         let before =
             pallet_intent_settlement::pallet::PoolUtilization::<Test>::get();
@@ -1333,7 +1361,8 @@ fn test_outstanding_coverage_symmetric_accounting() {
             claim_id,
             iid0,
             voucher,
-            bfpr
+            bfpr,
+            mock_voucher_sigs()
         ));
         let mid = pallet_intent_settlement::pallet::PoolUtilization::<Test>::get();
         assert_eq!(
@@ -1379,7 +1408,8 @@ fn test_outstanding_coverage_overflow_rejected() {
                 claim_id,
                 iid,
                 voucher,
-                bfpr
+                bfpr,
+                mock_voucher_sigs()
             ),
             pallet_intent_settlement::pallet::Error::<Test>::CoverageOverflow
         );
@@ -1466,7 +1496,8 @@ fn test_pending_batches_index_is_maintained() {
             claim_id,
             iid1,
             voucher,
-            bfpr
+            bfpr,
+            mock_voucher_sigs()
         ));
         let pb_final =
             pallet_intent_settlement::pallet::PendingBatches::<Test>::get();
@@ -1604,7 +1635,8 @@ fn test_settle_claim_rejects_below_threshold() {
             claim_id,
             iid,
             voucher,
-            bfpr
+            bfpr,
+            mock_voucher_sigs()
         ));
         // Only one signer: rejected.
         assert_noop!(
@@ -1921,3 +1953,248 @@ mod hex {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Task #174 — `request_voucher` M-of-N signature gate
+// ---------------------------------------------------------------------------
+//
+// These tests exercise the new `signatures` parameter on `request_voucher`,
+// mirroring the existing M-of-N coverage on `credit_deposit` /
+// `settle_claim`. Conventions match the Issue #7 suite above so reviewers
+// can grep them side-by-side.
+//
+// Scenarios (mapped to the brief's 10-item list — those that map cleanly
+// to a unit-level mock runtime; payload-determinism + SDK-helper parity
+// live in `integration.rs` and `sdk/src/multisig.test.ts` respectively):
+//   T2: happy path with M=2
+//   T3: below-threshold (1 sig) rejected
+//   T4: above-threshold (3 sigs) accepted
+//   T5: bad sig rejected (MockSigVerifier marker mismatch)
+//   T6: non-committee signer rejected
+//   T7: duplicate signer rejected
+//   T8: caller-not-in-bundle rejected (proxy for cross-epoch replay; the
+//       caller-binding check is the same code path that also makes a
+//       rotated-out signer's stale bundle unusable by a current member)
+// Test 1 (4-arg decode error) is a wire-format property and is exercised
+// at the chain-RPC level in the integration suite, not at unit level —
+// the Rust `request_voucher` symbol on this branch only has the new
+// 5-arg shape so a 4-arg call is a compile error, not a runtime error.
+
+fn voucher_setup() -> (IntentId, ClaimId, BatchFairnessProof, Voucher, [u8; 32]) {
+    // Build an Attested intent + good fairness proof + voucher, plus the
+    // canonical request_voucher pre-image digest the bundle should sign.
+    let iid = attested_intent();
+    let claim_id = H256::from([0x42u8; 32]);
+    let bfpr = good_fairness_proof(iid, 1_000_000);
+    let voucher = good_voucher(claim_id, &bfpr, 1_000_000);
+    let voucher_digest = crate::types::compute_voucher_digest(&voucher);
+    let bfpr_digest = crate::types::compute_fairness_proof_digest(&bfpr);
+    let payload = request_voucher_payload(&claim_id, &iid, &voucher_digest, &bfpr_digest);
+    (iid, claim_id, bfpr, voucher, payload)
+}
+
+#[test]
+fn test_request_voucher_happy_with_m_of_n_sigs() {
+    // T2: 2-of-3 (matches DefaultMinSignerThreshold=2 in mock) → mints voucher.
+    new_test_ext().execute_with(|| {
+        let (iid, claim_id, bfpr, voucher, _payload) = voucher_setup();
+        assert_ok!(IntentSettlement::request_voucher(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            iid,
+            voucher,
+            bfpr,
+            vec![mock_sig_for(1), mock_sig_for(2)]
+        ));
+        let intent =
+            pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
+        assert_eq!(intent.status, IntentStatus::Vouchered);
+        assert!(
+            pallet_intent_settlement::pallet::Vouchers::<Test>::contains_key(claim_id)
+        );
+    });
+}
+
+#[test]
+fn test_request_voucher_below_threshold_rejected() {
+    // T3: only 1 sig with MinSignerThreshold=2 → InsufficientSignatures.
+    new_test_ext().execute_with(|| {
+        let (iid, claim_id, bfpr, voucher, _payload) = voucher_setup();
+        assert_noop!(
+            IntentSettlement::request_voucher(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                iid,
+                voucher,
+                bfpr,
+                vec![mock_sig_for(1)]
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures
+        );
+        // Voucher NOT minted — the new gate fires before any state mutation.
+        assert!(
+            !pallet_intent_settlement::pallet::Vouchers::<Test>::contains_key(claim_id)
+        );
+        // Intent stays in Attested (not Vouchered).
+        let intent =
+            pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
+        assert_eq!(intent.status, IntentStatus::Attested);
+    });
+}
+
+#[test]
+fn test_request_voucher_above_threshold_accepted() {
+    // T4: 3 sigs (full committee) when threshold is 2 → still accepted.
+    new_test_ext().execute_with(|| {
+        let (iid, claim_id, bfpr, voucher, _payload) = voucher_setup();
+        assert_ok!(IntentSettlement::request_voucher(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            iid,
+            voucher,
+            bfpr,
+            vec![mock_sig_for(1), mock_sig_for(2), mock_sig_for(3)]
+        ));
+        let intent =
+            pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
+        assert_eq!(intent.status, IntentStatus::Vouchered);
+    });
+}
+
+#[test]
+fn test_request_voucher_bad_sig_rejected() {
+    // T5: one valid sig + one with a bogus marker byte → InvalidSignature.
+    // The MockSigVerifier accepts iff `sig[0] == pubkey[0]`; we use member
+    // 2's pubkey but a sig whose first byte is the wrong marker.
+    new_test_ext().execute_with(|| {
+        let (iid, claim_id, bfpr, voucher, _payload) = voucher_setup();
+        let bad = (mock_pubkey_of(&2), [0u8; 64]); // marker mismatch
+        assert_noop!(
+            IntentSettlement::request_voucher(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                iid,
+                voucher,
+                bfpr,
+                vec![mock_sig_for(1), bad]
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::InvalidSignature
+        );
+    });
+}
+
+#[test]
+fn test_request_voucher_non_committee_signer_rejected() {
+    // T6: rogue pubkey not in current committee → SignerNotCommitteeMember.
+    new_test_ext().execute_with(|| {
+        let (iid, claim_id, bfpr, voucher, _payload) = voucher_setup();
+        let rogue = ([0xFFu8; 32], [0xFFu8; 64]);
+        assert_noop!(
+            IntentSettlement::request_voucher(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                iid,
+                voucher,
+                bfpr,
+                vec![mock_sig_for(1), rogue]
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::SignerNotCommitteeMember
+        );
+    });
+}
+
+#[test]
+fn test_request_voucher_duplicate_signer_rejected() {
+    // T7: same signer twice in the bundle → DuplicateSigner. Defends against
+    // "M-of-2 by one operator pasting the same sig twice" attacks.
+    new_test_ext().execute_with(|| {
+        let (iid, claim_id, bfpr, voucher, _payload) = voucher_setup();
+        assert_noop!(
+            IntentSettlement::request_voucher(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                iid,
+                voucher,
+                bfpr,
+                vec![mock_sig_for(1), mock_sig_for(1)]
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::DuplicateSigner
+        );
+    });
+}
+
+#[test]
+fn test_request_voucher_caller_not_in_bundle_rejected() {
+    // T8 (epoch-boundary proxy): caller (member 3) submits a bundle of (1, 2).
+    // Even though it's a valid 2-of-3 by signer-count, the origin-binding
+    // check rejects it as `InsufficientSignatures` so a stale bundle posted
+    // by a non-signing member can't be replayed. This is the same code path
+    // that prevents a rotated-out signer's old bundle from being replayed by
+    // a current member after a committee rotation.
+    new_test_ext().execute_with(|| {
+        let (iid, claim_id, bfpr, voucher, _payload) = voucher_setup();
+        assert_noop!(
+            IntentSettlement::request_voucher(
+                RuntimeOrigin::signed(3),
+                claim_id,
+                iid,
+                voucher,
+                bfpr,
+                vec![mock_sig_for(1), mock_sig_for(2)]
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures
+        );
+    });
+}
+
+#[test]
+fn test_request_voucher_payload_deterministic_and_domain_separated() {
+    // T9 (pre-image determinism): same inputs → same digest. Domain-separated
+    // from settle_claim and credit_deposit so a sig over one cannot replay
+    // onto another.
+    let claim_id = H256::from([0x07u8; 32]);
+    let intent_id = H256::from([0x11u8; 32]);
+    let voucher_d = [0x22u8; 32];
+    let bfpr_d = [0x33u8; 32];
+    let a = request_voucher_payload(&claim_id, &intent_id, &voucher_d, &bfpr_d);
+    let b = request_voucher_payload(&claim_id, &intent_id, &voucher_d, &bfpr_d);
+    assert_eq!(a, b, "deterministic");
+
+    // Domain separation: same body bytes but different tag → different digest.
+    let c = settle_claim_payload(&claim_id, &voucher_d, false);
+    assert_ne!(a, c, "RVCH != STCL");
+    let d = credit_deposit_payload(&[0u8; 32], 0, &voucher_d);
+    assert_ne!(a, d, "RVCH != CRDP");
+
+    // Field-position sensitivity: swapping voucher_digest <-> bfpr_digest
+    // yields a different digest (so an attacker can't pre-compute one
+    // sig that works for the swapped pair).
+    let e = request_voucher_payload(&claim_id, &intent_id, &bfpr_d, &voucher_d);
+    assert_ne!(a, e, "voucher_digest and bfpr_digest are not interchangeable");
+}
+
+#[test]
+fn test_request_voucher_payload_parity_fixture_f() {
+    // Cross-layer parity: matches the SDK fixture in
+    // `sdk/src/multisig.test.ts` ("requestVoucherPayload matches Rust
+    // fixture F"). If either side's pre-image format drifts, both fail.
+    let claim_id = H256::from([0x07u8; 32]);
+    let intent_id = H256::from([0x11u8; 32]);
+    let voucher_d = [0x22u8; 32];
+    let bfpr_d = [0x33u8; 32];
+    let digest = request_voucher_payload(&claim_id, &intent_id, &voucher_d, &bfpr_d);
+    assert_eq!(
+        hex_32(digest),
+        TASK_174_FIXTURE_F_HEX,
+        "RVCH fixture F digest drifted — regenerate SDK fixture too"
+    );
+}
+
+/// Fixture F expected hex for `request_voucher_payload`. Generated by
+/// `sp_core::hashing::blake2_256(b"RVCH" || claim_id || intent_id ||
+///  voucher_digest || bfpr_digest)` with the constants in
+/// `test_request_voucher_payload_parity_fixture_f`. The SDK test pins the
+/// same hex so any drift in either implementation fails loudly in CI.
+const TASK_174_FIXTURE_F_HEX: &str =
+    "b3a165c261b9a5b76ec4d22779d0ae2fb56ef0bd8f3da3fcb48a40f1e8b1fdd4";
+
