@@ -1728,16 +1728,34 @@ pub mod pallet {
         ///   the legacy single-call) but consumed ONCE per batch, not per
         ///   entry — that's the throughput unlock.
         #[pallet::call_index(10)]
-        #[pallet::weight(
+        #[pallet::weight({
             // Base weight ~50M (single-call submit_intent's amortised cost)
             // plus per-entry storage cost ~5M. Tuned to match the sublinear
             // pattern proven in PR #27 (settle_batch_atomic) — actual numbers
             // are pinned by the runtime-benchmarks recipe in benchmarking.rs.
+            //
+            // Task #221 (PR #28 pre-merge security review): proof_size is no
+            // longer 0. Per-entry proof footprint ~5KB worst case (one
+            // `Intents::insert` value + one `Nonces::mutate` + one
+            // `PendingBatches::try_push` + one `ExpiryQueue::insert` + the
+            // SCALE-encoded `IntentKind` itself, dominated by BuyPolicy's
+            // 114-byte beneficiary_cardano_addr). Plus a 16KB base for the
+            // M-of-N free zone, header reads, and pool-utilization fetch.
+            // The bench-cli wiring (#190) is still pending so this remains
+            // a hand-tuned upper bound — the runtime-benchmarks pass will
+            // replace this whole expression with the generated WeightInfo
+            // entry when #190 lands. Until then, this estimate keeps the
+            // per-block normal-class budget honest at N=256
+            // (~16KB + 256*5KB ~1.3MB proof_size, well under the 5MB limit
+            // documented in types.rs::MAX_SUBMIT_BATCH).
+            const BASE_PROOF_SIZE: u64 = 16_384;
+            const PER_ENTRY_PROOF_SIZE: u64 = 5_120;
+            let n = entries.len() as u64;
             Weight::from_parts(
-                50_000_000u64.saturating_add((entries.len() as u64).saturating_mul(5_000_000)),
-                0,
+                50_000_000u64.saturating_add(n.saturating_mul(5_000_000)),
+                BASE_PROOF_SIZE.saturating_add(n.saturating_mul(PER_ENTRY_PROOF_SIZE)),
             )
-        )]
+        })]
         pub fn submit_batch_intents(
             origin: OriginFor<T>,
             entries: BoundedVec<SubmitIntentEntry, <T as Config>::MaxSubmitBatch>,
