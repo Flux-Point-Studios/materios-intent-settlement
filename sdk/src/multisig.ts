@@ -28,7 +28,7 @@ import { blake2AsU8a } from "@polkadot/util-crypto";
 import { Keyring } from "@polkadot/keyring";
 import { hexToU8a, u8aConcat, u8aEq } from "@polkadot/util";
 import type { HexString } from "./types.js";
-import { u64LE } from "./hashing.js";
+import { u32LE, u64LE } from "./hashing.js";
 
 // ---------------------------------------------------------------------------
 // Domain tags (Issue #7 — pallet lib.rs::TAG_CRDP, TAG_STCL; Task #174 —
@@ -46,6 +46,14 @@ export const TAG_STCL: Uint8Array = new Uint8Array([0x53, 0x54, 0x43, 0x4c]);
  * mint a voucher with an attestation bundle they posted earlier.
  */
 export const TAG_RVCH: Uint8Array = new Uint8Array([0x52, 0x56, 0x43, 0x48]);
+/**
+ * `b"ABIN"` — 4-byte ASCII domain tag for `attest_batch_intents` payloads
+ * (Task #211). One M-of-N committee signature bundle authorises the entire
+ * batch's `Pending -> Attested` transition. Pre-spec-207 a 3-of-3 committee
+ * posted M*N `attest_intent` extrinsics per epoch — at N=256 that's 768
+ * sig-verify rounds. Post-spec-207 it's ONE sig-verify per batch.
+ */
+export const TAG_ABIN: Uint8Array = new Uint8Array([0x41, 0x42, 0x49, 0x4e]);
 
 // ---------------------------------------------------------------------------
 // Payload builders (digests that committee members sign).
@@ -171,6 +179,48 @@ export function requestVoucherPayload(args: {
   require32(bfprDigest, "bfprDigest");
   const body = u8aConcat(claimId, intentId, voucherDigest, bfprDigest);
   const digest = blake2AsU8a(u8aConcat(TAG_RVCH, body), 256);
+  if (digest.length !== 32) {
+    throw new Error(`blake2_256 digest length != 32 (got ${digest.length})`);
+  }
+  return digest;
+}
+
+/**
+ * Byte-identical to Rust `attest_batch_intents_payload(intent_ids)` (Task #211).
+ *
+ * Pre-image:
+ *   `b"ABIN" || u32_le(N) || N x intent_id (32B each)`
+ *
+ * Flat byte stream — NOT SCALE-encoded BoundedVec — so the digest is
+ * independent of the substrate-interface BoundedVec wrapping quirk
+ * (`feedback_substrate_interface_boundedvec_wrap.md`). The Aiken / Rust
+ * pallet mirrors reconstruct the same byte stream from raw bytes.
+ *
+ * Per `feedback_mofn_hash_determinism.md`: only chain-derived intent_ids
+ * appear in the pre-image (no operator-local state). All committee
+ * members independently compute the same digest from the keeper's
+ * announced intent_ids list.
+ *
+ * Pinned cross-layer fixture H (`intent_ids = [0x07*32, 0x11*32, 0x22*32]`)
+ * hashes to
+ * `13d4c95e1e392553a6b6462eb0f5a24244007ec2410242b6de8297097a17b613`.
+ *
+ * @returns 32-byte blake2_256 digest committee members must sign.
+ */
+export function attestBatchIntentsPayload(args: {
+  /** List of 32-byte intent IDs (H256), hex-prefixed. */
+  intentIds: HexString[];
+}): Uint8Array {
+  const n = args.intentIds.length;
+  const parts: Uint8Array[] = [TAG_ABIN, u32LE(n)];
+  for (const id of args.intentIds) {
+    const idBytes = hexToU8a(id);
+    if (idBytes.length !== 32) {
+      throw new Error(`intentId: expected 32 bytes, got ${idBytes.length}`);
+    }
+    parts.push(idBytes);
+  }
+  const digest = blake2AsU8a(u8aConcat(...parts), 256);
   if (digest.length !== 32) {
     throw new Error(`blake2_256 digest length != 32 (got ${digest.length})`);
   }

@@ -53,6 +53,8 @@ parameter_types! {
     /// Mirror the prod default (256) so the unit-test scaling assertions
     /// reflect what the live chain will see.
     pub const MaxSettleBatch: u32 = 256;
+    /// Task #211: test-runtime bound on `attest_batch_intents` size.
+    pub const MaxAttestBatch: u32 = 256;
 }
 
 /// Issue #4 helper: our tests use `u64` AccountIds. Derive a synthetic
@@ -152,6 +154,7 @@ impl pallet_intent_settlement::pallet::Config for Test {
     type DefaultMinSignerThreshold = DefaultMinSignerThreshold;
     type SigVerifier = MockSigVerifier;
     type MaxSettleBatch = MaxSettleBatch;
+    type MaxAttestBatch = MaxAttestBatch;
 }
 
 pub const ALICE: u64 = 100;
@@ -2597,4 +2600,403 @@ fn test_request_voucher_payload_parity_fixture_f() {
 /// same hex so any drift in either implementation fails loudly in CI.
 const TASK_174_FIXTURE_F_HEX: &str =
     "b3a165c261b9a5b76ec4d22779d0ae2fb56ef0bd8f3da3fcb48a40f1e8b1fdd4";
+
+// ---------------------------------------------------------------------------
+// Task #211 — attest_batch_intents unit tests
+// ---------------------------------------------------------------------------
+
+/// Build N submitted-but-not-attested intents owned by ALICE. Returns the
+/// list of intent_ids in submission order.
+fn submit_n_pending(n: u32) -> Vec<IntentId> {
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let kind = IntentKind::RequestPayout {
+            policy_id: H256::from([(0xA0u8.wrapping_add(i as u8)) as u8; 32]),
+            oracle_evidence: BoundedVec::try_from(vec![i as u8; 8]).unwrap(),
+        };
+        let nonce = pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE);
+        let blk: u32 = System::block_number().try_into().unwrap();
+        let iid = intent_id_for(ALICE, nonce, &kind, blk);
+        assert_ok!(IntentSettlement::submit_intent(
+            RuntimeOrigin::signed(ALICE),
+            kind,
+        ));
+        out.push(iid);
+    }
+    out
+}
+
+/// Build a 2-of-3 sig bundle for the ABIN payload over `intent_ids`.
+fn abin_sigs_for(intent_ids: &[IntentId]) -> Vec<(CommitteePubkey, CommitteeSig)> {
+    let _ = pallet_intent_settlement::attest_batch_intents_payload(intent_ids);
+    vec![mock_sig_for(1), mock_sig_for(2)]
+}
+
+#[test]
+fn attest_batch_happy_path_n_5_emits_per_intent_and_batch_events() {
+    new_test_ext().execute_with(|| {
+        let iids = submit_n_pending(5);
+        let sigs = abin_sigs_for(&iids);
+        let bv: BoundedVec<IntentId, MaxAttestBatch> =
+            BoundedVec::try_from(iids.clone()).unwrap();
+        assert_ok!(IntentSettlement::attest_batch_intents(
+            RuntimeOrigin::signed(1),
+            bv,
+            sigs,
+        ));
+        // All 5 intents are now Attested with the bundle stored.
+        for iid in iids.iter() {
+            let intent =
+                pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
+            assert_eq!(intent.status, IntentStatus::Attested);
+            let stored =
+                pallet_intent_settlement::pallet::AttestationSigs::<Test>::get(iid)
+                    .unwrap();
+            assert_eq!(stored.len(), 2);
+        }
+        // Per-intent IntentAttested events still emitted (backward compat).
+        let per_intent: Vec<_> = System::events()
+            .into_iter()
+            .filter_map(|er| match er.event {
+                RuntimeEvent::IntentSettlement(
+                    pallet_intent_settlement::pallet::Event::IntentAttested { .. }
+                ) => Some(()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(per_intent.len(), 5);
+        // BatchIntentsAttested fired once.
+        let batch_events: Vec<_> = System::events()
+            .into_iter()
+            .filter_map(|er| match er.event {
+                RuntimeEvent::IntentSettlement(
+                    pallet_intent_settlement::pallet::Event::BatchIntentsAttested {
+                        submitted_count, attested_count, batch_digest, signer_count,
+                    }
+                ) => Some((submitted_count, attested_count, batch_digest, signer_count)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(batch_events.len(), 1);
+        let (sub, att, digest, sc) = &batch_events[0];
+        assert_eq!(*sub, 5);
+        assert_eq!(*att, 5);
+        assert_eq!(*sc, 2);
+        let expected =
+            pallet_intent_settlement::attest_batch_intents_payload(&iids);
+        assert_eq!(*digest, expected);
+    });
+}
+
+#[test]
+fn attest_batch_atomic_revert_on_unknown_intent() {
+    new_test_ext().execute_with(|| {
+        let mut iids = submit_n_pending(3);
+        // Inject a bogus intent_id at index 1.
+        iids.insert(1, H256::from([0xFFu8; 32]));
+        let sigs = abin_sigs_for(&iids);
+        let bv: BoundedVec<IntentId, MaxAttestBatch> =
+            BoundedVec::try_from(iids.clone()).unwrap();
+        assert_noop!(
+            IntentSettlement::attest_batch_intents(
+                RuntimeOrigin::signed(1),
+                bv,
+                sigs,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::IntentNotFound,
+        );
+        // No partial transitions.
+        for iid in iids.iter() {
+            if iid == &H256::from([0xFFu8; 32]) {
+                continue;
+            }
+            let intent =
+                pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
+            assert_eq!(
+                intent.status,
+                IntentStatus::Pending,
+                "atomicity broken — partial transition on failed batch"
+            );
+        }
+    });
+}
+
+#[test]
+fn attest_batch_rejects_duplicate_intent_within_batch() {
+    new_test_ext().execute_with(|| {
+        let iids = submit_n_pending(3);
+        let mut with_dup = iids.clone();
+        with_dup.push(iids[0]);
+        let sigs = abin_sigs_for(&with_dup);
+        let bv: BoundedVec<IntentId, MaxAttestBatch> =
+            BoundedVec::try_from(with_dup).unwrap();
+        assert_noop!(
+            IntentSettlement::attest_batch_intents(
+                RuntimeOrigin::signed(1),
+                bv,
+                sigs,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::DuplicateIntentInBatch,
+        );
+    });
+}
+
+#[test]
+fn attest_batch_already_attested_intents_idempotent_skip() {
+    // Mixed batch: some intents already-Attested via the legacy single-call,
+    // others fresh-Pending. Batch must succeed atomically, transition only
+    // the Pending ones, and report attested_count = (count of fresh).
+    new_test_ext().execute_with(|| {
+        let iids = submit_n_pending(4);
+        // Pre-attest the first two via legacy path.
+        for iid in iids.iter().take(2) {
+            assert_ok!(IntentSettlement::attest_intent(
+                RuntimeOrigin::signed(1),
+                *iid,
+                mock_pubkey_of(&1),
+                [0u8; 64],
+            ));
+            assert_ok!(IntentSettlement::attest_intent(
+                RuntimeOrigin::signed(2),
+                *iid,
+                mock_pubkey_of(&2),
+                [0u8; 64],
+            ));
+            let intent =
+                pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
+            assert_eq!(intent.status, IntentStatus::Attested);
+        }
+        // Reset the events log so we only inspect the batch's own events.
+        System::reset_events();
+        let sigs = abin_sigs_for(&iids);
+        let bv: BoundedVec<IntentId, MaxAttestBatch> =
+            BoundedVec::try_from(iids.clone()).unwrap();
+        assert_ok!(IntentSettlement::attest_batch_intents(
+            RuntimeOrigin::signed(1),
+            bv,
+            sigs,
+        ));
+        // BatchIntentsAttested: submitted=4, attested=2 (only the freshes).
+        let batch_events: Vec<_> = System::events()
+            .into_iter()
+            .filter_map(|er| match er.event {
+                RuntimeEvent::IntentSettlement(
+                    pallet_intent_settlement::pallet::Event::BatchIntentsAttested {
+                        submitted_count, attested_count, ..
+                    }
+                ) => Some((submitted_count, attested_count)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(batch_events, vec![(4, 2)]);
+        // All 4 are now Attested in storage.
+        for iid in iids.iter() {
+            let intent =
+                pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
+            assert_eq!(intent.status, IntentStatus::Attested);
+        }
+    });
+}
+
+#[test]
+fn attest_batch_rejects_terminal_status_intents() {
+    // If any intent in the batch is in a non-Pending/non-Attested status
+    // (e.g. Vouchered, Settled, Expired), the batch atomically rejects.
+    new_test_ext().execute_with(|| {
+        let iids = submit_n_pending(3);
+        // Terminalize the middle intent via the existing TTL pathway:
+        // expire_policy_mirror sets it to Expired.
+        assert_ok!(IntentSettlement::expire_policy_mirror(
+            RuntimeOrigin::signed(1),
+            iids[1],
+        ));
+        let intent =
+            pallet_intent_settlement::pallet::Intents::<Test>::get(iids[1]).unwrap();
+        assert_eq!(intent.status, IntentStatus::Expired);
+
+        let sigs = abin_sigs_for(&iids);
+        let bv: BoundedVec<IntentId, MaxAttestBatch> =
+            BoundedVec::try_from(iids.clone()).unwrap();
+        assert_noop!(
+            IntentSettlement::attest_batch_intents(
+                RuntimeOrigin::signed(1),
+                bv,
+                sigs,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::IntentStatusMismatch,
+        );
+        // First intent NOT freshly attested (atomic).
+        let intent0 =
+            pallet_intent_settlement::pallet::Intents::<Test>::get(iids[0]).unwrap();
+        assert_eq!(intent0.status, IntentStatus::Pending);
+    });
+}
+
+#[test]
+fn attest_batch_rejects_empty_batch() {
+    new_test_ext().execute_with(|| {
+        let bv: BoundedVec<IntentId, MaxAttestBatch> = BoundedVec::default();
+        let sigs = vec![mock_sig_for(1), mock_sig_for(2)];
+        assert_noop!(
+            IntentSettlement::attest_batch_intents(
+                RuntimeOrigin::signed(1),
+                bv,
+                sigs,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::EmptyAttestBatch,
+        );
+    });
+}
+
+#[test]
+fn attest_batch_rejects_non_committee_caller() {
+    new_test_ext().execute_with(|| {
+        let iids = submit_n_pending(2);
+        let sigs = abin_sigs_for(&iids);
+        let bv: BoundedVec<IntentId, MaxAttestBatch> =
+            BoundedVec::try_from(iids).unwrap();
+        // ALICE (account 100) is NOT a committee member.
+        assert_noop!(
+            IntentSettlement::attest_batch_intents(
+                RuntimeOrigin::signed(ALICE),
+                bv,
+                sigs,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::NotCommitteeMember,
+        );
+    });
+}
+
+#[test]
+fn attest_batch_below_threshold_rejected() {
+    new_test_ext().execute_with(|| {
+        let iids = submit_n_pending(2);
+        let bv: BoundedVec<IntentId, MaxAttestBatch> =
+            BoundedVec::try_from(iids).unwrap();
+        // Only 1 sig — threshold is 2.
+        assert_noop!(
+            IntentSettlement::attest_batch_intents(
+                RuntimeOrigin::signed(1),
+                bv,
+                vec![mock_sig_for(1)],
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures,
+        );
+    });
+}
+
+#[test]
+fn attest_batch_signature_must_match_batch_digest_not_per_entry() {
+    // If a caller signed a per-entry digest (e.g. just the first intent_id)
+    // rather than the canonical ABIN payload, the bundle MUST NOT verify
+    // against the multi-entry batch's digest. Pure-function assertion.
+    let iids = vec![
+        H256::from([1u8; 32]),
+        H256::from([2u8; 32]),
+        H256::from([3u8; 32]),
+    ];
+    let batch_digest = pallet_intent_settlement::attest_batch_intents_payload(&iids);
+    // Compare to single-entry batch digest — must differ.
+    let single_digest =
+        pallet_intent_settlement::attest_batch_intents_payload(&iids[..1]);
+    assert_ne!(batch_digest, single_digest, "batch != single-entry batch");
+    // Ordering matters.
+    let mut reversed = iids.clone();
+    reversed.reverse();
+    let reversed_digest =
+        pallet_intent_settlement::attest_batch_intents_payload(&reversed);
+    assert_ne!(batch_digest, reversed_digest);
+}
+
+#[test]
+fn attest_batch_scales_within_pending_batches_bound() {
+    // 16 entries (cap is MaxPendingBatches=16 in test runtime). Production
+    // bound is 256 (MAX_ATTEST_BATCH); see benchmarking.rs for the
+    // sublinear weight curve.
+    new_test_ext().execute_with(|| {
+        const N: u32 = 16;
+        let iids = submit_n_pending(N);
+        let sigs = abin_sigs_for(&iids);
+        let bv: BoundedVec<IntentId, MaxAttestBatch> =
+            BoundedVec::try_from(iids.clone()).unwrap();
+        assert_ok!(IntentSettlement::attest_batch_intents(
+            RuntimeOrigin::signed(1),
+            bv,
+            sigs,
+        ));
+        for iid in iids.iter() {
+            let intent =
+                pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
+            assert_eq!(intent.status, IntentStatus::Attested);
+        }
+    });
+}
+
+#[test]
+fn attest_batch_backward_compat_legacy_attest_intent_still_works() {
+    // The legacy attest_intent (call_index 1) is unchanged. Single-call
+    // accumulation across 2 calls produces the same terminal Attested
+    // state as the batch path.
+    new_test_ext().execute_with(|| {
+        let iid = submit_n_pending(1)[0];
+        assert_ok!(IntentSettlement::attest_intent(
+            RuntimeOrigin::signed(1),
+            iid,
+            mock_pubkey_of(&1),
+            [0u8; 64],
+        ));
+        assert_ok!(IntentSettlement::attest_intent(
+            RuntimeOrigin::signed(2),
+            iid,
+            mock_pubkey_of(&2),
+            [0u8; 64],
+        ));
+        let intent =
+            pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
+        assert_eq!(intent.status, IntentStatus::Attested);
+    });
+}
+
+#[test]
+fn attest_batch_payload_deterministic_and_domain_separated() {
+    let iids = vec![
+        H256::from([1u8; 32]),
+        H256::from([2u8; 32]),
+    ];
+    let a = pallet_intent_settlement::attest_batch_intents_payload(&iids);
+    let b = pallet_intent_settlement::attest_batch_intents_payload(&iids);
+    assert_eq!(a, b, "deterministic");
+    // Domain-separated from STBA. Build a single STBA entry with the same
+    // 32-byte content and confirm tags drive the digest apart.
+    let stba_entries = vec![SettleBatchEntry {
+        claim_id: H256::from([1u8; 32]),
+        cardano_tx_hash: [2u8; 32],
+        settled_direct: false,
+    }];
+    let stba = pallet_intent_settlement::settle_batch_atomic_payload(&stba_entries);
+    assert_ne!(a, stba, "ABIN != STBA");
+}
+
+#[test]
+fn attest_batch_payload_parity_fixture_h() {
+    // Cross-layer parity: matches the SDK fixture in
+    // `sdk/src/multisig.test.ts` ("attestBatchIntentsPayload matches Rust
+    // fixture H"). If either side's pre-image format drifts, both fail.
+    //
+    // Pinned input: 3 intent_ids 0x07*32 / 0x11*32 / 0x22*32.
+    let iids = vec![
+        H256::from([0x07u8; 32]),
+        H256::from([0x11u8; 32]),
+        H256::from([0x22u8; 32]),
+    ];
+    let digest = pallet_intent_settlement::attest_batch_intents_payload(&iids);
+    assert_eq!(
+        hex_32(digest),
+        TASK_211_FIXTURE_H_HEX,
+        "ABIN fixture H digest drifted — regenerate SDK fixture too"
+    );
+}
+
+const TASK_211_FIXTURE_H_HEX: &str =
+    "13d4c95e1e392553a6b6462eb0f5a24244007ec2410242b6de8297097a17b613";
 

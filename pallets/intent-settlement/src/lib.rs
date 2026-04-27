@@ -67,6 +67,15 @@ pub const TAG_RVCH: &[u8; 4] = b"RVCH";
 /// optimisation that lifts user-TPS from ~0.07 to ~10+ by removing the
 /// per-claim sig-verify cost.
 pub const TAG_STBA: &[u8; 4] = b"STBA";
+/// Task #211: domain tag for the `attest_batch_intents` multisig payload.
+/// The digest is computed once over the FULL ordered list of intent_ids;
+/// one committee signature bundle authorises N attestation transitions
+/// (Pending -> Attested). Pre-spec-207 a 3-of-3 committee posted 3*N
+/// `attest_intent` extrinsics per batch — at N=256 that's 768 sig-verify
+/// rounds per epoch. Post-spec-207 the cost is ONE sig-verify per batch.
+/// Domain-separated from STBA / STCL / CRDP / RVCH / SBIN so an ABIN
+/// signature can never be replayed against any other call's pre-image.
+pub const TAG_ABIN: &[u8; 4] = b"ABIN";
 
 /// Canonical digest signed by committee members when authorizing a
 /// `credit_deposit(target, amount, cardano_tx_hash)` call (Issue #7).
@@ -170,6 +179,33 @@ pub fn settle_batch_atomic_payload(
     crate::types::domain_hash(*TAG_STBA, &body)
 }
 
+/// Task #211: canonical digest signed by committee members when authorizing
+/// an `attest_batch_intents(intent_ids)` call. Pre-image:
+///
+/// `blake2_256(b"ABIN" || u32_le(N) || N×intent_id (32B each))`
+///
+/// Flat byte stream — NOT SCALE — so the digest is independent of the
+/// substrate-interface BoundedVec wrapping quirk
+/// (`feedback_substrate_interface_boundedvec_wrap.md`). The Aiken / TS
+/// keeper mirror reconstructs the same stream from raw bytes.
+///
+/// Per `feedback_mofn_hash_determinism.md`: only chain-derived intent_ids
+/// appear in the pre-image (no operator-local state). All committee
+/// members independently compute the same digest from the keeper's
+/// announced intent_ids list, so threshold can never wedge from divergent
+/// pre-images.
+pub fn attest_batch_intents_payload(
+    intent_ids: &[IntentId],
+) -> [u8; 32] {
+    let n = intent_ids.len() as u32;
+    let mut body = alloc::vec::Vec::with_capacity(4 + intent_ids.len() * 32);
+    body.extend_from_slice(&n.to_le_bytes());
+    for iid in intent_ids.iter() {
+        body.extend_from_slice(iid.as_bytes());
+    }
+    crate::types::domain_hash(*TAG_ABIN, &body)
+}
+
 #[frame_support::pallet]
 pub mod pallet {
     use super::*;
@@ -234,6 +270,13 @@ pub mod pallet {
         /// signature bundle.
         #[pallet::constant]
         type MaxSettleBatch: Get<u32>;
+
+        /// Task #211: maximum number of intents attested in a single
+        /// `attest_batch_intents` call. Canonical default is
+        /// `types::MAX_ATTEST_BATCH = 256`. Enables collapsing M*N per-epoch
+        /// committee extrinsics into ONE batch call.
+        #[pallet::constant]
+        type MaxAttestBatch: Get<u32>;
     }
 
     /// Abstraction for verifying an `sr25519` signature over a committee
@@ -429,6 +472,23 @@ pub mod pallet {
             batch_digest: [u8; 32],
             settled_direct_count: u32,
         },
+        /// Task #211: an `attest_batch_intents` call landed and transitioned
+        /// `attested_count` intents from Pending -> Attested under ONE
+        /// committee-signature verification. `submitted_count` is the total
+        /// number of intent_ids in the call (some may have been attested
+        /// already, in which case they're idempotent no-ops and not
+        /// counted as freshly attested). `batch_digest` is the canonical
+        /// ABIN pre-image hash so indexers can correlate the on-chain
+        /// landing with the keeper's signed batch. The legacy per-intent
+        /// `IntentAttested` events are STILL emitted for every transitioned
+        /// intent, so existing indexer paths keep working unchanged —
+        /// `BatchIntentsAttested` is purely additive.
+        BatchIntentsAttested {
+            submitted_count: u32,
+            attested_count: u32,
+            batch_digest: [u8; 32],
+            signer_count: u32,
+        },
     }
 
     // ---------------------------------------------------------------------
@@ -513,6 +573,14 @@ pub mod pallet {
         /// batch landed. Atomic rejection preserves the all-or-nothing
         /// semantic that lets keepers retry the whole batch deterministically.
         BatchClaimAlreadySettled,
+        /// Task #211: `attest_batch_intents` was called with an empty
+        /// intent_ids vec. Atomically rejected (no fee/state movement) so
+        /// the weight model stays honest.
+        EmptyAttestBatch,
+        /// Task #211: a single batch contained the same `intent_id` twice.
+        /// Atomic rejection — pallet must surface the keeper bug rather
+        /// than silently dedup.
+        DuplicateIntentInBatch,
     }
 
     // ---------------------------------------------------------------------
@@ -1143,6 +1211,163 @@ pub mod pallet {
                 count,
                 batch_digest: payload,
                 settled_direct_count,
+            });
+            Ok(())
+        }
+
+        /// Task #211: attest N intents in ONE extrinsic under ONE M-of-N
+        /// signature verification.
+        ///
+        /// Pre-spec-207 the attest stage ran `attest_intent` once per
+        /// (signer, intent) pair: a 3-of-3 committee at N=256 issued 768
+        /// chain extrinsics per epoch, each with its own per-call sig-
+        /// verify. Post-spec-207 this collapses to a single
+        /// `attest_batch_intents(intent_ids, signatures)` call with ONE
+        /// sig-verify pass over the whole batch — the largest single-pallet
+        /// TPS unlock in the v5.1 plan.
+        ///
+        /// Per-intent semantics:
+        /// - Each intent must currently be `Pending`. If it's `Attested`
+        ///   already (raced by another attestation extrinsic), this entry
+        ///   is treated as an idempotent no-op (does not contribute to the
+        ///   `attested_count` event field) — matches `attest_intent`'s
+        ///   prior behaviour. If it's in any other terminal state
+        ///   (Vouchered/Settled/Expired), the batch atomically rejects
+        ///   with `IntentStatusMismatch`.
+        /// - Each intent's `AttestationSigs` storage map is overwritten
+        ///   with the call's signature bundle on the Pending -> Attested
+        ///   transition. The bundle stored is exactly the `signatures`
+        ///   argument truncated to MaxCommittee (the legacy single-call
+        ///   `attest_intent` accumulated sigs across calls; the batch path
+        ///   posts the full M-of-N envelope in one shot, so the storage
+        ///   write is direct).
+        ///
+        /// Caller binding: same as `settle_batch_atomic`. The caller's
+        /// pubkey MUST appear in `signatures` (origin-binding via
+        /// `ensure_threshold_signatures`). Subsequent batch calls from the
+        /// same committee are idempotent on intents already in Attested
+        /// state, so there's no replay-attack window.
+        ///
+        /// Backward compatibility: the existing per-intent `attest_intent`
+        /// (call_index 1) is unchanged. Mixed-mode (some intents attested
+        /// via single-call, others via batch) is supported within the same
+        /// epoch.
+        ///
+        /// Atomic semantics: any per-intent failure (intent not found,
+        /// terminal status mismatch, duplicate intent_id within the batch)
+        /// reverts every storage mutation in this call.
+        ///
+        /// Cost model:
+        /// - Base ~50M ref_time (M-of-N sig-verify pass)
+        /// - Plus N * ~3M ref_time (per-intent storage read for `Intents`,
+        ///   one storage write each for `Intents` + `AttestationSigs`).
+        /// - At N=256 the per-intent cost ~768M dwarfs the sig-verify
+        ///   pass — but it's still ~3x cheaper than the legacy 768
+        ///   `attest_intent` calls each at ~50M = 38B total.
+        #[pallet::call_index(11)]
+        #[pallet::weight((
+            Weight::from_parts(
+                50_000_000u64.saturating_add((intent_ids.len() as u64).saturating_mul(3_000_000)),
+                0,
+            ),
+            DispatchClass::Operational,
+            Pays::No,
+        ))]
+        pub fn attest_batch_intents(
+            origin: OriginFor<T>,
+            intent_ids: BoundedVec<IntentId, <T as Config>::MaxAttestBatch>,
+            signatures: Vec<(CommitteePubkey, CommitteeSig)>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(
+                T::CommitteeMembership::is_member(&who),
+                Error::<T>::NotCommitteeMember
+            );
+            ensure!(!intent_ids.is_empty(), Error::<T>::EmptyAttestBatch);
+
+            // Compute the canonical ABIN digest ONCE over all intent_ids,
+            // then verify the M-of-N sig bundle against it ONCE — the
+            // throughput unlock.
+            let payload = attest_batch_intents_payload(intent_ids.as_slice());
+            Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
+
+            // Pass 1: detect duplicate intent_ids inside the batch up-front
+            // (cheaper than discovering it mid-loop after we've mutated
+            // state). O(N^2) with N <= 256 ~32k comparisons worst case,
+            // well below sig-verify cost.
+            let n = intent_ids.len();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    ensure!(
+                        intent_ids[i] != intent_ids[j],
+                        Error::<T>::DuplicateIntentInBatch,
+                    );
+                }
+            }
+
+            // Truncate the call-level sigs vec into the storage-bound
+            // BoundedVec for AttestationSigs. The storage type uses
+            // `MaxCommittee` (=32 in prod), and `ensure_threshold_signatures`
+            // already proved `signatures.len() >= threshold` — so any
+            // overflow here would mean the caller submitted MORE than
+            // MaxCommittee sigs, which we treat as an error rather than
+            // silently truncate.
+            let sigs_bv: BoundedVec<
+                (CommitteePubkey, CommitteeSig),
+                <T as Config>::MaxCommittee,
+            > = BoundedVec::try_from(signatures.clone())
+                .map_err(|_| Error::<T>::TooManySigs)?;
+
+            let signer_count = signatures.len() as u32;
+
+            // Atomic mutation phase. Any per-intent failure reverts the
+            // whole call — same all-or-nothing semantics as PR #27.
+            let attested_count = frame_support::storage::with_storage_layer::<
+                u32,
+                sp_runtime::DispatchError,
+                _,
+            >(|| {
+                let mut freshly_attested: u32 = 0;
+                for iid in intent_ids.iter() {
+                    let mut intent =
+                        Intents::<T>::get(iid).ok_or(Error::<T>::IntentNotFound)?;
+                    match intent.status {
+                        IntentStatus::Attested => {
+                            // Idempotent — already past the threshold from a
+                            // prior batch / single-call. Silently skip.
+                            continue;
+                        }
+                        IntentStatus::Pending => {
+                            intent.status = IntentStatus::Attested;
+                            Intents::<T>::insert(iid, intent);
+                            AttestationSigs::<T>::insert(iid, sigs_bv.clone());
+                            // Drop any partial single-call accumulation —
+                            // the batch's M-of-N envelope is the canonical
+                            // bundle now.
+                            PendingAttestations::<T>::remove(iid);
+                            Self::deposit_event(Event::IntentAttested {
+                                intent_id: *iid,
+                                attestor_count: signer_count,
+                            });
+                            freshly_attested = freshly_attested.saturating_add(1);
+                        }
+                        _ => {
+                            // Vouchered / Settled / Expired / Refunded —
+                            // can't be re-attested. Reject the batch
+                            // atomically; keeper must split the next batch
+                            // and exclude this intent.
+                            return Err(Error::<T>::IntentStatusMismatch.into());
+                        }
+                    }
+                }
+                Ok(freshly_attested)
+            })?;
+
+            Self::deposit_event(Event::BatchIntentsAttested {
+                submitted_count: n as u32,
+                attested_count,
+                batch_digest: payload,
+                signer_count,
             });
             Ok(())
         }

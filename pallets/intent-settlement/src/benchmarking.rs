@@ -131,4 +131,57 @@ mod benchmarks {
     // production weight pass runs in the materios-runtime, which wires
     // `Sr25519Verifier` against real AccountId32 — that's where the
     // canonical weight values come from.
+
+    // ---- Task #211 — attest_batch_intents bench -------------------------
+
+    /// Bench `attest_batch_intents` across `Linear<1, MAX_BATCH>` so the
+    /// runtime weight generator produces a sublinear curve matching the
+    /// spec-207 cost model:
+    ///   N=1   ~55M ref_time   N=64  ~250M ref_time
+    ///   N=8   ~75M ref_time   N=256 ~800M ref_time
+    /// Versus 256x3 = 768 single `attest_intent` calls at ~50M each =
+    /// ~38B ref_time, the batch path is ~50x cheaper at the per-block-budget
+    /// level. The bigger structural win is M-of-N collapse: pre-spec-207 a
+    /// 3-of-3 committee posted M*N = 768 separate sig-verifies; post-spec-207
+    /// it's ONE.
+    #[benchmark]
+    fn attest_batch_intents(n: Linear<1, MAX_BATCH_BENCH>) {
+        use crate::pallet::Intents;
+        let mut intent_ids: sp_std::vec::Vec<IntentId> =
+            sp_std::vec::Vec::with_capacity(n as usize);
+        let submitter: T::AccountId = whitelisted_caller();
+        for i in 0..n {
+            let mut id_bytes = [0u8; 32];
+            id_bytes[..4].copy_from_slice(&i.to_be_bytes());
+            id_bytes[4..8].copy_from_slice(b"BABI");
+            let iid = IntentId::from(id_bytes);
+            Intents::<T>::insert(
+                iid,
+                Intent {
+                    submitter: submitter.clone(),
+                    nonce: i as u64,
+                    kind: IntentKind::RequestPayout {
+                        policy_id: PolicyId::from([0u8; 32]),
+                        oracle_evidence: Default::default(),
+                    },
+                    submitted_block: 1,
+                    ttl_block: 1_000_000,
+                    status: IntentStatus::Pending,
+                },
+            );
+            intent_ids.push(iid);
+        }
+
+        let caller: T::AccountId = whitelisted_caller();
+        let caller_pubkey = T::CommitteeMembership::pubkey_of(&caller);
+        let signatures: sp_std::vec::Vec<(CommitteePubkey, CommitteeSig)> =
+            sp_std::vec![(caller_pubkey, [0u8; 64])];
+
+        let bv: frame_support::BoundedVec<IntentId, T::MaxAttestBatch> =
+            frame_support::BoundedVec::try_from(intent_ids)
+                .expect("bench n <= MaxAttestBatch");
+
+        #[extrinsic_call]
+        _(RawOrigin::Signed(caller), bv, signatures);
+    }
 }

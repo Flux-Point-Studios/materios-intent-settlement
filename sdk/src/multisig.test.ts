@@ -5,11 +5,13 @@ import {
   settleClaimPayload,
   creditDepositPayload,
   requestVoucherPayload,
+  attestBatchIntentsPayload,
   signPayload,
   buildSigBundle,
   TAG_CRDP,
   TAG_STCL,
   TAG_RVCH,
+  TAG_ABIN,
 } from "./multisig.js";
 import type { HexString } from "./types.js";
 
@@ -32,6 +34,10 @@ describe("multisig domain tags", () => {
 
   it("TAG_RVCH is ASCII `RVCH` (Task #174)", () => {
     expect(Array.from(TAG_RVCH)).toEqual([0x52, 0x56, 0x43, 0x48]);
+  });
+
+  it("TAG_ABIN is ASCII `ABIN` (Task #211)", () => {
+    expect(Array.from(TAG_ABIN)).toEqual([0x41, 0x42, 0x49, 0x4e]);
   });
 });
 
@@ -538,5 +544,74 @@ describe("requestVoucherPayload + buildSigBundle round-trip (Task #174)", () => 
     // helper-vs-low-level drift.
     expect(sr25519Verify(payload, bundle[0]!.sig, bundle[0]!.pubkey)).toBe(true);
     expect(sr25519Verify(payload, handRolled.sig, handRolled.pubkey)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task #211 — `attestBatchIntentsPayload` parity with Rust pallet.
+// ---------------------------------------------------------------------------
+
+describe("attestBatchIntentsPayload — Rust parity (Task #211)", () => {
+  it("matches Rust fixture H (3 intent_ids 0x07*32 / 0x11*32 / 0x22*32)", () => {
+    const digest = attestBatchIntentsPayload({
+      intentIds: [
+        ("0x" + "07".repeat(32)) as HexString,
+        ("0x" + "11".repeat(32)) as HexString,
+        ("0x" + "22".repeat(32)) as HexString,
+      ],
+    });
+    expect(u8aToHex(digest)).toBe(
+      "0x13d4c95e1e392553a6b6462eb0f5a24244007ec2410242b6de8297097a17b613",
+    );
+  });
+
+  it("returns a 32-byte digest and is sensitive to ordering", () => {
+    const a = attestBatchIntentsPayload({
+      intentIds: [
+        ("0x" + "07".repeat(32)) as HexString,
+        ("0x" + "11".repeat(32)) as HexString,
+      ],
+    });
+    expect(a.length).toBe(32);
+    const reversed = attestBatchIntentsPayload({
+      intentIds: [
+        ("0x" + "11".repeat(32)) as HexString,
+        ("0x" + "07".repeat(32)) as HexString,
+      ],
+    });
+    expect(u8aToHex(a)).not.toBe(u8aToHex(reversed));
+  });
+
+  it("includes N prefix — empty batch hashes to a deterministic non-zero digest", () => {
+    const empty = attestBatchIntentsPayload({ intentIds: [] });
+    expect(empty.length).toBe(32);
+    const one = attestBatchIntentsPayload({
+      intentIds: [("0x" + "07".repeat(32)) as HexString],
+    });
+    expect(u8aToHex(empty)).not.toBe(u8aToHex(one));
+  });
+
+  it("rejects non-32-byte intent_ids", () => {
+    expect(() =>
+      attestBatchIntentsPayload({
+        intentIds: [("0x" + "07".repeat(16)) as HexString],
+      }),
+    ).toThrow();
+  });
+
+  it("domain-separated from settleBatchAtomicPayload (STBA)", () => {
+    // STBA digest is computed elsewhere in the SDK runner code; here we
+    // assert ABIN's digest doesn't collide with the only other batch tag
+    // currently in scope (settle_claim — single-entry STCL). The 4-byte
+    // domain tag is the differentiator.
+    const ab = attestBatchIntentsPayload({
+      intentIds: [("0x" + "42".repeat(32)) as HexString],
+    });
+    const sc = settleClaimPayload({
+      claimId: ("0x" + "42".repeat(32)) as HexString,
+      cardanoTxHash: ("0x" + "00".repeat(32)) as HexString,
+      settledDirect: false,
+    });
+    expect(u8aToHex(ab)).not.toBe(u8aToHex(sc));
   });
 });

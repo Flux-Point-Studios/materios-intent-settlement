@@ -47,6 +47,14 @@ pub const MAX_BATCH: u32 = 256;
 /// 256 * 65B = ~16KB raw payload, well below the 5MB proof_size limit.
 pub const MAX_SETTLE_BATCH: u32 = 256;
 
+/// Task #211: max intents attested in a single `attest_batch_intents` call.
+/// Mirrors MAX_SETTLE_BATCH. The attest stage is the per-epoch hot path;
+/// pre-spec-207 a 3-of-3 committee posted 3*N attest_intent extrinsics per
+/// batch — at N=256 that's 768 sig-verify rounds per epoch. Post-spec-207
+/// it collapses to ONE M-of-N sig verify per attest_batch_intents call —
+/// the largest single-pallet TPS unlock in the v5.1 plan.
+pub const MAX_ATTEST_BATCH: u32 = 256;
+
 /// Max committee signatures per voucher (spec §3.1 uses `MaxCommittee=32`).
 pub const MAX_COMMITTEE: u32 = 32;
 
