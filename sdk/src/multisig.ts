@@ -54,6 +54,14 @@ export const TAG_RVCH: Uint8Array = new Uint8Array([0x52, 0x56, 0x43, 0x48]);
  * sig-verify rounds. Post-spec-207 it's ONE sig-verify per batch.
  */
 export const TAG_ABIN: Uint8Array = new Uint8Array([0x41, 0x42, 0x49, 0x4e]);
+/**
+ * `b"RVBN"` — 4-byte ASCII domain tag for `request_batch_vouchers`
+ * payloads (Task #212). One M-of-N committee signature bundle authorises
+ * N voucher mints. Pre-spec-207 each voucher mint required its own M-of-N
+ * round (per PR #26's RVCH gate); post-spec-207 N mints collapse to one
+ * sig-verify.
+ */
+export const TAG_RVBN: Uint8Array = new Uint8Array([0x52, 0x56, 0x42, 0x4e]);
 
 // ---------------------------------------------------------------------------
 // Payload builders (digests that committee members sign).
@@ -219,6 +227,69 @@ export function attestBatchIntentsPayload(args: {
       throw new Error(`intentId: expected 32 bytes, got ${idBytes.length}`);
     }
     parts.push(idBytes);
+  }
+  const digest = blake2AsU8a(u8aConcat(...parts), 256);
+  if (digest.length !== 32) {
+    throw new Error(`blake2_256 digest length != 32 (got ${digest.length})`);
+  }
+  return digest;
+}
+
+/**
+ * Byte-identical to Rust `request_batch_vouchers_payload(entries)`
+ * (Task #212).
+ *
+ * Pre-image:
+ *   `b"RVBN" || u32_le(N) || N x (claim_id || intent_id
+ *                                || voucher_digest || bfpr_digest)`
+ *
+ * Each per-entry tuple is identical in shape to the spec-206
+ * `requestVoucherPayload` body — the batch path concatenates N of them
+ * after a 4-byte length prefix and re-tags with RVBN.
+ *
+ * The pallet computes `voucher_digest` + `bfpr_digest` deterministically
+ * from each entry's `voucher` + `fairness_proof` (canonical SCALE) BEFORE
+ * verifying the signature, so the keeper and committee always see the
+ * same pre-image. Compute the per-entry digests here via the SDK helpers
+ * `voucherDigest` (in `hashing.ts`) and `fairnessProofDigest`.
+ *
+ * Pinned cross-layer fixture I:
+ *   entries = [
+ *     (claim=0x07*32, intent=0x11*32, vd=0x22*32, bd=0x33*32),
+ *     (claim=0x44*32, intent=0x55*32, vd=0x66*32, bd=0x77*32),
+ *   ]
+ *   digest = `f82d8e395614d905f0a12f78adf5e6562f6493247327bcbac42f5aeba3f34873`
+ *
+ * @returns 32-byte blake2_256 digest committee members must sign.
+ */
+export function requestBatchVouchersPayload(args: {
+  entries: {
+    claimId: HexString;
+    intentId: HexString;
+    voucherDigest: HexString;
+    bfprDigest: HexString;
+  }[];
+}): Uint8Array {
+  const n = args.entries.length;
+  const parts: Uint8Array[] = [TAG_RVBN, u32LE(n)];
+  for (const e of args.entries) {
+    const cid = hexToU8a(e.claimId);
+    const iid = hexToU8a(e.intentId);
+    const vd = hexToU8a(e.voucherDigest);
+    const bd = hexToU8a(e.bfprDigest);
+    if (cid.length !== 32) {
+      throw new Error(`claimId: expected 32 bytes, got ${cid.length}`);
+    }
+    if (iid.length !== 32) {
+      throw new Error(`intentId: expected 32 bytes, got ${iid.length}`);
+    }
+    if (vd.length !== 32) {
+      throw new Error(`voucherDigest: expected 32 bytes, got ${vd.length}`);
+    }
+    if (bd.length !== 32) {
+      throw new Error(`bfprDigest: expected 32 bytes, got ${bd.length}`);
+    }
+    parts.push(cid, iid, vd, bd);
   }
   const digest = blake2AsU8a(u8aConcat(...parts), 256);
   if (digest.length !== 32) {

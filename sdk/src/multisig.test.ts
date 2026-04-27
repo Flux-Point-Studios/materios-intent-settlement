@@ -6,12 +6,14 @@ import {
   creditDepositPayload,
   requestVoucherPayload,
   attestBatchIntentsPayload,
+  requestBatchVouchersPayload,
   signPayload,
   buildSigBundle,
   TAG_CRDP,
   TAG_STCL,
   TAG_RVCH,
   TAG_ABIN,
+  TAG_RVBN,
 } from "./multisig.js";
 import type { HexString } from "./types.js";
 
@@ -38,6 +40,10 @@ describe("multisig domain tags", () => {
 
   it("TAG_ABIN is ASCII `ABIN` (Task #211)", () => {
     expect(Array.from(TAG_ABIN)).toEqual([0x41, 0x42, 0x49, 0x4e]);
+  });
+
+  it("TAG_RVBN is ASCII `RVBN` (Task #212)", () => {
+    expect(Array.from(TAG_RVBN)).toEqual([0x52, 0x56, 0x42, 0x4e]);
   });
 });
 
@@ -613,5 +619,99 @@ describe("attestBatchIntentsPayload — Rust parity (Task #211)", () => {
       settledDirect: false,
     });
     expect(u8aToHex(ab)).not.toBe(u8aToHex(sc));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task #212 — `requestBatchVouchersPayload` parity with Rust pallet.
+// ---------------------------------------------------------------------------
+
+describe("requestBatchVouchersPayload — Rust parity (Task #212)", () => {
+  it("matches Rust fixture I (2 entries with structured tuple bytes)", () => {
+    const digest = requestBatchVouchersPayload({
+      entries: [
+        {
+          claimId: ("0x" + "07".repeat(32)) as HexString,
+          intentId: ("0x" + "11".repeat(32)) as HexString,
+          voucherDigest: ("0x" + "22".repeat(32)) as HexString,
+          bfprDigest: ("0x" + "33".repeat(32)) as HexString,
+        },
+        {
+          claimId: ("0x" + "44".repeat(32)) as HexString,
+          intentId: ("0x" + "55".repeat(32)) as HexString,
+          voucherDigest: ("0x" + "66".repeat(32)) as HexString,
+          bfprDigest: ("0x" + "77".repeat(32)) as HexString,
+        },
+      ],
+    });
+    expect(u8aToHex(digest)).toBe(
+      "0xf82d8e395614d905f0a12f78adf5e6562f6493247327bcbac42f5aeba3f34873",
+    );
+  });
+
+  it("returns 32 bytes and is sensitive to ordering", () => {
+    const a = requestBatchVouchersPayload({
+      entries: [
+        {
+          claimId: ("0x" + "07".repeat(32)) as HexString,
+          intentId: ("0x" + "11".repeat(32)) as HexString,
+          voucherDigest: ("0x" + "22".repeat(32)) as HexString,
+          bfprDigest: ("0x" + "33".repeat(32)) as HexString,
+        },
+        {
+          claimId: ("0x" + "44".repeat(32)) as HexString,
+          intentId: ("0x" + "55".repeat(32)) as HexString,
+          voucherDigest: ("0x" + "66".repeat(32)) as HexString,
+          bfprDigest: ("0x" + "77".repeat(32)) as HexString,
+        },
+      ],
+    });
+    expect(a.length).toBe(32);
+    const reversed = requestBatchVouchersPayload({
+      entries: [
+        {
+          claimId: ("0x" + "44".repeat(32)) as HexString,
+          intentId: ("0x" + "55".repeat(32)) as HexString,
+          voucherDigest: ("0x" + "66".repeat(32)) as HexString,
+          bfprDigest: ("0x" + "77".repeat(32)) as HexString,
+        },
+        {
+          claimId: ("0x" + "07".repeat(32)) as HexString,
+          intentId: ("0x" + "11".repeat(32)) as HexString,
+          voucherDigest: ("0x" + "22".repeat(32)) as HexString,
+          bfprDigest: ("0x" + "33".repeat(32)) as HexString,
+        },
+      ],
+    });
+    expect(u8aToHex(a)).not.toBe(u8aToHex(reversed));
+  });
+
+  it("rejects non-32-byte entry fields", () => {
+    expect(() =>
+      requestBatchVouchersPayload({
+        entries: [
+          {
+            claimId: ("0x" + "07".repeat(16)) as HexString, // SHORT
+            intentId: ("0x" + "11".repeat(32)) as HexString,
+            voucherDigest: ("0x" + "22".repeat(32)) as HexString,
+            bfprDigest: ("0x" + "33".repeat(32)) as HexString,
+          },
+        ],
+      }),
+    ).toThrow();
+  });
+
+  it("domain-separated from requestVoucherPayload (RVCH)", () => {
+    // Single-entry RVBN must not collide with RVCH digest computed over
+    // the same 4-tuple. Same body bytes, different domain tags.
+    const single: { claimId: HexString; intentId: HexString; voucherDigest: HexString; bfprDigest: HexString } = {
+      claimId: ("0x" + "11".repeat(32)) as HexString,
+      intentId: ("0x" + "22".repeat(32)) as HexString,
+      voucherDigest: ("0x" + "33".repeat(32)) as HexString,
+      bfprDigest: ("0x" + "44".repeat(32)) as HexString,
+    };
+    const rvch = requestVoucherPayload(single);
+    const rvbn = requestBatchVouchersPayload({ entries: [single] });
+    expect(u8aToHex(rvch)).not.toBe(u8aToHex(rvbn));
   });
 });

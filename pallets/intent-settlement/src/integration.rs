@@ -55,6 +55,8 @@ parameter_types! {
     pub const MaxSettleBatch: u32 = 256;
     /// Task #211: max attest_batch_intents size in the integration runtime.
     pub const MaxAttestBatch: u32 = 256;
+    /// Task #212: max request_batch_vouchers size in the integration runtime.
+    pub const MaxVoucherBatch: u32 = 256;
 }
 
 /// Static committee: Alice/Bob/Charlie by sr25519 dev-key AccountId. Threshold 2.
@@ -134,6 +136,7 @@ impl pallet_intent_settlement::pallet::Config for Testnet {
     type SigVerifier = IntegrationSigVerifier;
     type MaxSettleBatch = MaxSettleBatch;
     type MaxAttestBatch = MaxAttestBatch;
+    type MaxVoucherBatch = MaxVoucherBatch;
 }
 
 fn user_account() -> sp_runtime::AccountId32 {
@@ -853,5 +856,154 @@ fn task211_attest_batch_intents_real_runtime_atomic_revert() {
         }
         // Silence unused lint on the with_bogus binding.
         let _ = with_bogus.pop();
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Task #212 — request_batch_vouchers real-runtime integration test.
+//
+// Exercise the new batch path against the AccountId32 + sr25519 runtime so
+// the M-of-N sig-verify, per-entry digest binding, and per-voucher
+// `VoucherIssued` events all round-trip with real state.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn task212_request_batch_vouchers_real_runtime_happy_path() {
+    new_ext().execute_with(|| {
+        let user = user_account();
+        let alice = committee_accounts().0;
+        let bob = committee_accounts().1;
+
+        // Submit 2 BuyPolicy intents via the full pipeline so they reach
+        // Attested status under the integration runtime's real sr25519
+        // verifier.
+        let amount = 2_000_000u64;
+        let cardano_tx = [0xCC; 32];
+        let mut target_bytes = [0u8; 32];
+        target_bytes.copy_from_slice(&user.encode()[..32]);
+        let crdp = credit_deposit_payload(&target_bytes, amount * 4, &cardano_tx);
+        let crdp_sigs = vec![sign_with("//Alice", &crdp), sign_with("//Bob", &crdp)];
+        assert_ok!(IntentSettlement::credit_deposit(
+            RuntimeOrigin::signed(alice.clone()),
+            user.clone(),
+            amount * 4,
+            cardano_tx,
+            crdp_sigs,
+        ));
+
+        let mut iids: Vec<IntentId> = Vec::new();
+        for seed in [0xA1u8, 0xA2u8] {
+            let kind = IntentKind::BuyPolicy {
+                product_id: H256::from([seed; 32]),
+                strike: 1,
+                term_slots: 86_400,
+                premium_ada: amount,
+                beneficiary_cardano_addr: BoundedVec::try_from(vec![0xB1; 57]).unwrap(),
+            };
+            let mut sb = [0u8; 32];
+            sb.copy_from_slice(&user.encode()[..32]);
+            let nonce = pallet_intent_settlement::pallet::Nonces::<Testnet>::get(&user);
+            let blk: u32 = System::block_number() as u32;
+            let iid = compute_intent_id(&sb, nonce, &kind, blk);
+            assert_ok!(IntentSettlement::submit_intent(
+                RuntimeOrigin::signed(user.clone()),
+                kind,
+            ));
+            iids.push(iid);
+
+            let alice_pk = {
+                let b: &[u8; 32] = alice.as_ref();
+                *b
+            };
+            let bob_pk = {
+                let b: &[u8; 32] = bob.as_ref();
+                *b
+            };
+            assert_ok!(IntentSettlement::attest_intent(
+                RuntimeOrigin::signed(alice.clone()), iid, alice_pk, [0u8; 64],
+            ));
+            assert_ok!(IntentSettlement::attest_intent(
+                RuntimeOrigin::signed(bob.clone()), iid, bob_pk, [0u8; 64],
+            ));
+        }
+
+        // Build voucher entries.
+        let alice_pk = {
+            let b: &[u8; 32] = alice.as_ref();
+            *b
+        };
+        let bob_pk = {
+            let b: &[u8; 32] = bob.as_ref();
+            *b
+        };
+        let entries: Vec<RequestVoucherEntry> = iids
+            .iter()
+            .enumerate()
+            .map(|(i, iid)| {
+                let claim_id = H256::from([(0xD0u8 + i as u8); 32]);
+                let bfpr = BatchFairnessProof {
+                    batch_block_range: (1, System::block_number() as u32),
+                    sorted_intent_ids: BoundedVec::try_from(vec![*iid]).unwrap(),
+                    requested_amounts_ada: BoundedVec::try_from(vec![amount]).unwrap(),
+                    pool_balance_ada: 100_000_000,
+                    pro_rata_scale_bps: 10_000,
+                    awarded_amounts_ada: BoundedVec::try_from(vec![amount]).unwrap(),
+                };
+                let bfpr_d = compute_fairness_proof_digest(&bfpr);
+                let voucher = Voucher {
+                    claim_id,
+                    policy_id: H256::from([0x99; 32]),
+                    beneficiary_cardano_addr: BoundedVec::try_from(vec![0xB1; 57]).unwrap(),
+                    amount_ada: amount,
+                    batch_fairness_proof_digest: bfpr_d,
+                    issued_block: System::block_number() as u32,
+                    expiry_slot_cardano: 100_000,
+                    committee_sigs: BoundedVec::try_from(vec![
+                        (alice_pk, [0u8; 64]),
+                        (bob_pk, [0u8; 64]),
+                    ])
+                    .unwrap(),
+                };
+                RequestVoucherEntry {
+                    claim_id,
+                    intent_id: *iid,
+                    voucher,
+                    fairness_proof: bfpr,
+                }
+            })
+            .collect();
+
+        // Compute the canonical RVBN digest from the same per-entry
+        // digests the pallet derives. Sign with real sr25519.
+        let tuples: Vec<(ClaimId, IntentId, [u8; 32], [u8; 32])> = entries
+            .iter()
+            .map(|e| {
+                let bd = compute_fairness_proof_digest(&e.fairness_proof);
+                let vd = compute_voucher_digest(&e.voucher);
+                (e.claim_id, e.intent_id, vd, bd)
+            })
+            .collect();
+        let payload = crate::request_batch_vouchers_payload(&tuples);
+        let alice_sig = sign_with("//Alice", &payload);
+        let bob_sig = sign_with("//Bob", &payload);
+
+        let bv: BoundedVec<RequestVoucherEntry, MaxVoucherBatch> =
+            BoundedVec::try_from(entries.clone()).unwrap();
+        assert_ok!(IntentSettlement::request_batch_vouchers(
+            RuntimeOrigin::signed(alice.clone()),
+            bv,
+            vec![alice_sig, bob_sig],
+        ));
+        for entry in entries.iter() {
+            let intent =
+                pallet_intent_settlement::pallet::Intents::<Testnet>::get(entry.intent_id)
+                    .unwrap();
+            assert_eq!(intent.status, IntentStatus::Vouchered);
+            assert!(
+                pallet_intent_settlement::pallet::Vouchers::<Testnet>::contains_key(
+                    entry.claim_id,
+                ),
+            );
+        }
     });
 }
