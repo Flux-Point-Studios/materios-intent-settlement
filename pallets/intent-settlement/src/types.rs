@@ -60,6 +60,14 @@ pub const MAX_ATTEST_BATCH: u32 = 256;
 /// which cap their internal slices at MAX_BATCH=256.
 pub const MAX_VOUCHER_BATCH: u32 = 256;
 
+/// Task #210: max intents submitted in a single `submit_batch_intents` call.
+/// Mirror MAX_SETTLE_BATCH so the user-side burst stage matches the
+/// committee-settle stage. Sized for the largest realistic intent
+/// (BuyPolicy with 114B beneficiary addr + 8B premium ~200B SCALE encoded);
+/// 256 * 200B ~50KB worst-case extrinsic payload, well below the 5MB
+/// proof_size limit.
+pub const MAX_SUBMIT_BATCH: u32 = 256;
+
 /// Max committee signatures per voucher (spec §3.1 uses `MaxCommittee=32`).
 pub const MAX_COMMITTEE: u32 = 32;
 
@@ -320,4 +328,20 @@ pub struct RequestVoucherEntry {
     pub intent_id: IntentId,
     pub voucher: Voucher,
     pub fairness_proof: BatchFairnessProof,
+}
+
+// ---------------------------------------------------------------------------
+// Task #210: SubmitIntentEntry — single entry in a `submit_batch_intents` call
+// ---------------------------------------------------------------------------
+
+/// One user intent inside a `submit_batch_intents` batch. Carries the same
+/// payload as a single `submit_intent(kind)` call, minus the user origin —
+/// the batch's signed origin is the submitter for every entry. Pre-spec-207
+/// a 256-intent burst required 256 extrinsics; post-spec-207 it's one
+/// extrinsic with a single fee-payer + a single all-or-nothing semantic
+/// (atomic via `with_storage_layer` so no partial debit on a mid-batch
+/// rejection).
+#[derive(Clone, Encode, Decode, TypeInfo, MaxEncodedLen, RuntimeDebug, PartialEq, Eq)]
+pub struct SubmitIntentEntry {
+    pub kind: IntentKind,
 }

@@ -267,4 +267,42 @@ mod benchmarks {
         #[extrinsic_call]
         _(RawOrigin::Signed(caller), bv, signatures);
     }
+
+    // ---- Task #210 — submit_batch_intents bench -------------------------
+
+    /// Bench `submit_batch_intents` across `Linear<1, MAX_BATCH>` so the
+    /// runtime weight generator produces a sublinear curve matching the
+    /// spec-207 cost model:
+    ///   N=1   ~55M ref_time
+    ///   N=8   ~70M ref_time
+    ///   N=64  ~150M ref_time
+    ///   N=256 ~400M ref_time
+    /// Versus 256 single `submit_intent` calls at ~500M each = 128B
+    /// ref_time, the batch path is ~320x cheaper at the per-block-budget
+    /// level. The economic win is even larger because the user pays one
+    /// fee instead of N.
+    #[benchmark]
+    fn submit_batch_intents(n: Linear<1, MAX_BATCH_BENCH>) {
+        let caller: T::AccountId = whitelisted_caller();
+        let mut entries: sp_std::vec::Vec<SubmitIntentEntry> =
+            sp_std::vec::Vec::with_capacity(n as usize);
+        for i in 0..n {
+            entries.push(SubmitIntentEntry {
+                kind: IntentKind::RequestPayout {
+                    policy_id: PolicyId::from({
+                        let mut b = [0u8; 32];
+                        b[..4].copy_from_slice(&i.to_be_bytes());
+                        b
+                    }),
+                    oracle_evidence: Default::default(),
+                },
+            });
+        }
+        let bv: frame_support::BoundedVec<SubmitIntentEntry, T::MaxSubmitBatch> =
+            frame_support::BoundedVec::try_from(entries)
+                .expect("bench n <= MaxSubmitBatch");
+
+        #[extrinsic_call]
+        _(RawOrigin::Signed(caller), bv);
+    }
 }

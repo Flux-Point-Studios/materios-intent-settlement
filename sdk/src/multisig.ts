@@ -27,8 +27,8 @@
 import { blake2AsU8a } from "@polkadot/util-crypto";
 import { Keyring } from "@polkadot/keyring";
 import { hexToU8a, u8aConcat, u8aEq } from "@polkadot/util";
-import type { HexString } from "./types.js";
-import { u32LE, u64LE } from "./hashing.js";
+import type { HexString, IntentKind } from "./types.js";
+import { encodeIntentKind, u32LE, u64LE } from "./hashing.js";
 
 // ---------------------------------------------------------------------------
 // Domain tags (Issue #7 — pallet lib.rs::TAG_CRDP, TAG_STCL; Task #174 —
@@ -62,6 +62,14 @@ export const TAG_ABIN: Uint8Array = new Uint8Array([0x41, 0x42, 0x49, 0x4e]);
  * sig-verify.
  */
 export const TAG_RVBN: Uint8Array = new Uint8Array([0x52, 0x56, 0x42, 0x4e]);
+/**
+ * `b"SBIN"` — 4-byte ASCII domain tag for the `submit_batch_intents` event
+ * digest (Task #210). NOT a sig pre-image (the user-side burst stage has
+ * no M-of-N gate; the user origin IS the authority). Indexers read this
+ * digest off the `BatchIntentsSubmitted` event so they can correlate the
+ * on-chain landing with the keeper's observed batch object.
+ */
+export const TAG_SBIN: Uint8Array = new Uint8Array([0x53, 0x42, 0x49, 0x4e]);
 
 // ---------------------------------------------------------------------------
 // Payload builders (digests that committee members sign).
@@ -290,6 +298,41 @@ export function requestBatchVouchersPayload(args: {
       throw new Error(`bfprDigest: expected 32 bytes, got ${bd.length}`);
     }
     parts.push(cid, iid, vd, bd);
+  }
+  const digest = blake2AsU8a(u8aConcat(...parts), 256);
+  if (digest.length !== 32) {
+    throw new Error(`blake2_256 digest length != 32 (got ${digest.length})`);
+  }
+  return digest;
+}
+
+/**
+ * Byte-identical to Rust `submit_batch_intents_payload(entries)` (Task #210).
+ *
+ * Pre-image:
+ *   `b"SBIN" || u32_le(N) || N×scale(IntentKind)`
+ *
+ * NOT a sig pre-image. The user-side burst stage has no M-of-N gate (the
+ * user origin IS the authority). This digest is emitted in the
+ * `BatchIntentsSubmitted` event so off-chain observers can correlate the
+ * on-chain landing with the keeper's observed batch object. The included
+ * N prefix prevents trivial digest collision between two batches that
+ * share an IntentKind list of different lengths.
+ *
+ * Pinned cross-layer fixture G (3-entry RequestPayout list with
+ * policy_ids 0x07*32 / 0x11*32 / 0x22*32 and 4-byte zero oracle_evidence
+ * each) hashes to
+ * `a6644ed7143c4460cb5d0b1fab0fd1de6badee4e663b1a6d11d1c223404afb0a`.
+ *
+ * @returns 32-byte blake2_256 digest matching the Rust pallet emission.
+ */
+export function submitBatchIntentsPayload(args: {
+  entries: { kind: IntentKind }[];
+}): Uint8Array {
+  const n = args.entries.length;
+  const parts: Uint8Array[] = [TAG_SBIN, u32LE(n)];
+  for (const e of args.entries) {
+    parts.push(encodeIntentKind(e.kind));
   }
   const digest = blake2AsU8a(u8aConcat(...parts), 256);
   if (digest.length !== 32) {

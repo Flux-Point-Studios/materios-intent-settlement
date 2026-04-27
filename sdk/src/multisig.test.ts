@@ -7,6 +7,7 @@ import {
   requestVoucherPayload,
   attestBatchIntentsPayload,
   requestBatchVouchersPayload,
+  submitBatchIntentsPayload,
   signPayload,
   buildSigBundle,
   TAG_CRDP,
@@ -14,6 +15,7 @@ import {
   TAG_RVCH,
   TAG_ABIN,
   TAG_RVBN,
+  TAG_SBIN,
 } from "./multisig.js";
 import type { HexString } from "./types.js";
 
@@ -44,6 +46,10 @@ describe("multisig domain tags", () => {
 
   it("TAG_RVBN is ASCII `RVBN` (Task #212)", () => {
     expect(Array.from(TAG_RVBN)).toEqual([0x52, 0x56, 0x42, 0x4e]);
+  });
+
+  it("TAG_SBIN is ASCII `SBIN` (Task #210)", () => {
+    expect(Array.from(TAG_SBIN)).toEqual([0x53, 0x42, 0x49, 0x4e]);
   });
 });
 
@@ -605,11 +611,7 @@ describe("attestBatchIntentsPayload — Rust parity (Task #211)", () => {
     ).toThrow();
   });
 
-  it("domain-separated from settleBatchAtomicPayload (STBA)", () => {
-    // STBA digest is computed elsewhere in the SDK runner code; here we
-    // assert ABIN's digest doesn't collide with the only other batch tag
-    // currently in scope (settle_claim — single-entry STCL). The 4-byte
-    // domain tag is the differentiator.
+  it("domain-separated from settleClaimPayload (STCL)", () => {
     const ab = attestBatchIntentsPayload({
       intentIds: [("0x" + "42".repeat(32)) as HexString],
     });
@@ -713,5 +715,102 @@ describe("requestBatchVouchersPayload — Rust parity (Task #212)", () => {
     const rvch = requestVoucherPayload(single);
     const rvbn = requestBatchVouchersPayload({ entries: [single] });
     expect(u8aToHex(rvch)).not.toBe(u8aToHex(rvbn));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task #210 — `submitBatchIntentsPayload` parity with Rust pallet.
+// ---------------------------------------------------------------------------
+
+describe("submitBatchIntentsPayload — Rust parity (Task #210)", () => {
+  it("matches Rust fixture G (3 RequestPayout entries, ascending policy ids)", () => {
+    const evidence = new Uint8Array(4);
+    const digest = submitBatchIntentsPayload({
+      entries: [
+        {
+          kind: {
+            tag: "RequestPayout",
+            policyId: ("0x" + "07".repeat(32)) as HexString,
+            oracleEvidence: evidence,
+          },
+        },
+        {
+          kind: {
+            tag: "RequestPayout",
+            policyId: ("0x" + "11".repeat(32)) as HexString,
+            oracleEvidence: evidence,
+          },
+        },
+        {
+          kind: {
+            tag: "RequestPayout",
+            policyId: ("0x" + "22".repeat(32)) as HexString,
+            oracleEvidence: evidence,
+          },
+        },
+      ],
+    });
+    expect(u8aToHex(digest)).toBe(
+      "0xa6644ed7143c4460cb5d0b1fab0fd1de6badee4e663b1a6d11d1c223404afb0a",
+    );
+  });
+
+  it("returns a 32-byte digest and is sensitive to entry ordering", () => {
+    const ev = new Uint8Array(4);
+    const a = submitBatchIntentsPayload({
+      entries: [
+        {
+          kind: {
+            tag: "RequestPayout",
+            policyId: ("0x" + "07".repeat(32)) as HexString,
+            oracleEvidence: ev,
+          },
+        },
+        {
+          kind: {
+            tag: "RequestPayout",
+            policyId: ("0x" + "11".repeat(32)) as HexString,
+            oracleEvidence: ev,
+          },
+        },
+      ],
+    });
+    expect(a.length).toBe(32);
+    const reversed = submitBatchIntentsPayload({
+      entries: [
+        {
+          kind: {
+            tag: "RequestPayout",
+            policyId: ("0x" + "11".repeat(32)) as HexString,
+            oracleEvidence: ev,
+          },
+        },
+        {
+          kind: {
+            tag: "RequestPayout",
+            policyId: ("0x" + "07".repeat(32)) as HexString,
+            oracleEvidence: ev,
+          },
+        },
+      ],
+    });
+    expect(u8aToHex(a)).not.toBe(u8aToHex(reversed));
+  });
+
+  it("includes N prefix — empty batch hashes to a deterministic non-zero digest", () => {
+    const empty = submitBatchIntentsPayload({ entries: [] });
+    expect(empty.length).toBe(32);
+    const one = submitBatchIntentsPayload({
+      entries: [
+        {
+          kind: {
+            tag: "RequestPayout",
+            policyId: ("0x" + "00".repeat(32)) as HexString,
+            oracleEvidence: new Uint8Array(0),
+          },
+        },
+      ],
+    });
+    expect(u8aToHex(empty)).not.toBe(u8aToHex(one));
   });
 });

@@ -92,6 +92,7 @@ export {
   requestVoucherPayload,
   attestBatchIntentsPayload,
   requestBatchVouchersPayload,
+  submitBatchIntentsPayload,
   signPayload,
   buildSigBundle,
   TAG_CRDP,
@@ -99,6 +100,7 @@ export {
   TAG_RVCH,
   TAG_ABIN,
   TAG_RVBN,
+  TAG_SBIN,
 } from "./multisig.js";
 
 export type {

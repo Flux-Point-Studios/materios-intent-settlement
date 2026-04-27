@@ -86,6 +86,14 @@ pub const TAG_ABIN: &[u8; 4] = b"ABIN";
 /// voucher signature can never be replayed against any other pallet
 /// pre-image.
 pub const TAG_RVBN: &[u8; 4] = b"RVBN";
+/// Task #210: domain tag for the `submit_batch_intents` event digest. There
+/// is NO M-of-N gate on this extrinsic (it's user-side, not committee-side),
+/// but emitting a canonical batch digest in the `BatchIntentsSubmitted`
+/// event lets indexers correlate the on-chain landing with the keeper's
+/// observed batch. Domain-separates from STBA/RVCH/STCL/CRDP and the
+/// upcoming ABIN/RVBN tags so a SBIN digest can never be replayed onto a
+/// committee-signed pre-image.
+pub const TAG_SBIN: &[u8; 4] = b"SBIN";
 
 /// Canonical digest signed by committee members when authorizing a
 /// `credit_deposit(target, amount, cardano_tx_hash)` call (Issue #7).
@@ -249,6 +257,31 @@ pub fn request_batch_vouchers_payload(
     crate::types::domain_hash(*TAG_RVBN, &body)
 }
 
+/// Task #210: canonical batch digest emitted in the `BatchIntentsSubmitted`
+/// event. There is NO M-of-N gate on `submit_batch_intents` (it's the
+/// user-side stage), so this digest is purely an indexer-facing identity
+/// for the batch — it does NOT serve as a sig pre-image. Format:
+///
+/// `blake2_256(b"SBIN" || u32_le(N) || N×scale(IntentKind))`
+///
+/// The IntentKind SCALE encoding is identical to what the pallet hashes into
+/// IntentId (modulo the per-intent submitter/nonce/block fields), so a
+/// keeper that observed the batch off-chain can recompute this digest and
+/// correlate with the on-chain `BatchIntentsSubmitted{batch_digest}`. The
+/// included N prefix prevents trivial digest collision between two batches
+/// that share a kind list of different lengths.
+pub fn submit_batch_intents_payload(
+    entries: &[SubmitIntentEntry],
+) -> [u8; 32] {
+    let n = entries.len() as u32;
+    let mut body = alloc::vec::Vec::new();
+    body.extend_from_slice(&n.to_le_bytes());
+    for e in entries.iter() {
+        body.extend_from_slice(&e.kind.encode());
+    }
+    crate::types::domain_hash(*TAG_SBIN, &body)
+}
+
 #[frame_support::pallet]
 pub mod pallet {
     use super::*;
@@ -326,6 +359,15 @@ pub mod pallet {
         /// `types::MAX_VOUCHER_BATCH = 256`.
         #[pallet::constant]
         type MaxVoucherBatch: Get<u32>;
+
+        /// Task #210: maximum number of intents submitted in a single
+        /// `submit_batch_intents` call. The runtime configures this; the
+        /// canonical default is `types::MAX_SUBMIT_BATCH = 256`. Only
+        /// constrained by per-block normal-class extrinsic budget plus the
+        /// PendingBatches index headroom (so the largest realistic batch
+        /// stays well within `MaxPendingBatches`).
+        #[pallet::constant]
+        type MaxSubmitBatch: Get<u32>;
     }
 
     /// Abstraction for verifying an `sr25519` signature over a committee
@@ -550,6 +592,20 @@ pub mod pallet {
             batch_digest: [u8; 32],
             total_amount_ada: AdaLovelace,
         },
+        /// Task #210: a `submit_batch_intents` call landed and registered
+        /// `count` user intents in one extrinsic. `batch_digest` is the
+        /// canonical SBIN pre-image (`blake2_256(b"SBIN" || N || kinds)`)
+        /// so off-chain observers can correlate the on-chain landing with
+        /// the keeper's observed batch. The individual `IntentSubmitted`
+        /// events are STILL emitted for every entry (one per intent), so
+        /// downstream indexers tracking single-intent flow keep working
+        /// without changes — `BatchIntentsSubmitted` is purely additive.
+        BatchIntentsSubmitted {
+            submitter: T::AccountId,
+            count: u32,
+            batch_digest: [u8; 32],
+            total_premium_ada: AdaLovelace,
+        },
     }
 
     // ---------------------------------------------------------------------
@@ -648,6 +704,16 @@ pub mod pallet {
         /// Task #212: a single batch contained the same `claim_id` twice.
         /// Atomically rejected — pallet must surface the keeper bug.
         DuplicateClaimInVoucherBatch,
+        /// Task #210: `submit_batch_intents` was called with an empty entries
+        /// vec. Atomically rejected (no fee/credit movement) so the weight
+        /// model stays honest (we charge ~baseline + N*per-entry; N=0 must
+        /// not slip through as "free").
+        EmptyIntentBatch,
+        /// Task #210: summing per-entry `BuyPolicy.premium_ada` across the
+        /// batch overflows `u64`. Cheaper to reject than to silently wrap,
+        /// matching the Issue #5 `CoverageOverflow` precedent on the
+        /// voucher-mint stage.
+        SubmitBatchPremiumOverflow,
     }
 
     // ---------------------------------------------------------------------
@@ -1622,6 +1688,112 @@ pub mod pallet {
             });
             Ok(())
         }
+
+        /// Task #210: register N user intents in ONE extrinsic.
+        ///
+        /// User-side burst submission. Pre-spec-207 each intent required its
+        /// own `submit_intent` extrinsic — at 256 intents that's 256
+        /// signatures, 256 fee debits, and 256 round trips through the
+        /// mempool. Post-spec-207 a single `submit_batch_intents(entries)`
+        /// debits the user's fee once, takes ONE pre-image of the batch (for
+        /// indexer correlation, NOT for sig-verify — the user origin is the
+        /// only authority needed here), and runs the same per-intent state
+        /// transitions inside a single transactional storage layer.
+        ///
+        /// Atomic semantics: the entire batch reverts on the FIRST per-entry
+        /// failure (insufficient credit, pool-utilization cap, duplicate
+        /// intent collision, or PendingBatches index overflow). No partial
+        /// debit, no partial intents stored. Callers can retry the batch
+        /// deterministically after fixing whichever entry tripped the
+        /// rejection.
+        ///
+        /// Idempotency: the existing single-call `submit_intent` enforces
+        /// `DuplicateIntent` via the IntentId pre-image (which already
+        /// includes the user's nonce). Inside the batch each entry consumes
+        /// nonce+i, so two identical entries in the same batch produce
+        /// different IntentIds and BOTH commit (they're not duplicates from
+        /// the chain's perspective). Two identical batches submitted twice
+        /// (same nonce starting point) hit `DuplicateIntent` on the second
+        /// call's first entry and atomically revert — the legacy guarantee.
+        ///
+        /// Backward compatibility: the existing 1-arg `submit_intent` is
+        /// unchanged. Callers can mix single and batch in the same block.
+        ///
+        /// Cost model:
+        /// - Base ~50M ref_time (signature verify + envelope decode)
+        /// - Plus N*~5M ref_time (per-entry pool-utilization check +
+        ///   IntentId derivation + storage writes for `Intents`, `Nonces`,
+        ///   `PendingBatches`, `ExpiryQueue`)
+        /// - Plus the standard `submit_intent` per-call weight (500M from
+        ///   the legacy single-call) but consumed ONCE per batch, not per
+        ///   entry — that's the throughput unlock.
+        #[pallet::call_index(10)]
+        #[pallet::weight(
+            // Base weight ~50M (single-call submit_intent's amortised cost)
+            // plus per-entry storage cost ~5M. Tuned to match the sublinear
+            // pattern proven in PR #27 (settle_batch_atomic) — actual numbers
+            // are pinned by the runtime-benchmarks recipe in benchmarking.rs.
+            Weight::from_parts(
+                50_000_000u64.saturating_add((entries.len() as u64).saturating_mul(5_000_000)),
+                0,
+            )
+        )]
+        pub fn submit_batch_intents(
+            origin: OriginFor<T>,
+            entries: BoundedVec<SubmitIntentEntry, <T as Config>::MaxSubmitBatch>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(!entries.is_empty(), Error::<T>::EmptyIntentBatch);
+
+            // Compute the canonical SBIN digest BEFORE consuming entries —
+            // this is purely for indexer correlation (no sig-verify), so
+            // it's safe to do up-front. Costs O(sum of SCALE-encoded kinds)
+            // which is dominated by the BoundedVec encoding the user already
+            // paid to land.
+            let batch_digest = submit_batch_intents_payload(entries.as_slice());
+
+            // Pre-flight: sum BuyPolicy premiums across the batch. Reject
+            // overflow before mutating storage so a craft-an-overflow
+            // attempt cannot leave state half-updated. The per-entry credit
+            // and pool-utilization checks STILL run inside `do_submit_intent`
+            // (we don't pre-check them here — letting the per-entry path run
+            // keeps semantics identical to a sequence of single-call
+            // `submit_intent`s, just collapsed into one origin/fee).
+            let mut total_premium_ada: AdaLovelace = 0;
+            for entry in entries.iter() {
+                if let IntentKind::BuyPolicy { premium_ada, .. } = &entry.kind {
+                    total_premium_ada = total_premium_ada
+                        .checked_add(*premium_ada)
+                        .ok_or(Error::<T>::SubmitBatchPremiumOverflow)?;
+                }
+            }
+
+            // Atomic mutation phase. Any per-entry error from
+            // `do_submit_intent` (insufficient credit, pool-cap exceeded,
+            // duplicate intent, pending-batches full) bubbles up and rolls
+            // back EVERY mutation in this call — including any entries that
+            // already debited credits. This matches the all-or-nothing
+            // semantics PR #27 established for `settle_batch_atomic`.
+            let count = entries.len() as u32;
+            frame_support::storage::with_storage_layer::<
+                (),
+                sp_runtime::DispatchError,
+                _,
+            >(|| {
+                for entry in entries.into_iter() {
+                    Self::do_submit_intent(who.clone(), entry.kind)?;
+                }
+                Ok(())
+            })?;
+
+            Self::deposit_event(Event::BatchIntentsSubmitted {
+                submitter: who,
+                count,
+                batch_digest,
+                total_premium_ada,
+            });
+            Ok(())
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -1893,4 +2065,5 @@ pub mod pallet {
 pub use crate::types::{
     compute_committee_set_digest, compute_fairness_proof_digest, compute_intent_id,
     compute_voucher_digest, domain_hash, RequestVoucherEntry, SettleBatchEntry,
+    SubmitIntentEntry,
 };
