@@ -184,4 +184,87 @@ mod benchmarks {
         #[extrinsic_call]
         _(RawOrigin::Signed(caller), bv, signatures);
     }
+
+    // ---- Task #212 — request_batch_vouchers bench -----------------------
+
+    /// Bench `request_batch_vouchers` across `Linear<1, MAX_BATCH>` so the
+    /// runtime weight generator produces a sublinear curve matching the
+    /// spec-207 cost model:
+    ///   N=1   ~60M ref_time   N=64  ~700M ref_time
+    ///   N=8   ~130M ref_time  N=256 ~2.6B ref_time
+    /// Versus 256 single `request_voucher` calls at ~100M each = ~25.6B
+    /// ref_time, the batch path is ~10x cheaper at the per-block-budget
+    /// level.
+    #[benchmark]
+    fn request_batch_vouchers(n: Linear<1, MAX_BATCH_BENCH>) {
+        use crate::pallet::Intents;
+        let submitter: T::AccountId = whitelisted_caller();
+        let mut entries: sp_std::vec::Vec<RequestVoucherEntry> =
+            sp_std::vec::Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let mut id_bytes = [0u8; 32];
+            id_bytes[..4].copy_from_slice(&i.to_be_bytes());
+            id_bytes[4..8].copy_from_slice(b"BRBV");
+            let intent_id = IntentId::from(id_bytes);
+            let mut cid_bytes = id_bytes;
+            cid_bytes[8..12].copy_from_slice(b"CLAM");
+            let claim_id = ClaimId::from(cid_bytes);
+            Intents::<T>::insert(
+                intent_id,
+                Intent {
+                    submitter: submitter.clone(),
+                    nonce: i as u64,
+                    kind: IntentKind::RequestPayout {
+                        policy_id: PolicyId::from([0u8; 32]),
+                        oracle_evidence: Default::default(),
+                    },
+                    submitted_block: 1,
+                    ttl_block: 1_000_000,
+                    status: IntentStatus::Attested,
+                },
+            );
+            let bfpr = BatchFairnessProof {
+                batch_block_range: (1, 1),
+                sorted_intent_ids: frame_support::BoundedVec::try_from(
+                    sp_std::vec![intent_id],
+                ).unwrap(),
+                requested_amounts_ada: frame_support::BoundedVec::try_from(
+                    sp_std::vec![1_000u64],
+                ).unwrap(),
+                pool_balance_ada: 1_000_000_000,
+                pro_rata_scale_bps: 10_000,
+                awarded_amounts_ada: frame_support::BoundedVec::try_from(
+                    sp_std::vec![1_000u64],
+                ).unwrap(),
+            };
+            let bfpr_d = compute_fairness_proof_digest(&bfpr);
+            let voucher = Voucher {
+                claim_id,
+                policy_id: PolicyId::from([0u8; 32]),
+                beneficiary_cardano_addr: Default::default(),
+                amount_ada: 1_000,
+                batch_fairness_proof_digest: bfpr_d,
+                issued_block: 1,
+                expiry_slot_cardano: 100_000,
+                committee_sigs: Default::default(),
+            };
+            entries.push(RequestVoucherEntry {
+                claim_id,
+                intent_id,
+                voucher,
+                fairness_proof: bfpr,
+            });
+        }
+
+        let caller: T::AccountId = whitelisted_caller();
+        let caller_pubkey = T::CommitteeMembership::pubkey_of(&caller);
+        let signatures: sp_std::vec::Vec<(CommitteePubkey, CommitteeSig)> =
+            sp_std::vec![(caller_pubkey, [0u8; 64])];
+        let bv: frame_support::BoundedVec<RequestVoucherEntry, T::MaxVoucherBatch> =
+            frame_support::BoundedVec::try_from(entries)
+                .expect("bench n <= MaxVoucherBatch");
+
+        #[extrinsic_call]
+        _(RawOrigin::Signed(caller), bv, signatures);
+    }
 }

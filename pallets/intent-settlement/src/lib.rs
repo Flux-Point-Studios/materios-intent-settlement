@@ -76,6 +76,16 @@ pub const TAG_STBA: &[u8; 4] = b"STBA";
 /// Domain-separated from STBA / STCL / CRDP / RVCH / SBIN so an ABIN
 /// signature can never be replayed against any other call's pre-image.
 pub const TAG_ABIN: &[u8; 4] = b"ABIN";
+/// Task #212: domain tag for the `request_batch_vouchers` multisig
+/// payload. The digest is computed once over the FULL ordered list of
+/// (claim_id, intent_id, voucher_digest, bfpr_digest) tuples; one
+/// committee signature bundle authorises N voucher mints. Pre-spec-207
+/// each voucher mint required its own M-of-N round (per PR #26's RVCH
+/// gate); post-spec-207 N mints collapse to one sig-verify. Domain-
+/// separated from RVCH / STBA / STCL / CRDP / SBIN / ABIN so a batch-
+/// voucher signature can never be replayed against any other pallet
+/// pre-image.
+pub const TAG_RVBN: &[u8; 4] = b"RVBN";
 
 /// Canonical digest signed by committee members when authorizing a
 /// `credit_deposit(target, amount, cardano_tx_hash)` call (Issue #7).
@@ -206,6 +216,39 @@ pub fn attest_batch_intents_payload(
     crate::types::domain_hash(*TAG_ABIN, &body)
 }
 
+/// Task #212: canonical digest signed by committee members when
+/// authorizing a `request_batch_vouchers(entries)` call. Pre-image:
+///
+/// `blake2_256(b"RVBN" || u32_le(N)
+///             || N x (claim_id (32B) || intent_id (32B)
+///                     || voucher_digest (32B) || bfpr_digest (32B)))`
+///
+/// Each per-entry tuple is identical in shape to the spec-206 single-call
+/// `request_voucher_payload` body — the batch path just concatenates N of
+/// them after a 4-byte length prefix and re-tags with RVBN. The
+/// `voucher_digest` + `bfpr_digest` are computed deterministically by the
+/// pallet from each entry's `voucher` + `fairness_proof` (canonical SCALE)
+/// before this digest is hashed, so the keeper and committee always see
+/// the same pre-image.
+///
+/// Per `feedback_mofn_hash_determinism.md`: only chain-derived state
+/// (claim_ids, intent_ids, deterministic Voucher + BFPR digests) appears
+/// in the pre-image — no operator-local fields.
+pub fn request_batch_vouchers_payload(
+    entries: &[(ClaimId, IntentId, [u8; 32], [u8; 32])],
+) -> [u8; 32] {
+    let n = entries.len() as u32;
+    let mut body = alloc::vec::Vec::with_capacity(4 + entries.len() * (32 + 32 + 32 + 32));
+    body.extend_from_slice(&n.to_le_bytes());
+    for (claim_id, intent_id, voucher_d, bfpr_d) in entries.iter() {
+        body.extend_from_slice(claim_id.as_bytes());
+        body.extend_from_slice(intent_id.as_bytes());
+        body.extend_from_slice(voucher_d);
+        body.extend_from_slice(bfpr_d);
+    }
+    crate::types::domain_hash(*TAG_RVBN, &body)
+}
+
 #[frame_support::pallet]
 pub mod pallet {
     use super::*;
@@ -277,6 +320,12 @@ pub mod pallet {
         /// committee extrinsics into ONE batch call.
         #[pallet::constant]
         type MaxAttestBatch: Get<u32>;
+
+        /// Task #212: maximum number of vouchers issued in a single
+        /// `request_batch_vouchers` call. Canonical default is
+        /// `types::MAX_VOUCHER_BATCH = 256`.
+        #[pallet::constant]
+        type MaxVoucherBatch: Get<u32>;
     }
 
     /// Abstraction for verifying an `sr25519` signature over a committee
@@ -489,6 +538,18 @@ pub mod pallet {
             batch_digest: [u8; 32],
             signer_count: u32,
         },
+        /// Task #212: a `request_batch_vouchers` call landed and minted
+        /// `count` vouchers under ONE committee-signature verification.
+        /// The legacy per-voucher `VoucherIssued` events are STILL emitted
+        /// inside the batch (one per entry) so existing indexer paths keep
+        /// working unchanged. `batch_digest` is the canonical RVBN
+        /// pre-image hash so off-chain observers can correlate the on-chain
+        /// landing with the keeper's signed batch object.
+        BatchVouchersIssued {
+            count: u32,
+            batch_digest: [u8; 32],
+            total_amount_ada: AdaLovelace,
+        },
     }
 
     // ---------------------------------------------------------------------
@@ -581,6 +642,12 @@ pub mod pallet {
         /// Atomic rejection — pallet must surface the keeper bug rather
         /// than silently dedup.
         DuplicateIntentInBatch,
+        /// Task #212: `request_batch_vouchers` was called with an empty
+        /// entries vec. Atomically rejected.
+        EmptyVoucherBatch,
+        /// Task #212: a single batch contained the same `claim_id` twice.
+        /// Atomically rejected — pallet must surface the keeper bug.
+        DuplicateClaimInVoucherBatch,
     }
 
     // ---------------------------------------------------------------------
@@ -1371,6 +1438,190 @@ pub mod pallet {
             });
             Ok(())
         }
+
+        /// Task #212: mint N vouchers in ONE extrinsic under ONE M-of-N
+        /// signature verification.
+        ///
+        /// Pre-spec-207 each voucher mint required its own M-of-N round
+        /// (per PR #26's `request_voucher` RVCH gate). At N=256 vouchers
+        /// per epoch that's 256 separate sig-verifies. Post-spec-207 those
+        /// collapse to one RVBN sig-verify pass over the canonical batch
+        /// digest.
+        ///
+        /// Per-entry semantics (identical to single-call `request_voucher`):
+        /// - `intent_id` must be in `Attested` status; transitions to
+        ///   `Vouchered`.
+        /// - `claim_id` must not already have a Voucher in storage
+        ///   (`DuplicateVoucher`).
+        /// - `fairness_proof` must satisfy `validate_fairness_proof`
+        ///   (`InvalidFairnessProof` on violation).
+        /// - `voucher.batch_fairness_proof_digest` must equal the digest
+        ///   of `fairness_proof` (`FairnessDigestMismatch`).
+        /// - `voucher.amount_ada` adds to `outstanding_coverage_ada`; the
+        ///   total batch increment is checked-add-checked at the top so a
+        ///   craft-an-overflow attempt cannot leave state half-updated.
+        ///
+        /// After the per-entry checks pass, the canonical RVBN digest is
+        /// computed once over the WHOLE batch's `(claim_id, intent_id,
+        /// voucher_digest, bfpr_digest)` tuples and the M-of-N envelope is
+        /// verified ONCE against it.
+        ///
+        /// Backward compatibility: the existing 5-arg `request_voucher`
+        /// (call_index 2) is unchanged.
+        ///
+        /// Atomic semantics: any per-entry failure (intent missing/wrong
+        /// status, claim already vouchered, invalid fairness proof, digest
+        /// mismatch, duplicate claim_id within batch, coverage overflow)
+        /// reverts every storage mutation in this call.
+        ///
+        /// Cost model:
+        /// - Base ~50M ref_time (M-of-N sig-verify + duplicate-claim scan)
+        /// - Plus N * ~10M ref_time (per-entry voucher_digest +
+        ///   bfpr_digest computation + storage writes for `Claims`,
+        ///   `Vouchers`, `Intents`, `PendingBatches` removal,
+        ///   `outstanding_coverage_ada` increment).
+        /// - At N=256 ~2.6B ref_time. Versus 256 single `request_voucher`
+        ///   calls at ~100M each = 25.6B ref_time, the batch path is
+        ///   ~10x cheaper.
+        #[pallet::call_index(12)]
+        #[pallet::weight((
+            Weight::from_parts(
+                50_000_000u64.saturating_add((entries.len() as u64).saturating_mul(10_000_000)),
+                0,
+            ),
+            DispatchClass::Operational,
+            Pays::No,
+        ))]
+        pub fn request_batch_vouchers(
+            origin: OriginFor<T>,
+            entries: BoundedVec<RequestVoucherEntry, <T as Config>::MaxVoucherBatch>,
+            signatures: Vec<(CommitteePubkey, CommitteeSig)>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(
+                T::CommitteeMembership::is_member(&who),
+                Error::<T>::NotCommitteeMember
+            );
+            ensure!(!entries.is_empty(), Error::<T>::EmptyVoucherBatch);
+
+            // Pass 0: detect duplicate claim_ids inside the batch up-front.
+            // O(N^2) at N <= 256 ~32k comparisons, well below sig-verify cost.
+            let n = entries.len();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    ensure!(
+                        entries[i].claim_id != entries[j].claim_id,
+                        Error::<T>::DuplicateClaimInVoucherBatch,
+                    );
+                }
+            }
+
+            // Pass 1: per-entry digest computation + per-entry digest
+            // binding check. We do this BEFORE the M-of-N sig-verify so
+            // honest operators all see the same `(voucher_digest,
+            // bfpr_digest)` pair the pallet just validated — no operator-
+            // local state slips into the canonical pre-image (per
+            // `feedback_mofn_hash_determinism.md`).
+            let mut tuples: alloc::vec::Vec<(ClaimId, IntentId, [u8; 32], [u8; 32])> =
+                alloc::vec::Vec::with_capacity(n);
+            for entry in entries.iter() {
+                Self::validate_fairness_proof(&entry.fairness_proof)?;
+                let bfpr_digest =
+                    compute_fairness_proof_digest(&entry.fairness_proof);
+                ensure!(
+                    entry.voucher.batch_fairness_proof_digest == bfpr_digest,
+                    Error::<T>::FairnessDigestMismatch
+                );
+                let voucher_digest = compute_voucher_digest(&entry.voucher);
+                tuples.push((
+                    entry.claim_id,
+                    entry.intent_id,
+                    voucher_digest,
+                    bfpr_digest,
+                ));
+            }
+
+            // ONE sig-verify pass over the whole batch — the throughput
+            // unlock. Domain-tagged with RVBN so a per-entry RVCH
+            // signature can never replay onto the batch path.
+            let payload = request_batch_vouchers_payload(&tuples);
+            Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
+
+            // Atomic mutation phase. Each per-entry mutation mirrors the
+            // single-call `request_voucher` body (issue #5 ordering
+            // preserved: pre-check coverage overflow on the WHOLE batch
+            // sum before mutating, mirror that per-entry as we walk).
+            let (count, total_amount_unsettled) = frame_support::storage::with_storage_layer::<
+                (u32, u64),
+                sp_runtime::DispatchError,
+                _,
+            >(|| {
+                let mut running_total: u64 = 0;
+                for (idx, entry) in entries.iter().enumerate() {
+                    // Duplicate-voucher check (per single-call semantics).
+                    ensure!(
+                        !Vouchers::<T>::contains_key(entry.claim_id),
+                        Error::<T>::DuplicateVoucher
+                    );
+                    let mut intent = Intents::<T>::get(entry.intent_id)
+                        .ok_or(Error::<T>::IntentNotFound)?;
+                    ensure!(
+                        intent.status == IntentStatus::Attested,
+                        Error::<T>::IntentStatusMismatch
+                    );
+
+                    // Coverage overflow check — same checked-add as
+                    // request_voucher (issue #5).
+                    let pool = PoolUtilization::<T>::get();
+                    let new_outstanding = pool
+                        .outstanding_coverage_ada
+                        .checked_add(entry.voucher.amount_ada)
+                        .ok_or(Error::<T>::CoverageOverflow)?;
+
+                    let voucher_amount = entry.voucher.amount_ada;
+                    let claim = Claim {
+                        intent_id: entry.intent_id,
+                        policy_id: entry.voucher.policy_id,
+                        amount_ada: voucher_amount,
+                        issued_block: entry.voucher.issued_block,
+                        expiry_slot_cardano: entry.voucher.expiry_slot_cardano,
+                        settled: false,
+                        settled_direct: false,
+                        cardano_tx_hash: [0u8; 32],
+                    };
+                    Claims::<T>::insert(entry.claim_id, claim);
+                    Vouchers::<T>::insert(entry.claim_id, entry.voucher.clone());
+                    intent.status = IntentStatus::Vouchered;
+                    Intents::<T>::insert(entry.intent_id, intent);
+                    Self::remove_from_pending_batches(entry.intent_id);
+
+                    PoolUtilization::<T>::mutate(|u| {
+                        u.outstanding_coverage_ada = new_outstanding;
+                    });
+
+                    // Per-voucher event still emitted for indexer
+                    // back-compat — same shape as single-call. The
+                    // `voucher_digest` + `fairness_proof_digest` were
+                    // computed in pass 1 and stashed in `tuples`.
+                    let (_cid, _iid, vd, bd) = tuples[idx];
+                    Self::deposit_event(Event::VoucherIssued {
+                        claim_id: entry.claim_id,
+                        voucher_digest: vd,
+                        fairness_proof_digest: bd,
+                    });
+
+                    running_total = running_total.saturating_add(voucher_amount);
+                }
+                Ok((n as u32, running_total))
+            })?;
+
+            Self::deposit_event(Event::BatchVouchersIssued {
+                count,
+                batch_digest: payload,
+                total_amount_ada: total_amount_unsettled,
+            });
+            Ok(())
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -1641,5 +1892,5 @@ pub mod pallet {
 // Re-export for downstream / Aiken-parity SDK.
 pub use crate::types::{
     compute_committee_set_digest, compute_fairness_proof_digest, compute_intent_id,
-    compute_voucher_digest, domain_hash, SettleBatchEntry,
+    compute_voucher_digest, domain_hash, RequestVoucherEntry, SettleBatchEntry,
 };

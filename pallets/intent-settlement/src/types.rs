@@ -55,6 +55,11 @@ pub const MAX_SETTLE_BATCH: u32 = 256;
 /// the largest single-pallet TPS unlock in the v5.1 plan.
 pub const MAX_ATTEST_BATCH: u32 = 256;
 
+/// Task #212: max vouchers issued in a single `request_batch_vouchers`
+/// call. Each entry holds a `Voucher` + `BatchFairnessProof`, both of
+/// which cap their internal slices at MAX_BATCH=256.
+pub const MAX_VOUCHER_BATCH: u32 = 256;
+
 /// Max committee signatures per voucher (spec §3.1 uses `MaxCommittee=32`).
 pub const MAX_COMMITTEE: u32 = 32;
 
@@ -296,4 +301,23 @@ pub struct SettleBatchEntry {
     pub claim_id: ClaimId,
     pub cardano_tx_hash: [u8; 32],
     pub settled_direct: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Task #212: RequestVoucherEntry — single entry in a `request_batch_vouchers`
+// call. Same per-claim payload as the spec-206 single-call `request_voucher`
+// (PR #26), packaged so a committee can mint N vouchers under ONE M-of-N
+// signature bundle.
+// ---------------------------------------------------------------------------
+
+/// One voucher's worth of mint data inside a `request_batch_vouchers`
+/// batch. The pallet validates each entry's fairness-proof + digest binding
+/// + issues the voucher, all under ONE batch sig-verify pass — pre-spec-207
+/// each voucher mint required its own M-of-N round.
+#[derive(Clone, Encode, Decode, TypeInfo, MaxEncodedLen, RuntimeDebug, PartialEq, Eq)]
+pub struct RequestVoucherEntry {
+    pub claim_id: ClaimId,
+    pub intent_id: IntentId,
+    pub voucher: Voucher,
+    pub fairness_proof: BatchFairnessProof,
 }

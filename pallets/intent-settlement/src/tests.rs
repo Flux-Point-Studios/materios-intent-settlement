@@ -55,6 +55,8 @@ parameter_types! {
     pub const MaxSettleBatch: u32 = 256;
     /// Task #211: test-runtime bound on `attest_batch_intents` size.
     pub const MaxAttestBatch: u32 = 256;
+    /// Task #212: test-runtime bound on `request_batch_vouchers` size.
+    pub const MaxVoucherBatch: u32 = 256;
 }
 
 /// Issue #4 helper: our tests use `u64` AccountIds. Derive a synthetic
@@ -155,6 +157,7 @@ impl pallet_intent_settlement::pallet::Config for Test {
     type SigVerifier = MockSigVerifier;
     type MaxSettleBatch = MaxSettleBatch;
     type MaxAttestBatch = MaxAttestBatch;
+    type MaxVoucherBatch = MaxVoucherBatch;
 }
 
 pub const ALICE: u64 = 100;
@@ -2632,6 +2635,60 @@ fn abin_sigs_for(intent_ids: &[IntentId]) -> Vec<(CommitteePubkey, CommitteeSig)
     vec![mock_sig_for(1), mock_sig_for(2)]
 }
 
+/// Build N attested-but-not-vouchered intents owned by ALICE. Returns the
+/// list of intent_ids in submission order.
+fn submit_n_attested(n: u32) -> Vec<IntentId> {
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let kind = IntentKind::RequestPayout {
+            policy_id: H256::from([(0xB0u8.wrapping_add(i as u8)) as u8; 32]),
+            oracle_evidence: BoundedVec::try_from(vec![i as u8; 8]).unwrap(),
+        };
+        let nonce = pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE);
+        let blk: u32 = System::block_number().try_into().unwrap();
+        let iid = intent_id_for(ALICE, nonce, &kind, blk);
+        assert_ok!(IntentSettlement::submit_intent(
+            RuntimeOrigin::signed(ALICE),
+            kind,
+        ));
+        // Attest 2-of-3.
+        assert_ok!(IntentSettlement::attest_intent(
+            RuntimeOrigin::signed(1), iid, mock_pubkey_of(&1), [0u8; 64],
+        ));
+        assert_ok!(IntentSettlement::attest_intent(
+            RuntimeOrigin::signed(2), iid, mock_pubkey_of(&2), [0u8; 64],
+        ));
+        out.push(iid);
+    }
+    out
+}
+
+/// Build a batch of N RequestVoucherEntry given parallel intent_ids list.
+/// Each entry uses a distinct claim_id and a single-intent fairness proof.
+fn build_voucher_entries(intent_ids: &[IntentId], amount: u64) -> Vec<RequestVoucherEntry> {
+    intent_ids
+        .iter()
+        .enumerate()
+        .map(|(i, iid)| {
+            let claim_id = H256::from([(0xC0u8.wrapping_add(i as u8)) as u8; 32]);
+            let bfpr = good_fairness_proof(*iid, amount);
+            let voucher = good_voucher(claim_id, &bfpr, amount);
+            RequestVoucherEntry {
+                claim_id,
+                intent_id: *iid,
+                voucher,
+                fairness_proof: bfpr,
+            }
+        })
+        .collect()
+}
+
+/// Build the canonical RVBN sig bundle (mock verifier; payload-agnostic
+/// since `MockSigVerifier` only checks `sig[0] == pubkey[0]`).
+fn rvbn_sigs() -> Vec<(CommitteePubkey, CommitteeSig)> {
+    vec![mock_sig_for(1), mock_sig_for(2)]
+}
+
 #[test]
 fn attest_batch_happy_path_n_5_emits_per_intent_and_batch_events() {
     new_test_ext().execute_with(|| {
@@ -2999,4 +3056,340 @@ fn attest_batch_payload_parity_fixture_h() {
 
 const TASK_211_FIXTURE_H_HEX: &str =
     "13d4c95e1e392553a6b6462eb0f5a24244007ec2410242b6de8297097a17b613";
+
+// ---------------------------------------------------------------------------
+// Task #212 — request_batch_vouchers unit tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn request_batch_vouchers_happy_path_n_3() {
+    new_test_ext().execute_with(|| {
+        let amount = 1_000_000u64;
+        let iids = submit_n_attested(3);
+        let entries = build_voucher_entries(&iids, amount);
+        let bv: BoundedVec<RequestVoucherEntry, MaxVoucherBatch> =
+            BoundedVec::try_from(entries.clone()).unwrap();
+        let outstanding_before =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .outstanding_coverage_ada;
+
+        // Bump pool NAV so 3 voucher mints fit the cap.
+        pallet_intent_settlement::pallet::PoolUtilization::<Test>::mutate(|u| {
+            u.total_nav_ada = u.total_nav_ada.saturating_add(amount * 10);
+        });
+
+        assert_ok!(IntentSettlement::request_batch_vouchers(
+            RuntimeOrigin::signed(1),
+            bv,
+            rvbn_sigs(),
+        ));
+
+        // Each intent now Vouchered, claims + vouchers stored, outstanding
+        // coverage incremented by 3 * amount.
+        for entry in entries.iter() {
+            let intent =
+                pallet_intent_settlement::pallet::Intents::<Test>::get(entry.intent_id)
+                    .unwrap();
+            assert_eq!(intent.status, IntentStatus::Vouchered);
+            assert!(
+                pallet_intent_settlement::pallet::Vouchers::<Test>::contains_key(
+                    entry.claim_id,
+                ),
+            );
+        }
+        let outstanding_after =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .outstanding_coverage_ada;
+        assert_eq!(outstanding_after - outstanding_before, amount * 3);
+
+        // Per-voucher VoucherIssued events still emitted (bw compat).
+        let per_voucher: Vec<_> = System::events()
+            .into_iter()
+            .filter_map(|er| match er.event {
+                RuntimeEvent::IntentSettlement(
+                    pallet_intent_settlement::pallet::Event::VoucherIssued { .. }
+                ) => Some(()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(per_voucher.len(), 3);
+
+        // BatchVouchersIssued emitted exactly once.
+        let batch: Vec<_> = System::events()
+            .into_iter()
+            .filter_map(|er| match er.event {
+                RuntimeEvent::IntentSettlement(
+                    pallet_intent_settlement::pallet::Event::BatchVouchersIssued {
+                        count, batch_digest, total_amount_ada,
+                    }
+                ) => Some((count, batch_digest, total_amount_ada)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(batch.len(), 1);
+        let (count, _digest, total) = batch[0];
+        assert_eq!(count, 3);
+        assert_eq!(total, amount * 3);
+    });
+}
+
+#[test]
+fn request_batch_vouchers_atomic_revert_on_invalid_fairness_proof() {
+    new_test_ext().execute_with(|| {
+        let amount = 1_000_000u64;
+        let iids = submit_n_attested(3);
+        let mut entries = build_voucher_entries(&iids, amount);
+        // Corrupt the second entry's fairness proof: pro_rata_scale_bps > 10_000.
+        entries[1].fairness_proof.pro_rata_scale_bps = 99_999;
+        let bv: BoundedVec<RequestVoucherEntry, MaxVoucherBatch> =
+            BoundedVec::try_from(entries.clone()).unwrap();
+        pallet_intent_settlement::pallet::PoolUtilization::<Test>::mutate(|u| {
+            u.total_nav_ada = u.total_nav_ada.saturating_add(amount * 10);
+        });
+        let outstanding_before =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .outstanding_coverage_ada;
+        assert_noop!(
+            IntentSettlement::request_batch_vouchers(
+                RuntimeOrigin::signed(1),
+                bv,
+                rvbn_sigs(),
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::InvalidFairnessProof,
+        );
+        // No partial mutations.
+        for entry in entries.iter() {
+            let intent =
+                pallet_intent_settlement::pallet::Intents::<Test>::get(entry.intent_id)
+                    .unwrap();
+            assert_eq!(
+                intent.status,
+                IntentStatus::Attested,
+                "atomicity broken — partial transition on failed batch"
+            );
+            assert!(
+                !pallet_intent_settlement::pallet::Vouchers::<Test>::contains_key(
+                    entry.claim_id,
+                ),
+            );
+        }
+        let outstanding_after =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .outstanding_coverage_ada;
+        assert_eq!(outstanding_before, outstanding_after);
+    });
+}
+
+#[test]
+fn request_batch_vouchers_rejects_duplicate_claim_in_batch() {
+    new_test_ext().execute_with(|| {
+        let amount = 1_000u64;
+        let iids = submit_n_attested(3);
+        let mut entries = build_voucher_entries(&iids, amount);
+        // Force entries[2].claim_id to collide with entries[0].claim_id.
+        entries[2].claim_id = entries[0].claim_id;
+        let bv: BoundedVec<RequestVoucherEntry, MaxVoucherBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_noop!(
+            IntentSettlement::request_batch_vouchers(
+                RuntimeOrigin::signed(1),
+                bv,
+                rvbn_sigs(),
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::DuplicateClaimInVoucherBatch,
+        );
+    });
+}
+
+#[test]
+fn request_batch_vouchers_rejects_pending_intent_in_batch() {
+    // An intent that's still Pending (not yet Attested) can't be
+    // vouchered. The batch atomically rejects.
+    new_test_ext().execute_with(|| {
+        let amount = 1_000u64;
+        // Two attested + one only-submitted (Pending).
+        let iids_attested = submit_n_attested(2);
+        let pending_kind = IntentKind::RequestPayout {
+            policy_id: H256::from([0xCC; 32]),
+            oracle_evidence: BoundedVec::try_from(vec![0u8; 8]).unwrap(),
+        };
+        let pending_nonce = pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE);
+        let pending_blk: u32 = System::block_number().try_into().unwrap();
+        let pending_iid = intent_id_for(ALICE, pending_nonce, &pending_kind, pending_blk);
+        assert_ok!(IntentSettlement::submit_intent(
+            RuntimeOrigin::signed(ALICE), pending_kind,
+        ));
+        let mut all_iids = iids_attested.clone();
+        all_iids.push(pending_iid);
+        let entries = build_voucher_entries(&all_iids, amount);
+        let bv: BoundedVec<RequestVoucherEntry, MaxVoucherBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_noop!(
+            IntentSettlement::request_batch_vouchers(
+                RuntimeOrigin::signed(1),
+                bv,
+                rvbn_sigs(),
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::IntentStatusMismatch,
+        );
+    });
+}
+
+#[test]
+fn request_batch_vouchers_rejects_empty_batch() {
+    new_test_ext().execute_with(|| {
+        let bv: BoundedVec<RequestVoucherEntry, MaxVoucherBatch> = BoundedVec::default();
+        assert_noop!(
+            IntentSettlement::request_batch_vouchers(
+                RuntimeOrigin::signed(1),
+                bv,
+                rvbn_sigs(),
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::EmptyVoucherBatch,
+        );
+    });
+}
+
+#[test]
+fn request_batch_vouchers_rejects_non_committee_caller() {
+    new_test_ext().execute_with(|| {
+        let amount = 1_000u64;
+        let iids = submit_n_attested(1);
+        let entries = build_voucher_entries(&iids, amount);
+        let bv: BoundedVec<RequestVoucherEntry, MaxVoucherBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_noop!(
+            IntentSettlement::request_batch_vouchers(
+                RuntimeOrigin::signed(ALICE), // not committee
+                bv,
+                rvbn_sigs(),
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::NotCommitteeMember,
+        );
+    });
+}
+
+#[test]
+fn request_batch_vouchers_below_threshold_rejected() {
+    new_test_ext().execute_with(|| {
+        let amount = 1_000u64;
+        let iids = submit_n_attested(1);
+        let entries = build_voucher_entries(&iids, amount);
+        let bv: BoundedVec<RequestVoucherEntry, MaxVoucherBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_noop!(
+            IntentSettlement::request_batch_vouchers(
+                RuntimeOrigin::signed(1),
+                bv,
+                vec![mock_sig_for(1)], // only 1 sig, threshold is 2
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures,
+        );
+    });
+}
+
+#[test]
+fn request_batch_vouchers_signature_must_match_canonical_batch_digest() {
+    // The pallet computes voucher_digest + bfpr_digest deterministically
+    // before forming the canonical RVBN pre-image. A sig over the legacy
+    // single-call RVCH digest (per-entry) must NOT verify against the
+    // batch path's RVBN digest. Pure-function assertion.
+    let entries = vec![
+        (
+            H256::from([1u8; 32]),
+            H256::from([2u8; 32]),
+            [3u8; 32],
+            [4u8; 32],
+        ),
+    ];
+    let rvbn = pallet_intent_settlement::request_batch_vouchers_payload(&entries);
+    let rvch = pallet_intent_settlement::request_voucher_payload(
+        &entries[0].0, &entries[0].1, &entries[0].2, &entries[0].3,
+    );
+    assert_ne!(rvbn, rvch, "RVBN must domain-separate from RVCH");
+}
+
+#[test]
+fn request_batch_vouchers_backward_compat_legacy_single_call() {
+    // The legacy 5-arg `request_voucher` (call_index 2, with M-of-N from
+    // PR #26) is unchanged. Mint via the legacy path and confirm terminal
+    // state matches what the batch path produces.
+    new_test_ext().execute_with(|| {
+        let amount = 100_000u64;
+        let iid = submit_n_attested(1)[0];
+        let claim_id = H256::from([0xEE; 32]);
+        let bfpr = good_fairness_proof(iid, amount);
+        let voucher = good_voucher(claim_id, &bfpr, amount);
+        pallet_intent_settlement::pallet::PoolUtilization::<Test>::mutate(|u| {
+            u.total_nav_ada = u.total_nav_ada.saturating_add(amount * 10);
+        });
+        assert_ok!(IntentSettlement::request_voucher(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            iid,
+            voucher,
+            bfpr,
+            mock_voucher_sigs(),
+        ));
+        let intent =
+            pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
+        assert_eq!(intent.status, IntentStatus::Vouchered);
+    });
+}
+
+#[test]
+fn request_batch_vouchers_payload_deterministic_and_domain_separated() {
+    let entries = vec![
+        (
+            H256::from([1u8; 32]),
+            H256::from([2u8; 32]),
+            [3u8; 32],
+            [4u8; 32],
+        ),
+        (
+            H256::from([5u8; 32]),
+            H256::from([6u8; 32]),
+            [7u8; 32],
+            [8u8; 32],
+        ),
+    ];
+    let a = pallet_intent_settlement::request_batch_vouchers_payload(&entries);
+    let b = pallet_intent_settlement::request_batch_vouchers_payload(&entries);
+    assert_eq!(a, b, "deterministic");
+    let mut reversed = entries.clone();
+    reversed.reverse();
+    let c = pallet_intent_settlement::request_batch_vouchers_payload(&reversed);
+    assert_ne!(a, c, "order matters");
+}
+
+#[test]
+fn request_batch_vouchers_payload_parity_fixture_i() {
+    // Cross-layer parity: matches the SDK fixture in
+    // `sdk/src/multisig.test.ts` ("requestBatchVouchersPayload matches
+    // Rust fixture I"). Pinned input: 2 entries with structured tuple
+    // bytes.
+    let entries = vec![
+        (
+            H256::from([0x07u8; 32]),
+            H256::from([0x11u8; 32]),
+            [0x22u8; 32],
+            [0x33u8; 32],
+        ),
+        (
+            H256::from([0x44u8; 32]),
+            H256::from([0x55u8; 32]),
+            [0x66u8; 32],
+            [0x77u8; 32],
+        ),
+    ];
+    let digest = pallet_intent_settlement::request_batch_vouchers_payload(&entries);
+    assert_eq!(
+        hex_32(digest),
+        TASK_212_FIXTURE_I_HEX,
+        "RVBN fixture I digest drifted — regenerate SDK fixture too"
+    );
+}
+
+const TASK_212_FIXTURE_I_HEX: &str =
+    "f82d8e395614d905f0a12f78adf5e6562f6493247327bcbac42f5aeba3f34873";
 

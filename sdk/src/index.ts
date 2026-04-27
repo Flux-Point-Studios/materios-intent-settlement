@@ -91,12 +91,14 @@ export {
   creditDepositPayload,
   requestVoucherPayload,
   attestBatchIntentsPayload,
+  requestBatchVouchersPayload,
   signPayload,
   buildSigBundle,
   TAG_CRDP,
   TAG_STCL,
   TAG_RVCH,
   TAG_ABIN,
+  TAG_RVBN,
 } from "./multisig.js";
 
 export type {
