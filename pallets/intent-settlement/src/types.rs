@@ -41,6 +41,12 @@ pub const MAX_ORACLE_EVIDENCE: u32 = 512;
 /// Max claims per batch fairness proof / per voucher.
 pub const MAX_BATCH: u32 = 256;
 
+/// Task #177: max claims settled in a single `settle_batch_atomic` call.
+/// Sized so a full batch + a committee signature bundle fit comfortably
+/// within a single block's normal-class extrinsic budget. 256 entries =
+/// 256 * 65B = ~16KB raw payload, well below the 5MB proof_size limit.
+pub const MAX_SETTLE_BATCH: u32 = 256;
+
 /// Max committee signatures per voucher (spec §3.1 uses `MaxCommittee=32`).
 pub const MAX_COMMITTEE: u32 = 32;
 
@@ -265,4 +271,21 @@ pub fn compute_committee_set_digest(pubkeys: &[CommitteePubkey], threshold: u32)
     body.extend_from_slice(&pubkeys.to_vec().encode());
     body.extend_from_slice(&threshold.to_le_bytes());
     domain_hash(*TAG_CMTT, &body)
+}
+
+// ---------------------------------------------------------------------------
+// Task #177: SettleBatchEntry — single entry in a `settle_batch_atomic` call
+// ---------------------------------------------------------------------------
+
+/// One claim's worth of settlement data inside a `settle_batch_atomic` batch.
+///
+/// All three fields are chain-derivable — see `feedback_mofn_hash_determinism`
+/// for why no operator-local state appears here.
+#[derive(
+    Clone, Copy, Encode, Decode, TypeInfo, MaxEncodedLen, RuntimeDebug, PartialEq, Eq,
+)]
+pub struct SettleBatchEntry {
+    pub claim_id: ClaimId,
+    pub cardano_tx_hash: [u8; 32],
+    pub settled_direct: bool,
 }
