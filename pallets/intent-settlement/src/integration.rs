@@ -57,6 +57,8 @@ parameter_types! {
     pub const MaxAttestBatch: u32 = 256;
     /// Task #212: max request_batch_vouchers size in the integration runtime.
     pub const MaxVoucherBatch: u32 = 256;
+    /// Task #210: max submit_batch_intents size in the integration runtime.
+    pub const MaxSubmitBatch: u32 = 256;
 }
 
 /// Static committee: Alice/Bob/Charlie by sr25519 dev-key AccountId. Threshold 2.
@@ -137,6 +139,7 @@ impl pallet_intent_settlement::pallet::Config for Testnet {
     type MaxSettleBatch = MaxSettleBatch;
     type MaxAttestBatch = MaxAttestBatch;
     type MaxVoucherBatch = MaxVoucherBatch;
+    type MaxSubmitBatch = MaxSubmitBatch;
 }
 
 fn user_account() -> sp_runtime::AccountId32 {
@@ -808,6 +811,82 @@ fn task211_attest_batch_intents_real_runtime_happy_path() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Task #210 — submit_batch_intents real-runtime integration tests.
+//
+// Exercise the new batch path against the AccountId32 + sr25519 runtime so
+// the per-entry IntentId derivations, PendingBatches index updates, and
+// `BatchIntentsSubmitted` event all round-trip with real state. The unit
+// suite in `tests.rs` proves the algorithmic shape; here we prove the wire
+// shape end-to-end.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn task210_submit_batch_intents_atomic_revert_real_runtime() {
+    new_ext().execute_with(|| {
+        let user = user_account();
+        // Pre-credit user; pool cap = 7500 bps of NAV. The third entry
+        // exceeds the cap so the batch must atomically revert.
+        let alice = committee_accounts().0;
+        let cardano_tx = [0xAA; 32];
+        let mut target_bytes = [0u8; 32];
+        target_bytes.copy_from_slice(&user.encode()[..32]);
+        let crdp = credit_deposit_payload(&target_bytes, 100_000_000u64, &cardano_tx);
+        let crdp_sigs = vec![sign_with("//Alice", &crdp), sign_with("//Bob", &crdp)];
+        assert_ok!(IntentSettlement::credit_deposit(
+            RuntimeOrigin::signed(alice),
+            user.clone(),
+            100_000_000u64,
+            cardano_tx,
+            crdp_sigs
+        ));
+
+        let nonce_before = pallet_intent_settlement::pallet::Nonces::<Testnet>::get(
+            &user,
+        );
+        let credits_before = pallet_intent_settlement::pallet::Credits::<Testnet>::get(
+            &user,
+        );
+
+        // Build a batch where the THIRD entry exceeds the pool-utilization
+        // cap. NAV after the credit_deposit above = 100M (genesis) + 100M
+        // (deposit) = 200M; cap_bps = 7500 → max coverage 150M. The third
+        // entry's 200M premium trips the cap.
+        let mk_buy = |seed: u8, premium: u64| SubmitIntentEntry {
+            kind: IntentKind::BuyPolicy {
+                product_id: H256::from([seed; 32]),
+                strike: 1,
+                term_slots: 86_400,
+                premium_ada: premium,
+                beneficiary_cardano_addr: BoundedVec::try_from(vec![0xB1; 57]).unwrap(),
+            },
+        };
+        let entries = vec![
+            mk_buy(0xA1, 1_000_000),
+            mk_buy(0xA2, 1_000_000),
+            mk_buy(0xA3, 200_000_000), // exceeds cap
+            mk_buy(0xA4, 1_000_000),
+        ];
+        let bv: BoundedVec<SubmitIntentEntry, MaxSubmitBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        let res = IntentSettlement::submit_batch_intents(
+            RuntimeOrigin::signed(user.clone()),
+            bv,
+        );
+        assert!(res.is_err(), "expected atomic revert on cap-exceed");
+
+        // Every per-entry mutation rolled back: nonce, credits unchanged.
+        assert_eq!(
+            pallet_intent_settlement::pallet::Nonces::<Testnet>::get(&user),
+            nonce_before
+        );
+        assert_eq!(
+            pallet_intent_settlement::pallet::Credits::<Testnet>::get(&user),
+            credits_before
+        );
+    });
+}
+
 #[test]
 fn task211_attest_batch_intents_real_runtime_atomic_revert() {
     new_ext().execute_with(|| {
@@ -1005,5 +1084,55 @@ fn task212_request_batch_vouchers_real_runtime_happy_path() {
                 ),
             );
         }
+    });
+}
+
+#[test]
+fn task210_submit_batch_intents_happy_path_real_runtime() {
+    new_ext().execute_with(|| {
+        let user = user_account();
+        let alice = committee_accounts().0;
+
+        // Pre-credit user with enough headroom for 5 BuyPolicy premiums.
+        let cardano_tx = [0xCC; 32];
+        let crdp = credit_deposit_payload(
+            &{
+                let mut t = [0u8; 32];
+                t.copy_from_slice(&user.encode()[..32]);
+                t
+            },
+            10_000_000u64,
+            &cardano_tx,
+        );
+        let crdp_sigs = vec![sign_with("//Alice", &crdp), sign_with("//Bob", &crdp)];
+        assert_ok!(IntentSettlement::credit_deposit(
+            RuntimeOrigin::signed(alice),
+            user.clone(),
+            10_000_000u64,
+            cardano_tx,
+            crdp_sigs
+        ));
+
+        let entries: Vec<SubmitIntentEntry> = (0..5u8)
+            .map(|i| SubmitIntentEntry {
+                kind: IntentKind::BuyPolicy {
+                    product_id: H256::from([i; 32]),
+                    strike: 1,
+                    term_slots: 86_400,
+                    premium_ada: 1_000,
+                    beneficiary_cardano_addr: BoundedVec::try_from(vec![0xB1; 57]).unwrap(),
+                },
+            })
+            .collect();
+        let bv: BoundedVec<SubmitIntentEntry, MaxSubmitBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_ok!(IntentSettlement::submit_batch_intents(
+            RuntimeOrigin::signed(user.clone()),
+            bv,
+        ));
+        assert_eq!(
+            pallet_intent_settlement::pallet::Nonces::<Testnet>::get(&user),
+            5
+        );
     });
 }

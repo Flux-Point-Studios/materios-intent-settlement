@@ -57,6 +57,8 @@ parameter_types! {
     pub const MaxAttestBatch: u32 = 256;
     /// Task #212: test-runtime bound on `request_batch_vouchers` size.
     pub const MaxVoucherBatch: u32 = 256;
+    /// Task #210: test-runtime bound on `submit_batch_intents` size.
+    pub const MaxSubmitBatch: u32 = 256;
 }
 
 /// Issue #4 helper: our tests use `u64` AccountIds. Derive a synthetic
@@ -158,6 +160,7 @@ impl pallet_intent_settlement::pallet::Config for Test {
     type MaxSettleBatch = MaxSettleBatch;
     type MaxAttestBatch = MaxAttestBatch;
     type MaxVoucherBatch = MaxVoucherBatch;
+    type MaxSubmitBatch = MaxSubmitBatch;
 }
 
 pub const ALICE: u64 = 100;
@@ -2745,6 +2748,96 @@ fn attest_batch_happy_path_n_5_emits_per_intent_and_batch_events() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Task #210 — submit_batch_intents unit tests
+//
+// Mirrors the spec-206 PR #27 settle_batch_atomic test layout: happy path,
+// scaling to MAX_BATCH (=64 in unit suite, full 256 in bench), atomicity,
+// backward-compat with the per-call form, pre-image determinism + parity.
+// ---------------------------------------------------------------------------
+
+/// Build a `BuyPolicy` IntentKind with seed-based product/strike/premium.
+fn bp_entry(seed: u8, premium: u64) -> SubmitIntentEntry {
+    SubmitIntentEntry {
+        kind: bp(seed, 1, premium),
+    }
+}
+
+/// Build a `RequestPayout` IntentKind (no credit/pool side-effect).
+fn rp_entry(seed: u8) -> SubmitIntentEntry {
+    SubmitIntentEntry {
+        kind: IntentKind::RequestPayout {
+            policy_id: H256::from([seed; 32]),
+            oracle_evidence: BoundedVec::try_from(vec![seed; 8]).unwrap(),
+        },
+    }
+}
+
+#[test]
+fn submit_batch_intents_happy_path_n_10() {
+    new_test_ext().execute_with(|| {
+        let n = 10u32;
+        // Top up Alice with enough credit for 10 BuyPolicy premiums.
+        pallet_intent_settlement::pallet::Credits::<Test>::insert(
+            ALICE,
+            10_000_000u64,
+        );
+        // Bump pool NAV so the per-entry pool-utilization check passes.
+        pallet_intent_settlement::pallet::PoolUtilization::<Test>::mutate(|u| {
+            u.total_nav_ada = u.total_nav_ada.saturating_add(50_000_000);
+        });
+
+        let entries: Vec<SubmitIntentEntry> = (0..n)
+            .map(|i| bp_entry(0xC0u8.wrapping_add(i as u8), 1_000))
+            .collect();
+
+        let bv: BoundedVec<SubmitIntentEntry, MaxSubmitBatch> =
+            BoundedVec::try_from(entries.clone()).unwrap();
+
+        let credits_before =
+            pallet_intent_settlement::pallet::Credits::<Test>::get(ALICE);
+
+        assert_ok!(IntentSettlement::submit_batch_intents(
+            RuntimeOrigin::signed(ALICE),
+            bv,
+        ));
+
+        // All 10 intents stored — Pending. Verified via Nonces (now 10) +
+        // PendingBatches index size + BatchIntentsSubmitted event.
+        assert_eq!(
+            pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE),
+            n as u64
+        );
+        let pb = pallet_intent_settlement::pallet::PendingBatches::<Test>::get();
+        assert_eq!(pb.len() as u32, n);
+        // Total premium debited.
+        let credits_after =
+            pallet_intent_settlement::pallet::Credits::<Test>::get(ALICE);
+        assert_eq!(credits_before - credits_after, 10_000);
+
+        // BatchIntentsSubmitted emitted exactly once with count=10.
+        let events: Vec<_> = System::events()
+            .into_iter()
+            .filter_map(|er| match er.event {
+                RuntimeEvent::IntentSettlement(
+                    pallet_intent_settlement::pallet::Event::BatchIntentsSubmitted {
+                        submitter, count, batch_digest, total_premium_ada,
+                    }
+                ) => Some((submitter, count, batch_digest, total_premium_ada)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events.len(), 1);
+        let (submitter, count, digest, premium_total) = &events[0];
+        assert_eq!(*submitter, ALICE);
+        assert_eq!(*count, n);
+        assert_eq!(*premium_total, 10_000);
+        let expected =
+            pallet_intent_settlement::submit_batch_intents_payload(&entries);
+        assert_eq!(*digest, expected);
+    });
+}
+
 #[test]
 fn attest_batch_atomic_revert_on_unknown_intent() {
     new_test_ext().execute_with(|| {
@@ -2925,6 +3018,59 @@ fn attest_batch_rejects_non_committee_caller() {
 }
 
 #[test]
+fn submit_batch_intents_atomic_revert_on_one_bad_entry() {
+    // Inject an entry that exceeds the pool-utilization cap mid-batch. The
+    // whole batch must revert — no partial debit, no partial intents.
+    new_test_ext().execute_with(|| {
+        pallet_intent_settlement::pallet::Credits::<Test>::insert(
+            ALICE,
+            u64::MAX,
+        );
+        // cap_bps = 7500, total_nav_ada = 10_000_000 → max coverage 7.5M.
+        // Two 1M premiums fit; a 9M third entry blows the cap.
+        let entries: Vec<SubmitIntentEntry> = vec![
+            bp_entry(0xD0, 1_000_000),
+            bp_entry(0xD1, 1_000_000),
+            bp_entry(0xD2, 9_000_000), // cap-exceeder
+            bp_entry(0xD3, 1_000_000), // would have been fine but never runs
+        ];
+
+        let credits_before =
+            pallet_intent_settlement::pallet::Credits::<Test>::get(ALICE);
+        let nonce_before =
+            pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE);
+        let pb_len_before =
+            pallet_intent_settlement::pallet::PendingBatches::<Test>::get().len();
+
+        let bv: BoundedVec<SubmitIntentEntry, MaxSubmitBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_noop!(
+            IntentSettlement::submit_batch_intents(
+                RuntimeOrigin::signed(ALICE),
+                bv,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::PoolUtilizationExceeded,
+        );
+
+        // Atomicity: ZERO mutation. Credits, nonce, PendingBatches index
+        // all unchanged from before the failed call.
+        assert_eq!(
+            pallet_intent_settlement::pallet::Credits::<Test>::get(ALICE),
+            credits_before,
+            "atomicity broken — partial credit debit on failed batch"
+        );
+        assert_eq!(
+            pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE),
+            nonce_before
+        );
+        assert_eq!(
+            pallet_intent_settlement::pallet::PendingBatches::<Test>::get().len(),
+            pb_len_before
+        );
+    });
+}
+
+#[test]
 fn attest_batch_below_threshold_rejected() {
     new_test_ext().execute_with(|| {
         let iids = submit_n_pending(2);
@@ -2938,6 +3084,20 @@ fn attest_batch_below_threshold_rejected() {
                 vec![mock_sig_for(1)],
             ),
             pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures,
+        );
+    });
+}
+
+#[test]
+fn submit_batch_intents_rejects_empty_batch() {
+    new_test_ext().execute_with(|| {
+        let bv: BoundedVec<SubmitIntentEntry, MaxSubmitBatch> = BoundedVec::default();
+        assert_noop!(
+            IntentSettlement::submit_batch_intents(
+                RuntimeOrigin::signed(ALICE),
+                bv,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::EmptyIntentBatch,
         );
     });
 }
@@ -2990,6 +3150,74 @@ fn attest_batch_scales_within_pending_batches_bound() {
 }
 
 #[test]
+fn submit_batch_intents_request_payout_does_not_touch_credit() {
+    // RequestPayout entries don't debit credit — proven separately via
+    // `submit_intent_request_payout_doesnt_touch_credit`. Replicate that
+    // invariant for the batch path.
+    new_test_ext().execute_with(|| {
+        let entries: Vec<SubmitIntentEntry> = (0..5)
+            .map(|i| rp_entry(0xE0u8.wrapping_add(i)))
+            .collect();
+        let bv: BoundedVec<SubmitIntentEntry, MaxSubmitBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_ok!(IntentSettlement::submit_batch_intents(
+            RuntimeOrigin::signed(BOB),
+            bv,
+        ));
+        assert_eq!(
+            pallet_intent_settlement::pallet::Credits::<Test>::get(BOB),
+            0
+        );
+        assert_eq!(
+            pallet_intent_settlement::pallet::Nonces::<Test>::get(BOB),
+            5
+        );
+    });
+}
+
+#[test]
+fn submit_batch_intents_scales_within_pending_batches_bound() {
+    // The test runtime caps MaxPendingBatches at 16, so the largest unit-
+    // test batch we can land is 16 entries (every Pending intent occupies
+    // an index slot until it terminalizes). Production runtime sets
+    // MaxPendingBatches = 10_000 and the bench harness pushes the full
+    // MAX_SUBMIT_BATCH = 256 against that — see benchmarking.rs.
+    //
+    // 16 is sufficient to prove the linear loop is sound on a heterogeneous
+    // mix of BuyPolicy + RequestPayout entries.
+    new_test_ext().execute_with(|| {
+        const N: u32 = 16;
+        // Bump NAV so 16 BuyPolicy premiums fit.
+        pallet_intent_settlement::pallet::PoolUtilization::<Test>::mutate(|u| {
+            u.total_nav_ada = u.total_nav_ada.saturating_add(1_000_000_000);
+        });
+        pallet_intent_settlement::pallet::Credits::<Test>::insert(
+            ALICE,
+            1_000_000_000u64,
+        );
+
+        let mut entries: Vec<SubmitIntentEntry> = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            if i % 2 == 0 {
+                entries.push(bp_entry(i as u8, 1_000));
+            } else {
+                entries.push(rp_entry(i as u8));
+            }
+        }
+        let bv: BoundedVec<SubmitIntentEntry, MaxSubmitBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_ok!(IntentSettlement::submit_batch_intents(
+            RuntimeOrigin::signed(ALICE),
+            bv,
+        ));
+        assert_eq!(
+            pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE),
+            N as u64
+        );
+    });
+}
+
+#[test]
 fn attest_batch_backward_compat_legacy_attest_intent_still_works() {
     // The legacy attest_intent (call_index 1) is unchanged. Single-call
     // accumulation across 2 calls produces the same terminal Attested
@@ -3011,6 +3239,30 @@ fn attest_batch_backward_compat_legacy_attest_intent_still_works() {
         let intent =
             pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
         assert_eq!(intent.status, IntentStatus::Attested);
+    });
+}
+
+#[test]
+fn submit_batch_intents_backward_compat_single_call_still_works() {
+    // The existing submit_intent (call_index 0) is untouched. After the
+    // batch path lands, single-call submits MUST still work and produce the
+    // same terminal state. This is paired with the chain-side bw-compat
+    // smoke that runs against the same runtime live.
+    new_test_ext().execute_with(|| {
+        pallet_intent_settlement::pallet::Credits::<Test>::insert(
+            ALICE,
+            1_000_000u64,
+        );
+        let kind = bp(0x77, 1, 500_000);
+        let expected_id = intent_id_for(ALICE, 0, &kind, 1);
+        assert_ok!(IntentSettlement::submit_intent(
+            RuntimeOrigin::signed(ALICE),
+            kind,
+        ));
+        let intent =
+            pallet_intent_settlement::pallet::Intents::<Test>::get(expected_id)
+                .unwrap();
+        assert_eq!(intent.status, IntentStatus::Pending);
     });
 }
 
@@ -3392,4 +3644,642 @@ fn request_batch_vouchers_payload_parity_fixture_i() {
 
 const TASK_212_FIXTURE_I_HEX: &str =
     "f82d8e395614d905f0a12f78adf5e6562f6493247327bcbac42f5aeba3f34873";
+
+#[test]
+fn submit_batch_intents_payload_is_deterministic_and_domain_separated() {
+    let entries = vec![
+        bp_entry(0x01, 100),
+        rp_entry(0x02),
+        bp_entry(0x03, 200),
+    ];
+    let a = pallet_intent_settlement::submit_batch_intents_payload(&entries);
+    let b = pallet_intent_settlement::submit_batch_intents_payload(&entries);
+    assert_eq!(a, b, "deterministic");
+
+    // Reordering changes the digest.
+    let mut reversed = entries.clone();
+    reversed.reverse();
+    let c = pallet_intent_settlement::submit_batch_intents_payload(&reversed);
+    assert_ne!(a, c, "order matters");
+
+    // Domain-separated from STBA. Build a settle batch over 3 entries and
+    // compare digests — even with different inner types the tag must guard
+    // against any cross-replay.
+    let stba_entries = vec![
+        SettleBatchEntry {
+            claim_id: H256::from([0u8; 32]),
+            cardano_tx_hash: [0u8; 32],
+            settled_direct: false,
+        },
+    ];
+    let stba = pallet_intent_settlement::settle_batch_atomic_payload(&stba_entries);
+    assert_ne!(a, stba, "SBIN != STBA");
+}
+
+#[test]
+fn submit_batch_intents_payload_parity_fixture_g() {
+    // Cross-layer parity: matches the SDK fixture in
+    // `sdk/src/multisig.test.ts` ("submitBatchIntentsPayload matches Rust
+    // fixture G"). If either side's pre-image format drifts, both fail.
+    //
+    // Fixture inputs: 3 entries, deterministic — RequestPayout(seed=0x07),
+    // RequestPayout(seed=0x11), RequestPayout(seed=0x22) with 4-byte oracle
+    // evidence each.
+    let entries = vec![
+        SubmitIntentEntry {
+            kind: IntentKind::RequestPayout {
+                policy_id: H256::from([0x07u8; 32]),
+                oracle_evidence: BoundedVec::try_from(vec![0u8; 4]).unwrap(),
+            },
+        },
+        SubmitIntentEntry {
+            kind: IntentKind::RequestPayout {
+                policy_id: H256::from([0x11u8; 32]),
+                oracle_evidence: BoundedVec::try_from(vec![0u8; 4]).unwrap(),
+            },
+        },
+        SubmitIntentEntry {
+            kind: IntentKind::RequestPayout {
+                policy_id: H256::from([0x22u8; 32]),
+                oracle_evidence: BoundedVec::try_from(vec![0u8; 4]).unwrap(),
+            },
+        },
+    ];
+    let digest = pallet_intent_settlement::submit_batch_intents_payload(&entries);
+    assert_eq!(
+        hex_32(digest),
+        TASK_210_FIXTURE_G_HEX,
+        "SBIN fixture G digest drifted — regenerate SDK fixture too"
+    );
+}
+
+/// Fixture G expected hex for `submit_batch_intents_payload`. Generated by
+/// `sp_core::hashing::blake2_256(b"SBIN" || u32_le(N) || N×scale(IntentKind))`
+/// with the entries pinned in `submit_batch_intents_payload_parity_fixture_g`.
+/// The SDK test pins the same hex so any drift in either implementation
+/// fails loudly in CI.
+const TASK_210_FIXTURE_G_HEX: &str =
+    "a6644ed7143c4460cb5d0b1fab0fd1de6badee4e663b1a6d11d1c223404afb0a";
+
+// ---------------------------------------------------------------------------
+// Task #221 — pre-merge regression tests requested in PR #28 security review.
+//
+// 5 additional regression tests pin the atomic-revert + bound-checking
+// guarantees against the live extrinsic so any future refactor that drops
+// `checked_add`, `with_storage_layer`, the duplicate-IntentId precondition,
+// the `MaxPendingBatches` guard, or the `MaxSubmitBatch` boundary is
+// surfaced loudly in CI rather than silently in production.
+// ---------------------------------------------------------------------------
+
+/// Task #221 — Test 1: `SubmitBatchPremiumOverflow` regression.
+///
+/// Construct two `BuyPolicy` entries whose summed `premium_ada` exceeds
+/// `u64::MAX`. The pre-flight `checked_add` in `submit_batch_intents` MUST
+/// fire, the call MUST atomically revert (no nonce bump, no credit debit,
+/// no `PendingBatches` mutation), and the surfaced error MUST be the
+/// dedicated `SubmitBatchPremiumOverflow` variant — NOT a generic
+/// `InsufficientCredit` (which would mask the overflow as a balance issue
+/// and let an attacker probe credit state via crafted overflow attempts).
+///
+/// Buggy pre-image this test catches: replacing `checked_add` with
+/// `saturating_add` would silently pin the running total at `u64::MAX` and
+/// then trip `InsufficientCredit` on the per-entry path inside
+/// `do_submit_intent`. The test asserts the error variant explicitly so
+/// that swap regresses loudly.
+#[test]
+fn task221_submit_batch_premium_overflow_atomic_revert() {
+    new_test_ext().execute_with(|| {
+        // Top up Alice with a sane (non-overflow) credit balance so the
+        // overflow check is what fires, not InsufficientCredit. We also
+        // record the pre-call state so we can assert ZERO mutation.
+        pallet_intent_settlement::pallet::Credits::<Test>::insert(
+            ALICE,
+            1_000u64,
+        );
+        let credits_before =
+            pallet_intent_settlement::pallet::Credits::<Test>::get(ALICE);
+        let nonce_before =
+            pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE);
+        let pb_len_before =
+            pallet_intent_settlement::pallet::PendingBatches::<Test>::get().len();
+
+        // Two BuyPolicy entries each with premium=u64::MAX. Their sum
+        // overflows u64::MAX on the first checked_add.
+        let entries: Vec<SubmitIntentEntry> = vec![
+            bp_entry(0xE1, u64::MAX),
+            bp_entry(0xE2, u64::MAX),
+        ];
+        let bv: BoundedVec<SubmitIntentEntry, MaxSubmitBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_noop!(
+            IntentSettlement::submit_batch_intents(
+                RuntimeOrigin::signed(ALICE),
+                bv,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::SubmitBatchPremiumOverflow,
+        );
+
+        // Atomicity: nothing moved. assert_noop! already proves storage is
+        // pristine via the runtime test harness, but we double-check the
+        // user-visible state explicitly so a future refactor that switches
+        // away from with_storage_layer can't mask a partial-mutation bug.
+        assert_eq!(
+            pallet_intent_settlement::pallet::Credits::<Test>::get(ALICE),
+            credits_before,
+            "atomicity broken — credit moved on overflow path"
+        );
+        assert_eq!(
+            pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE),
+            nonce_before,
+            "atomicity broken — nonce bumped on overflow path"
+        );
+        assert_eq!(
+            pallet_intent_settlement::pallet::PendingBatches::<Test>::get().len(),
+            pb_len_before,
+            "atomicity broken — PendingBatches mutated on overflow path"
+        );
+    });
+}
+
+/// Task #221 — Test 2: mid-batch `InsufficientCredit` atomic revert.
+///
+/// Submit a 10-entry batch where Alice's credit balance is sized to cover
+/// EXACTLY the first 4 entries' premiums; entry 5 trips
+/// `InsufficientCredit` inside `do_submit_intent`. The atomic semantic
+/// MUST roll back the first 4 successful debits AND the 4 nonce bumps AND
+/// the 4 PendingBatches insertions — nothing committed. This is the
+/// most important atomicity assertion in the suite because it exercises
+/// the with_storage_layer rollback after a mid-loop failure (vs the
+/// `_one_bad_entry` test which trips at entry 3 of 4).
+///
+/// Buggy pre-image this test catches: stripping the
+/// `with_storage_layer` wrapper would let entries 1-4 commit before
+/// entry 5's failure rolls the call back. The test asserts the EXACT
+/// pre-call state on every observable, so any partial commit fails the
+/// suite.
+#[test]
+fn task221_submit_batch_insufficient_credit_mid_batch_atomic_revert() {
+    new_test_ext().execute_with(|| {
+        // Bump pool NAV so pool-utilization isn't the failure mode.
+        pallet_intent_settlement::pallet::PoolUtilization::<Test>::mutate(|u| {
+            u.total_nav_ada = u.total_nav_ada.saturating_add(50_000_000);
+        });
+        // Credit ALICE with EXACTLY 4 * 1_000 = 4_000 — entry 5's debit
+        // tries 5_000 against 0 remaining and fails.
+        pallet_intent_settlement::pallet::Credits::<Test>::insert(
+            ALICE,
+            4_000u64,
+        );
+
+        let credits_before =
+            pallet_intent_settlement::pallet::Credits::<Test>::get(ALICE);
+        let nonce_before =
+            pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE);
+        let pb_len_before =
+            pallet_intent_settlement::pallet::PendingBatches::<Test>::get().len();
+
+        let entries: Vec<SubmitIntentEntry> = (0..10u8)
+            .map(|i| bp_entry(0xF0u8.wrapping_add(i), 1_000))
+            .collect();
+        let bv: BoundedVec<SubmitIntentEntry, MaxSubmitBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_noop!(
+            IntentSettlement::submit_batch_intents(
+                RuntimeOrigin::signed(ALICE),
+                bv,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::InsufficientCredit,
+        );
+
+        // Atomicity: every observable identical to pre-call state.
+        assert_eq!(
+            pallet_intent_settlement::pallet::Credits::<Test>::get(ALICE),
+            credits_before,
+            "atomicity broken — partial credit debit committed"
+        );
+        assert_eq!(
+            pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE),
+            nonce_before,
+            "atomicity broken — nonce bumped for committed entries"
+        );
+        assert_eq!(
+            pallet_intent_settlement::pallet::PendingBatches::<Test>::get().len(),
+            pb_len_before,
+            "atomicity broken — partial PendingBatches insertions committed"
+        );
+        // No BatchIntentsSubmitted event leaked through the failed call.
+        let leaked_events: Vec<_> = System::events()
+            .into_iter()
+            .filter(|er| matches!(
+                er.event,
+                RuntimeEvent::IntentSettlement(
+                    pallet_intent_settlement::pallet::Event::BatchIntentsSubmitted { .. }
+                )
+            ))
+            .collect();
+        assert_eq!(
+            leaked_events.len(),
+            0,
+            "BatchIntentsSubmitted leaked through a failed batch — event ordering is wrong"
+        );
+    });
+}
+
+/// Task #221 — Test 3: `DuplicateIntent` collision against pre-existing
+/// chain state.
+///
+/// Submit a single intent (nonce 0) so it lives in `Intents` storage. Then
+/// fabricate a batch where one entry's derived `IntentId` collides with
+/// the pre-existing one. We achieve the collision by directly inserting a
+/// stub `Intent` entry at the SAME `IntentId` that the batch's k-th entry
+/// would derive — that's the real-world failure mode (same nonce window
+/// retried twice, or a deliberate adversarial nonce-reuse attempt). The
+/// whole batch MUST atomically revert.
+///
+/// Buggy pre-image this test catches: dropping `with_storage_layer` from
+/// the per-entry submit path means the entries BEFORE the collision
+/// commit. Also catches: stripping the
+/// `ensure!(!Intents::<T>::contains_key(intent_id), DuplicateIntent)`
+/// guard from `do_submit_intent` would let the new batch silently
+/// overwrite the pre-existing intent.
+#[test]
+fn task221_submit_batch_duplicate_intent_pre_existing_atomic_revert() {
+    new_test_ext().execute_with(|| {
+        // Top up + bump NAV so credit/cap aren't the issue.
+        pallet_intent_settlement::pallet::PoolUtilization::<Test>::mutate(|u| {
+            u.total_nav_ada = u.total_nav_ada.saturating_add(50_000_000);
+        });
+        pallet_intent_settlement::pallet::Credits::<Test>::insert(
+            ALICE,
+            10_000_000u64,
+        );
+
+        // Build the batch's 3rd entry kind UP FRONT, derive its IntentId
+        // (ALICE's nonce will be 2 by then, block 1), and pre-insert a
+        // stub Intent there.
+        let collision_kind = bp(0x77, 1, 1_000);
+        let collision_iid = intent_id_for(ALICE, 2, &collision_kind, 1);
+        // Insert a stub intent at the colliding ID. Use a RequestPayout
+        // kind so it's clearly distinct from the BuyPolicy that would
+        // overwrite.
+        pallet_intent_settlement::pallet::Intents::<Test>::insert(
+            collision_iid,
+            Intent {
+                submitter: ALICE,
+                nonce: 999,
+                kind: IntentKind::RequestPayout {
+                    policy_id: H256::from([0u8; 32]),
+                    oracle_evidence: BoundedVec::try_from(vec![0u8; 4]).unwrap(),
+                },
+                submitted_block: 1,
+                ttl_block: 1_000,
+                status: IntentStatus::Pending,
+            },
+        );
+
+        let credits_before =
+            pallet_intent_settlement::pallet::Credits::<Test>::get(ALICE);
+        let nonce_before =
+            pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE);
+
+        // 4-entry batch — entry 3 (0-indexed: index 2) collides.
+        let entries: Vec<SubmitIntentEntry> = vec![
+            bp_entry(0x70, 1_000),
+            bp_entry(0x71, 1_000),
+            SubmitIntentEntry { kind: collision_kind },
+            bp_entry(0x73, 1_000),
+        ];
+        let bv: BoundedVec<SubmitIntentEntry, MaxSubmitBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_noop!(
+            IntentSettlement::submit_batch_intents(
+                RuntimeOrigin::signed(ALICE),
+                bv,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::DuplicateIntent,
+        );
+
+        // Atomicity: pre-existing colliding intent is UNCHANGED (status
+        // still Pending with its stub fields), credits/nonce identical.
+        let preserved =
+            pallet_intent_settlement::pallet::Intents::<Test>::get(collision_iid)
+                .expect("pre-existing intent must still be in storage");
+        assert_eq!(preserved.nonce, 999, "stub intent overwritten — atomicity bug");
+        assert_eq!(
+            pallet_intent_settlement::pallet::Credits::<Test>::get(ALICE),
+            credits_before,
+            "atomicity broken — credit moved despite duplicate-intent revert"
+        );
+        assert_eq!(
+            pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE),
+            nonce_before,
+            "atomicity broken — nonce bumped despite duplicate-intent revert"
+        );
+    });
+}
+
+/// Task #221 — Test 4: `PendingBatchesFull` mid-batch atomic revert.
+///
+/// Fill `PendingBatches` to N-1 (=15 in test runtime where
+/// MaxPendingBatches=16), submit a 2-entry batch (the second push would
+/// take it to 17 > 16). The batch MUST atomically revert; entry 1 (which
+/// would have fit) MUST NOT be silently committed.
+///
+/// Buggy pre-image this test catches: pre-checking `pb.len() + N <=
+/// MaxPendingBatches` BEFORE the loop would be a correct design but
+/// stripping it in favour of relying on `try_push` per entry inside
+/// `with_storage_layer` is the *current* design. This test pins the
+/// per-entry-then-rollback path: if a future PR moves the check to
+/// pre-loop AND drops the rollback wrapper, we still want the failure
+/// mode to be atomic.
+#[test]
+fn task221_submit_batch_pending_full_mid_batch_atomic_revert() {
+    new_test_ext().execute_with(|| {
+        // Bump NAV so pool-cap isn't the failure mode.
+        pallet_intent_settlement::pallet::PoolUtilization::<Test>::mutate(|u| {
+            u.total_nav_ada = u.total_nav_ada.saturating_add(50_000_000);
+        });
+        pallet_intent_settlement::pallet::Credits::<Test>::insert(
+            ALICE,
+            10_000_000u64,
+        );
+        // Fill PendingBatches to N-1 = 15 by submitting 15 single intents.
+        for i in 0..15u8 {
+            assert_ok!(IntentSettlement::submit_intent(
+                RuntimeOrigin::signed(ALICE),
+                bp(0x80u8.wrapping_add(i), 1, 1_000),
+            ));
+        }
+        assert_eq!(
+            pallet_intent_settlement::pallet::PendingBatches::<Test>::get().len(),
+            15,
+            "test setup wrong — PendingBatches should be at 15 before the batch"
+        );
+
+        let credits_before =
+            pallet_intent_settlement::pallet::Credits::<Test>::get(ALICE);
+        let nonce_before =
+            pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE);
+
+        // 2-entry batch. First entry pushes PendingBatches from 15 -> 16
+        // (still fits). Second entry would push 16 -> 17 and trip
+        // PendingBatchesFull. The whole batch MUST revert — including the
+        // first entry's mutation.
+        let entries: Vec<SubmitIntentEntry> = vec![
+            bp_entry(0x90, 1_000),
+            bp_entry(0x91, 1_000),
+        ];
+        let bv: BoundedVec<SubmitIntentEntry, MaxSubmitBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_noop!(
+            IntentSettlement::submit_batch_intents(
+                RuntimeOrigin::signed(ALICE),
+                bv,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::PendingBatchesFull,
+        );
+
+        // Atomicity: still at 15, credits + nonce unchanged from pre-batch.
+        assert_eq!(
+            pallet_intent_settlement::pallet::PendingBatches::<Test>::get().len(),
+            15,
+            "atomicity broken — PendingBatches partially committed before fill error"
+        );
+        assert_eq!(
+            pallet_intent_settlement::pallet::Credits::<Test>::get(ALICE),
+            credits_before,
+            "atomicity broken — credit moved through a failed-fill batch"
+        );
+        assert_eq!(
+            pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE),
+            nonce_before,
+            "atomicity broken — nonce bumped for committed entry of failed batch"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Task #221 — Test 5: full N=256 (MaxSubmitBatch) boundary test.
+//
+// The main mock runtime caps MaxPendingBatches at 16; landing N=256 needs
+// a parallel mock runtime where MaxPendingBatches >= 256 (matching the
+// production materios-runtime config of MaxPendingBatches=10_000). We
+// encapsulate that runtime in its own sub-module so the rest of the suite
+// keeps the tight 16-bound (which exercises the per-block storage budget
+// realistically) while this single test pushes the call up to its
+// declared MaxSubmitBatch boundary.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod max_submit_batch_boundary {
+    use crate as pallet_intent_settlement;
+    use crate::pallet::{IsCommitteeMember, VerifyCommitteeSignature};
+    use crate::types::*;
+    use frame_support::{
+        assert_ok, construct_runtime, derive_impl, parameter_types,
+        BoundedVec,
+    };
+    use sp_core::H256;
+    use sp_runtime::{traits::IdentityLookup, BuildStorage};
+
+    type Block = frame_system::mocking::MockBlock<Test>;
+
+    construct_runtime! {
+        pub enum Test {
+            System: frame_system,
+            IntentSettlement: pallet_intent_settlement,
+        }
+    }
+
+    #[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
+    impl frame_system::Config for Test {
+        type Block = Block;
+        type AccountId = u64;
+        type Lookup = IdentityLookup<Self::AccountId>;
+    }
+
+    parameter_types! {
+        pub const MaxCommittee: u32 = 32;
+        pub const MaxExpirePerBlock: u32 = 1024;
+        pub const DefaultIntentTTL: u32 = 600;
+        pub const DefaultClaimTTL: u32 = 28_800;
+        /// Production-aligned: 10_000 to comfortably hold a full 256-entry
+        /// batch alongside any pre-existing pending intents.
+        pub const MaxPendingBatches: u32 = 10_000;
+        pub const DefaultMinSignerThreshold: u32 = 2;
+        pub const MaxSettleBatch: u32 = 256;
+        pub const MaxAttestBatch: u32 = 256;
+        /// The boundary we're probing — production MAX_SUBMIT_BATCH = 256.
+        pub const MaxSubmitBatch: u32 = 256;
+    }
+
+    fn pubkey_of(who: &u64) -> CommitteePubkey {
+        let mut out = [0u8; 32];
+        out[..8].copy_from_slice(&who.to_le_bytes());
+        out
+    }
+    fn account_of_pubkey(pubkey: &CommitteePubkey) -> Option<u64> {
+        let mut lo = [0u8; 8];
+        lo.copy_from_slice(&pubkey[..8]);
+        let candidate = u64::from_le_bytes(lo);
+        if matches!(candidate, 1 | 2 | 3) && pubkey[8..].iter().all(|b| *b == 0) {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+
+    pub struct MockCommittee;
+    impl IsCommitteeMember<u64> for MockCommittee {
+        fn is_member(who: &u64) -> bool {
+            matches!(*who, 1 | 2 | 3)
+        }
+        fn threshold() -> u32 { 2 }
+        fn member_count() -> u32 { 3 }
+        fn pubkey_of(who: &u64) -> CommitteePubkey { pubkey_of(who) }
+        fn account_of_pubkey(pubkey: &CommitteePubkey) -> Option<u64> {
+            account_of_pubkey(pubkey)
+        }
+    }
+
+    pub struct MockSigVerifier;
+    impl VerifyCommitteeSignature for MockSigVerifier {
+        fn verify(pubkey: &CommitteePubkey, sig: &CommitteeSig, _msg: &[u8]) -> bool {
+            sig[0] == pubkey[0]
+        }
+    }
+
+    impl pallet_intent_settlement::pallet::Config for Test {
+        type RuntimeEvent = RuntimeEvent;
+        type MaxCommittee = MaxCommittee;
+        type MaxExpirePerBlock = MaxExpirePerBlock;
+        type DefaultIntentTTL = DefaultIntentTTL;
+        type DefaultClaimTTL = DefaultClaimTTL;
+        type CommitteeMembership = MockCommittee;
+        type MaxPendingBatches = MaxPendingBatches;
+        type DefaultMinSignerThreshold = DefaultMinSignerThreshold;
+        type SigVerifier = MockSigVerifier;
+        type MaxSettleBatch = MaxSettleBatch;
+        type MaxAttestBatch = MaxAttestBatch;
+        type MaxSubmitBatch = MaxSubmitBatch;
+    }
+
+    const ALICE: u64 = 100;
+
+    fn new_test_ext() -> sp_io::TestExternalities {
+        let t = frame_system::GenesisConfig::<Test>::default()
+            .build_storage()
+            .unwrap();
+        let mut ext = sp_io::TestExternalities::new(t);
+        ext.execute_with(|| {
+            System::set_block_number(1);
+            pallet_intent_settlement::pallet::IntentTTL::<Test>::put(600u32);
+            pallet_intent_settlement::pallet::ClaimTTL::<Test>::put(28_800u32);
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::put(
+                PoolUtilizationParams {
+                    target_bps: 5_000,
+                    cap_bps: 7_500,
+                    // Bump NAV way up so 256 BuyPolicy premiums fit under cap.
+                    total_nav_ada: 1_000_000_000_000,
+                    outstanding_coverage_ada: 0,
+                },
+            );
+            pallet_intent_settlement::pallet::MinSignerThreshold::<Test>::put(2u32);
+        });
+        ext
+    }
+
+    /// Task #221 — Test 5: full N=256 boundary success.
+    ///
+    /// Submit a batch with EXACTLY MaxSubmitBatch=256 entries. The call MUST
+    /// succeed, all 256 intents MUST be in `Intents`, the `PendingBatches`
+    /// index MUST be at 256, the user's nonce MUST advance by 256, and the
+    /// `BatchIntentsSubmitted` event MUST report `count == 256`. This pins
+    /// the boundary against any future runtime config drift that would
+    /// silently let MaxSubmitBatch decrease.
+    ///
+    /// Weight assertion intentionally NOT made here — the bench-cli wiring
+    /// (#190) is still pending so per-block weight is approximated by the
+    /// inline `#[pallet::weight(...)]` expression in lib.rs. What we DO
+    /// pin here is that the call doesn't panic / overflow / saturate at
+    /// the boundary, and that the `count` field of the event matches the
+    /// declared MaxSubmitBatch constant — that's the load-bearing invariant
+    /// for indexer correlation.
+    ///
+    /// Buggy pre-image this test catches: lowering MaxSubmitBatch in the
+    /// runtime without touching MAX_SUBMIT_BATCH in types.rs would let the
+    /// SDK build a 256-entry payload that the runtime then rejects via
+    /// BoundedVec::try_from. This test would fail loudly at the BoundedVec
+    /// step.
+    #[test]
+    fn task221_submit_batch_n_256_boundary_success() {
+        use crate::types::SubmitIntentEntry;
+        use frame_support::assert_ok;
+        new_test_ext().execute_with(|| {
+            const N: u32 = 256;
+            // Top up Alice with enough credit for 256 BuyPolicy premiums of
+            // 1_000 each = 256_000 lovelace. Make it 10x for headroom.
+            pallet_intent_settlement::pallet::Credits::<Test>::insert(
+                ALICE,
+                2_560_000u64,
+            );
+
+            let entries: Vec<SubmitIntentEntry> = (0..N)
+                .map(|i| SubmitIntentEntry {
+                    kind: IntentKind::BuyPolicy {
+                        product_id: H256::from([(i & 0xFF) as u8; 32]),
+                        strike: 1,
+                        term_slots: 86_400,
+                        premium_ada: 1_000,
+                        beneficiary_cardano_addr:
+                            BoundedVec::try_from(vec![0xA1u8; 57]).unwrap(),
+                    },
+                })
+                .collect();
+            let bv: BoundedVec<SubmitIntentEntry, MaxSubmitBatch> =
+                BoundedVec::try_from(entries.clone())
+                    .expect("entries.len() must == MaxSubmitBatch == 256");
+            assert_eq!(
+                bv.len() as u32,
+                N,
+                "test setup wrong — BoundedVec is not at the N=256 boundary"
+            );
+
+            assert_ok!(IntentSettlement::submit_batch_intents(
+                RuntimeOrigin::signed(ALICE),
+                bv,
+            ));
+
+            // Post-conditions: 256 intents stored, nonce advanced by 256,
+            // PendingBatches index at 256, BatchIntentsSubmitted event with
+            // count == 256.
+            assert_eq!(
+                pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE),
+                N as u64,
+                "nonce did not advance to 256 after a successful 256-entry batch"
+            );
+            let pb = pallet_intent_settlement::pallet::PendingBatches::<Test>::get();
+            assert_eq!(
+                pb.len() as u32,
+                N,
+                "PendingBatches did not capture all 256 intents"
+            );
+            // Hunt the event with count == 256.
+            let count_event = System::events()
+                .into_iter()
+                .find_map(|er| match er.event {
+                    RuntimeEvent::IntentSettlement(
+                        pallet_intent_settlement::pallet::Event::BatchIntentsSubmitted {
+                            count, ..
+                        }
+                    ) => Some(count),
+                    _ => None,
+                });
+            assert_eq!(
+                count_event,
+                Some(N),
+                "BatchIntentsSubmitted event missing or wrong count at the N=256 boundary"
+            );
+        });
+    }
+}
 
