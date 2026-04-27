@@ -89,10 +89,12 @@ export {
 export {
   settleClaimPayload,
   creditDepositPayload,
+  requestVoucherPayload,
   signPayload,
   buildSigBundle,
   TAG_CRDP,
   TAG_STCL,
+  TAG_RVCH,
 } from "./multisig.js";
 
 export type {

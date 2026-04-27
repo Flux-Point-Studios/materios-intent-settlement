@@ -4,10 +4,12 @@ import { hexToU8a, u8aToHex } from "@polkadot/util";
 import {
   settleClaimPayload,
   creditDepositPayload,
+  requestVoucherPayload,
   signPayload,
   buildSigBundle,
   TAG_CRDP,
   TAG_STCL,
+  TAG_RVCH,
 } from "./multisig.js";
 import type { HexString } from "./types.js";
 
@@ -26,6 +28,10 @@ describe("multisig domain tags", () => {
 
   it("TAG_STCL is ASCII `STCL`", () => {
     expect(Array.from(TAG_STCL)).toEqual([0x53, 0x54, 0x43, 0x4c]);
+  });
+
+  it("TAG_RVCH is ASCII `RVCH` (Task #174)", () => {
+    expect(Array.from(TAG_RVCH)).toEqual([0x52, 0x56, 0x43, 0x48]);
   });
 });
 
@@ -350,5 +356,187 @@ describe("buildSigBundle", () => {
     for (const entry of bundle) {
       expect(sr25519Verify(payload, entry.sig, entry.pubkey)).toBe(true);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task #174 — `requestVoucherPayload` parity with Rust + helper sanity.
+//
+// The Rust counterpart is `request_voucher_payload(claim_id, intent_id,
+// voucher_digest, bfpr_digest)` in `pallets/intent-settlement/src/lib.rs`.
+// Fixture F's expected hex is pinned in
+// `pallets/intent-settlement/src/tests.rs::TASK_174_FIXTURE_F_HEX` and
+// matches the value asserted below — any drift fails loudly in both Rust
+// and TS CI.
+// ---------------------------------------------------------------------------
+
+describe("requestVoucherPayload — Rust parity (Task #174)", () => {
+  it("matches Rust fixture F (claim=0x07.., intent=0x11.., voucher_digest=0x22.., bfpr_digest=0x33..)", () => {
+    const digest = requestVoucherPayload({
+      claimId: ("0x" + "07".repeat(32)) as HexString,
+      intentId: ("0x" + "11".repeat(32)) as HexString,
+      voucherDigest: ("0x" + "22".repeat(32)) as HexString,
+      bfprDigest: ("0x" + "33".repeat(32)) as HexString,
+    });
+    expect(u8aToHex(digest)).toBe(
+      "0xb3a165c261b9a5b76ec4d22779d0ae2fb56ef0bd8f3da3fcb48a40f1e8b1fdd4",
+    );
+  });
+
+  it("returns a 32-byte digest", () => {
+    const digest = requestVoucherPayload({
+      claimId: ("0x" + "00".repeat(32)) as HexString,
+      intentId: ("0x" + "00".repeat(32)) as HexString,
+      voucherDigest: ("0x" + "00".repeat(32)) as HexString,
+      bfprDigest: ("0x" + "00".repeat(32)) as HexString,
+    });
+    expect(digest.length).toBe(32);
+  });
+
+  it("is sensitive to claimId", () => {
+    const a = requestVoucherPayload({
+      claimId: ("0x" + "07".repeat(32)) as HexString,
+      intentId: ("0x" + "11".repeat(32)) as HexString,
+      voucherDigest: ("0x" + "22".repeat(32)) as HexString,
+      bfprDigest: ("0x" + "33".repeat(32)) as HexString,
+    });
+    const b = requestVoucherPayload({
+      claimId: ("0x" + "08".repeat(32)) as HexString, // <- single byte flip
+      intentId: ("0x" + "11".repeat(32)) as HexString,
+      voucherDigest: ("0x" + "22".repeat(32)) as HexString,
+      bfprDigest: ("0x" + "33".repeat(32)) as HexString,
+    });
+    expect(u8aToHex(a)).not.toBe(u8aToHex(b));
+  });
+
+  it("voucherDigest and bfprDigest are NOT interchangeable", () => {
+    // Field-position attack: if the pre-image swallowed the two digests in
+    // a position-insensitive way (e.g. XOR), an attacker could pre-compute
+    // a sig for the swapped pair. The pallet's pre-image is positional, so
+    // the SDK helper must mirror that sensitivity.
+    const a = requestVoucherPayload({
+      claimId: ("0x" + "07".repeat(32)) as HexString,
+      intentId: ("0x" + "11".repeat(32)) as HexString,
+      voucherDigest: ("0x" + "22".repeat(32)) as HexString,
+      bfprDigest: ("0x" + "33".repeat(32)) as HexString,
+    });
+    const swapped = requestVoucherPayload({
+      claimId: ("0x" + "07".repeat(32)) as HexString,
+      intentId: ("0x" + "11".repeat(32)) as HexString,
+      voucherDigest: ("0x" + "33".repeat(32)) as HexString, // <- swapped
+      bfprDigest: ("0x" + "22".repeat(32)) as HexString, // <- swapped
+    });
+    expect(u8aToHex(a)).not.toBe(u8aToHex(swapped));
+  });
+
+  it("domain-separated from settleClaimPayload + creditDepositPayload", () => {
+    // Same 32B chunks fed to all three should still produce three distinct
+    // digests because of the 4-byte domain tag prefix.
+    const rv = requestVoucherPayload({
+      claimId: ("0x" + "42".repeat(32)) as HexString,
+      intentId: ("0x" + "42".repeat(32)) as HexString,
+      voucherDigest: ("0x" + "42".repeat(32)) as HexString,
+      bfprDigest: ("0x" + "42".repeat(32)) as HexString,
+    });
+    const sd = settleClaimPayload({
+      claimId: ("0x" + "42".repeat(32)) as HexString,
+      cardanoTxHash: ("0x" + "42".repeat(32)) as HexString,
+      settledDirect: false,
+    });
+    const cd = creditDepositPayload({
+      depositor: ("0x" + "42".repeat(32)) as HexString,
+      amountAda: 0n,
+      cardanoTxHash: ("0x" + "42".repeat(32)) as HexString,
+    });
+    expect(u8aToHex(rv)).not.toBe(u8aToHex(sd));
+    expect(u8aToHex(rv)).not.toBe(u8aToHex(cd));
+    expect(u8aToHex(sd)).not.toBe(u8aToHex(cd));
+  });
+
+  it("rejects non-32-byte inputs", () => {
+    const ok32 = ("0x" + "07".repeat(32)) as HexString;
+    const short16 = ("0x" + "07".repeat(16)) as HexString;
+    expect(() =>
+      requestVoucherPayload({
+        claimId: short16,
+        intentId: ok32,
+        voucherDigest: ok32,
+        bfprDigest: ok32,
+      }),
+    ).toThrow();
+    expect(() =>
+      requestVoucherPayload({
+        claimId: ok32,
+        intentId: short16,
+        voucherDigest: ok32,
+        bfprDigest: ok32,
+      }),
+    ).toThrow();
+    expect(() =>
+      requestVoucherPayload({
+        claimId: ok32,
+        intentId: ok32,
+        voucherDigest: short16,
+        bfprDigest: ok32,
+      }),
+    ).toThrow();
+    expect(() =>
+      requestVoucherPayload({
+        claimId: ok32,
+        intentId: ok32,
+        voucherDigest: ok32,
+        bfprDigest: short16,
+      }),
+    ).toThrow();
+  });
+});
+
+describe("requestVoucherPayload + buildSigBundle round-trip (Task #174)", () => {
+  it("each sig in the bundle verifies under the request_voucher digest", () => {
+    // T10 from the brief: the SDK helper that constructs the sig envelope
+    // must produce the SAME bytes as a hand-rolled blake2b + sr25519 — and
+    // those bytes must verify back. This is the regression test that
+    // catches helper drift before any chain submit is attempted.
+    const payload = requestVoucherPayload({
+      claimId: ("0x" + "aa".repeat(32)) as HexString,
+      intentId: ("0x" + "bb".repeat(32)) as HexString,
+      voucherDigest: ("0x" + "cc".repeat(32)) as HexString,
+      bfprDigest: ("0x" + "dd".repeat(32)) as HexString,
+    });
+    const bundle = buildSigBundle({
+      callerSeed: "//Alice",
+      cosignerSeeds: ["//Bob"],
+      payload,
+    });
+    expect(bundle.length).toBe(2);
+    for (const entry of bundle) {
+      expect(sr25519Verify(payload, entry.sig, entry.pubkey)).toBe(true);
+    }
+  });
+
+  it("hand-rolled signature over the same digest matches the helper bundle entry", () => {
+    // Belt-and-braces: signPayload (low-level) and buildSigBundle (caller-
+    // first ordering) must agree on what //Alice signs over the request_-
+    // voucher digest. If they ever drift, this fails before bundle hits
+    // the chain.
+    const payload = requestVoucherPayload({
+      claimId: ("0x" + "01".repeat(32)) as HexString,
+      intentId: ("0x" + "02".repeat(32)) as HexString,
+      voucherDigest: ("0x" + "03".repeat(32)) as HexString,
+      bfprDigest: ("0x" + "04".repeat(32)) as HexString,
+    });
+    const handRolled = signPayload("//Alice", payload);
+    const bundle = buildSigBundle({
+      callerSeed: "//Alice",
+      cosignerSeeds: [],
+      payload,
+    });
+    expect(u8aToHex(bundle[0]!.pubkey)).toBe(u8aToHex(handRolled.pubkey));
+    // sr25519 sigs are randomized per call (Schnorrkel adds nonce entropy)
+    // so we can't byte-compare. But both sigs must verify under the same
+    // pubkey + payload — that's the cross-check that protects against
+    // helper-vs-low-level drift.
+    expect(sr25519Verify(payload, bundle[0]!.sig, bundle[0]!.pubkey)).toBe(true);
+    expect(sr25519Verify(payload, handRolled.sig, handRolled.pubkey)).toBe(true);
   });
 });

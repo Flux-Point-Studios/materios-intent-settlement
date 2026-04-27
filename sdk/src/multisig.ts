@@ -31,13 +31,21 @@ import type { HexString } from "./types.js";
 import { u64LE } from "./hashing.js";
 
 // ---------------------------------------------------------------------------
-// Domain tags (Issue #7 — pallet lib.rs::TAG_CRDP, TAG_STCL).
+// Domain tags (Issue #7 — pallet lib.rs::TAG_CRDP, TAG_STCL; Task #174 —
+// TAG_RVCH).
 // ---------------------------------------------------------------------------
 
 /** `b"CRDP"` — 4-byte ASCII domain tag for credit_deposit payloads. */
 export const TAG_CRDP: Uint8Array = new Uint8Array([0x43, 0x52, 0x44, 0x50]);
 /** `b"STCL"` — 4-byte ASCII domain tag for settle_claim payloads. */
 export const TAG_STCL: Uint8Array = new Uint8Array([0x53, 0x54, 0x43, 0x4c]);
+/**
+ * `b"RVCH"` — 4-byte ASCII domain tag for `request_voucher` payloads
+ * (Task #174). Closes the M-of-N gap on the voucher-mint stage of the
+ * intent pipeline so a single committee member can no longer unilaterally
+ * mint a voucher with an attestation bundle they posted earlier.
+ */
+export const TAG_RVCH: Uint8Array = new Uint8Array([0x52, 0x56, 0x43, 0x48]);
 
 // ---------------------------------------------------------------------------
 // Payload builders (digests that committee members sign).
@@ -101,6 +109,68 @@ export function creditDepositPayload(args: {
   require32(cardanoTxHash, "cardanoTxHash");
   const body = u8aConcat(depositor, u64LE(args.amountAda), cardanoTxHash);
   const digest = blake2AsU8a(u8aConcat(TAG_CRDP, body), 256);
+  if (digest.length !== 32) {
+    throw new Error(`blake2_256 digest length != 32 (got ${digest.length})`);
+  }
+  return digest;
+}
+
+/**
+ * Byte-identical to Rust
+ * `request_voucher_payload(claim_id, intent_id, voucher_digest, bfpr_digest)`
+ * (Task #174).
+ *
+ * Pre-image:
+ * `b"RVCH" || claim_id (32B) || intent_id (32B) || voucher_digest (32B) || bfpr_digest (32B)`
+ *
+ * All four 32-byte inputs are deterministic functions of state visible to
+ * every honest operator at the moment of voucher mint:
+ *   - `claimId`, `intentId`: chosen by the keeper, included verbatim in the
+ *     dispatch.
+ *   - `voucherDigest`: `compute_voucher_digest(voucher)` per the SDK's
+ *     `hashing.ts::voucherDigest` helper. Pure function of the voucher
+ *     struct (which the pallet stores as-is).
+ *   - `bfprDigest`: `compute_fairness_proof_digest(proof)` per the SDK's
+ *     `hashing.ts::fairnessProofDigest`. The pallet rejects with
+ *     `FairnessDigestMismatch` unless `voucher.batch_fairness_proof_digest`
+ *     equals this value, so the two digests cross-check.
+ *
+ * Per `feedback_mofn_hash_determinism.md` no operator-local state (wall
+ * clock, Cardano epoch, locally-computed verification level) appears in
+ * the pre-image. Replay-across-epoch protection comes from the live
+ * committee-membership check in the pallet's `ensure_threshold_signatures`:
+ * rotated-out members can no longer pass `is_member`, so old bundles can't
+ * be replayed after a committee rotation.
+ *
+ * @returns 32-byte blake2_256 digest that committee members must sign.
+ */
+export function requestVoucherPayload(args: {
+  /** 32-byte claim id (H256), hex-prefixed. */
+  claimId: HexString;
+  /** 32-byte intent id (H256), hex-prefixed. */
+  intentId: HexString;
+  /**
+   * 32-byte digest of the `Voucher` struct. Compute via
+   * `hashing.ts::voucherDigest` and hand the same bytes here.
+   */
+  voucherDigest: HexString;
+  /**
+   * 32-byte digest of the `BatchFairnessProof` struct. Compute via
+   * `hashing.ts::fairnessProofDigest`. MUST equal
+   * `voucher.batch_fairness_proof_digest`.
+   */
+  bfprDigest: HexString;
+}): Uint8Array {
+  const claimId = hexToU8a(args.claimId);
+  const intentId = hexToU8a(args.intentId);
+  const voucherDigest = hexToU8a(args.voucherDigest);
+  const bfprDigest = hexToU8a(args.bfprDigest);
+  require32(claimId, "claimId");
+  require32(intentId, "intentId");
+  require32(voucherDigest, "voucherDigest");
+  require32(bfprDigest, "bfprDigest");
+  const body = u8aConcat(claimId, intentId, voucherDigest, bfprDigest);
+  const digest = blake2AsU8a(u8aConcat(TAG_RVCH, body), 256);
   if (digest.length !== 32) {
     throw new Error(`blake2_256 digest length != 32 (got ${digest.length})`);
   }
