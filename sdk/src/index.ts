@@ -90,11 +90,13 @@ export {
   settleClaimPayload,
   creditDepositPayload,
   requestVoucherPayload,
+  attestBatchIntentsPayload,
   signPayload,
   buildSigBundle,
   TAG_CRDP,
   TAG_STCL,
   TAG_RVCH,
+  TAG_ABIN,
 } from "./multisig.js";
 
 export type {

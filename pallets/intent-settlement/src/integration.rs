@@ -53,6 +53,8 @@ parameter_types! {
     pub const DefaultMinSignerThreshold: u32 = 2;
     /// Task #177: max settle_batch_atomic size in the integration runtime.
     pub const MaxSettleBatch: u32 = 256;
+    /// Task #211: max attest_batch_intents size in the integration runtime.
+    pub const MaxAttestBatch: u32 = 256;
 }
 
 /// Static committee: Alice/Bob/Charlie by sr25519 dev-key AccountId. Threshold 2.
@@ -131,6 +133,7 @@ impl pallet_intent_settlement::pallet::Config for Testnet {
     type DefaultMinSignerThreshold = DefaultMinSignerThreshold;
     type SigVerifier = IntegrationSigVerifier;
     type MaxSettleBatch = MaxSettleBatch;
+    type MaxAttestBatch = MaxAttestBatch;
 }
 
 fn user_account() -> sp_runtime::AccountId32 {
@@ -744,5 +747,111 @@ fn task174_request_voucher_t9_preimage_determinism_across_operators() {
             bfpr,
             vec![alice_sig, bob_sig]
         ));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Task #211 — attest_batch_intents real-runtime integration tests.
+//
+// Exercise the new batch path against the AccountId32 + sr25519 runtime so
+// the M-of-N sig-verify, per-intent state transitions, and event emissions
+// all round-trip with real state. The unit suite in `tests.rs` proves the
+// algorithmic shape; here we prove the wire shape end-to-end.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn task211_attest_batch_intents_real_runtime_happy_path() {
+    new_ext().execute_with(|| {
+        let user = user_account();
+        let alice = committee_accounts().0;
+
+        // Submit 3 RequestPayout intents to get fresh Pending entries.
+        let mut iids: Vec<IntentId> = Vec::new();
+        for i in 0..3u8 {
+            let kind = IntentKind::RequestPayout {
+                policy_id: H256::from([(0x40 + i) as u8; 32]),
+                oracle_evidence: BoundedVec::try_from(vec![i; 8]).unwrap(),
+            };
+            let mut sb = [0u8; 32];
+            sb.copy_from_slice(&user.encode()[..32]);
+            let nonce = pallet_intent_settlement::pallet::Nonces::<Testnet>::get(&user);
+            let blk: u32 = System::block_number() as u32;
+            let iid = compute_intent_id(&sb, nonce, &kind, blk);
+            assert_ok!(IntentSettlement::submit_intent(
+                RuntimeOrigin::signed(user.clone()),
+                kind,
+            ));
+            iids.push(iid);
+        }
+
+        // Build canonical ABIN pre-image and 2-of-3 sig bundle (real sr25519).
+        let payload = crate::attest_batch_intents_payload(&iids);
+        let alice_sig = sign_with("//Alice", &payload);
+        let bob_sig = sign_with("//Bob", &payload);
+
+        let bv: BoundedVec<IntentId, MaxAttestBatch> =
+            BoundedVec::try_from(iids.clone()).unwrap();
+        assert_ok!(IntentSettlement::attest_batch_intents(
+            RuntimeOrigin::signed(alice.clone()),
+            bv,
+            vec![alice_sig, bob_sig],
+        ));
+        for iid in iids.iter() {
+            let intent =
+                pallet_intent_settlement::pallet::Intents::<Testnet>::get(iid)
+                    .unwrap();
+            assert_eq!(intent.status, IntentStatus::Attested);
+        }
+    });
+}
+
+#[test]
+fn task211_attest_batch_intents_real_runtime_atomic_revert() {
+    new_ext().execute_with(|| {
+        let user = user_account();
+        let alice = committee_accounts().0;
+
+        // Submit 2 valid intents, then construct a 3-entry batch that
+        // includes a bogus intent_id at index 1 — atomic revert expected.
+        let mk_kind = |seed: u8| IntentKind::RequestPayout {
+            policy_id: H256::from([seed; 32]),
+            oracle_evidence: BoundedVec::try_from(vec![0u8; 4]).unwrap(),
+        };
+        let mut iids: Vec<IntentId> = Vec::new();
+        for seed in [0x91u8, 0x92u8] {
+            let kind = mk_kind(seed);
+            let mut sb = [0u8; 32];
+            sb.copy_from_slice(&user.encode()[..32]);
+            let nonce = pallet_intent_settlement::pallet::Nonces::<Testnet>::get(&user);
+            let blk: u32 = System::block_number() as u32;
+            iids.push(compute_intent_id(&sb, nonce, &kind, blk));
+            assert_ok!(IntentSettlement::submit_intent(
+                RuntimeOrigin::signed(user.clone()),
+                kind,
+            ));
+        }
+        let bogus = H256::from([0xFFu8; 32]);
+        let mut with_bogus = vec![iids[0], bogus, iids[1]];
+
+        let payload = crate::attest_batch_intents_payload(&with_bogus);
+        let alice_sig = sign_with("//Alice", &payload);
+        let bob_sig = sign_with("//Bob", &payload);
+        let bv: BoundedVec<IntentId, MaxAttestBatch> =
+            BoundedVec::try_from(with_bogus.clone()).unwrap();
+        let res = IntentSettlement::attest_batch_intents(
+            RuntimeOrigin::signed(alice.clone()),
+            bv,
+            vec![alice_sig, bob_sig],
+        );
+        assert!(res.is_err(), "expected atomic revert on bogus intent");
+        // Both real intents STILL Pending (atomic).
+        for iid in iids.iter() {
+            let intent =
+                pallet_intent_settlement::pallet::Intents::<Testnet>::get(iid)
+                    .unwrap();
+            assert_eq!(intent.status, IntentStatus::Pending);
+        }
+        // Silence unused lint on the with_bogus binding.
+        let _ = with_bogus.pop();
     });
 }
