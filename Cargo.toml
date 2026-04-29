@@ -48,7 +48,7 @@ idna = ">=0.5, <1"
 ahash = ">=0.8, <0.8.12"
 jobserver = ">=0.1, <0.1.33"
 tempfile = ">=3, <3.19"
-time = ">=0.3, <0.3.40"
+time = ">=0.3.47, <0.4"  # Fix RUSTSEC-2026-0009 (stack-exhaustion DoS), bumped from <0.3.40.
 
 [patch.crates-io]
 

@@ -21,8 +21,16 @@ Platform primitive for Cardano DeFi intent settlement. Built by Flux Point Studi
 
 ## Authoritative spec
 
-See `docs/spec-v1.md` (copy of `/home/deci/materios-intent-settlement-spec-v1.md`).
+See `docs/spec-v1.md`.
 
 ## License
 
-TBD (likely Apache-2.0 for pallets + MIT for SDK, matching orynq-sdk convention).
+Dual-licensed under Apache-2.0 (pallets) and MIT (SDK / keeper / e2e). See
+`LICENSE-APACHE` and `LICENSE-MIT`. Contributions are accepted under both
+licenses unless otherwise noted.
+
+## Security
+
+See [`SECURITY.md`](SECURITY.md) for vulnerability disclosure. This codebase
+has not yet been independently audited; see SECURITY.md "Status" for the
+internal-review status and known limitations.

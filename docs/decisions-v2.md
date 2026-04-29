@@ -3,7 +3,7 @@
 **Author:** Claude Code agent `materios-aegis-product-v2-openq-2026-04-20`
 **Date:** 2026-04-20
 **Status:** Draft — awaiting Nathaniel review on product-flag rows.
-**Predecessor:** `/home/deci/materios-intent-settlement-decisions.md` (v1, locked 2026-04-20 AM).
+**Predecessor:** `materios-intent-settlement-decisions-v1.md` (v1, locked 2026-04-20 AM, internal archive).
 **Repo target:** `Flux-Point-Studios/aegis-parametric-insurance-dev` (private). Platform primitive lives in `Flux-Point-Studios/materios-intent-settlement` per v1 locked monorepo-split decision.
 
 These six questions were surfaced in v1's "Questions NOT in the doc" section. They do **not** block Wave 2 (pallet + Aiken library); they **do** block Wave 3 (Aegis dApp build). Engineering-default rows can start immediately once Wave 2 ships; product-flagged rows need sign-off first.
