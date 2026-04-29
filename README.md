@@ -10,7 +10,7 @@ Platform primitive for Cardano DeFi intent settlement. Built by Flux Point Studi
 |---|---|---|
 | `pallets/intent-settlement/` | Team A | `pallet_intent_settlement` (Rust, Substrate FRAME) |
 | `pallets/committee-governance/` | Team A | `pallet_committee_governance` (Rust, Substrate FRAME) |
-| `keeper/` | Team C | Permissionless off-chain relayer (TypeScript, mesh-js) |
+| `keeper/` | Team C | Off-chain relayer — committee-operated in v0.1, splittable into permissionless request + committee attest in a future release (TypeScript, mesh-js) |
 | `sdk/` | Team C | Client SDK for dApps consuming the primitive |
 | `e2e/` | Team D | End-to-end integration + preprod demo |
 | `docs/` | all | Spec, decisions, interface contracts |
@@ -21,8 +21,16 @@ Platform primitive for Cardano DeFi intent settlement. Built by Flux Point Studi
 
 ## Authoritative spec
 
-See `docs/spec-v1.md` (copy of `/home/deci/materios-intent-settlement-spec-v1.md`).
+See `docs/spec-v1.md`.
 
 ## License
 
-TBD (likely Apache-2.0 for pallets + MIT for SDK, matching orynq-sdk convention).
+Dual-licensed under Apache-2.0 (pallets) and MIT (SDK / keeper / e2e). See
+`LICENSE-APACHE` and `LICENSE-MIT`. Contributions are accepted under both
+licenses unless otherwise noted.
+
+## Security
+
+See [`SECURITY.md`](SECURITY.md) for vulnerability disclosure. This codebase
+has not yet been independently audited; see SECURITY.md "Status" for the
+internal-review status and known limitations.

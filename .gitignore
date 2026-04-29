@@ -21,3 +21,4 @@ dist/
 coverage/
 daemon-state.json
 keeper-state.json
+.claude/

@@ -9,7 +9,7 @@
  *   - Keeper reads a fresh tip on every retry (getCurrentSlot spy)
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, beforeAll } from "vitest";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -23,17 +23,48 @@ import {
   SLOT_ERROR_SIGNATURES,
   SlotDriftExhaustedError,
 } from "../slot-retry.js";
+import { computePlutusV3ScriptHash } from "../script-hash.js";
 import type { ICardanoProvider, SubmittedTx } from "../cardano.js";
 import type {
   BatchPayload,
   Voucher,
   KeeperConfig,
   HexString,
+  CommitteePubkey,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
 import {
   intentId as computeIntentId,
   computeKeeperFeeLovelace,
+  voucherDigestWithAddress,
+  encodeType0AddressCbor,
+  splitType0AddressBytes,
+  signPayload,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
+import { hexToU8a, u8aToHex } from "@polkadot/util";
+import { cryptoWaitReady } from "@polkadot/util-crypto";
+
+beforeAll(async () => {
+  await cryptoWaitReady();
+});
+
+const PLACEHOLDER_CBOR = ("0x" + "00".repeat(4)) as HexString;
+const PLACEHOLDER_HASH = computePlutusV3ScriptHash(PLACEHOLDER_CBOR);
+
+// #73 + #79: pinned chain-identity tuple. The script-hash field must
+// equal blake2b_224(0x03||CBOR) for the keeper's #76a startup gate, so
+// pin to the actual hash of the placeholder CBOR.
+const TEST_CHAIN_ID: HexString = ("0x" + "73".repeat(32)) as HexString;
+const TEST_AEGIS_SCRIPT_HASH: HexString = PLACEHOLDER_HASH;
+const TEST_NETWORK_MAGIC = 1;
+const TEST_SETTLEMENT_VERSION = 1;
+
+/** 57-byte CIP-0019 type-0 address fixture used by the canonical-digest builder. */
+function type0Address(fill: number): Uint8Array {
+  const out = new Uint8Array(57);
+  out[0] = 0x01;
+  for (let i = 1; i < 57; i++) out[i] = fill & 0xff;
+  return out;
+}
 
 // ------------------------------ test fixtures -----------------------------
 
@@ -64,7 +95,7 @@ function makeVoucher(id: HexString): Voucher {
   return {
     claimId: id,
     policyId: ("0x" + "ee".repeat(32)) as HexString,
-    beneficiaryCardanoAddr: new TextEncoder().encode("addr_test1xyz"),
+    beneficiaryCardanoAddr: type0Address(0xab),
     amountAda: 10_000_000n,
     batchFairnessProofDigest: ("0x" + "dd".repeat(32)) as HexString,
     issuedBlock: 110,
@@ -76,6 +107,55 @@ function makeVoucher(id: HexString): Voucher {
       },
     ],
   };
+}
+
+/**
+ * Voucher with real sr25519 sigs from the supplied seed list. The
+ * returned `pubkeys` array can be plugged directly into a Keeper
+ * `fetchCommitteeSnapshot` so the Task #76b verify gate accepts it.
+ *
+ * Sigs are over the canonical voucherDigestWithAddress with the pinned
+ * test chain-identity tuple (#73 + #79).
+ */
+function makeSignedVoucher(
+  id: HexString,
+  seeds: string[] = ["//Alice"],
+): { voucher: Voucher; pubkeys: CommitteePubkey[] } {
+  const base: Voucher = {
+    claimId: id,
+    policyId: ("0x" + "ee".repeat(32)) as HexString,
+    beneficiaryCardanoAddr: type0Address(0xab),
+    amountAda: 10_000_000n,
+    batchFairnessProofDigest: ("0x" + "dd".repeat(32)) as HexString,
+    issuedBlock: 110,
+    expirySlotCardano: 5_000_000n,
+    committeeSigs: [],
+  };
+  const hashes = splitType0AddressBytes(base.beneficiaryCardanoAddr);
+  const cbor = encodeType0AddressCbor(hashes);
+  const digestHex = voucherDigestWithAddress({
+    claimId: base.claimId,
+    policyId: base.policyId,
+    beneficiaryAddressCbor: cbor,
+    amountAda: base.amountAda,
+    batchFairnessProofDigest: base.batchFairnessProofDigest,
+    issuedBlock: base.issuedBlock,
+    expirySlotCardano: base.expirySlotCardano,
+    materiosChainId: TEST_CHAIN_ID,
+    networkMagic: TEST_NETWORK_MAGIC,
+    aegisPolicyV1ScriptHash: TEST_AEGIS_SCRIPT_HASH,
+    settlementVersion: TEST_SETTLEMENT_VERSION,
+  });
+  const digest = hexToU8a(digestHex);
+  const sigs: Array<{ pubkey: HexString; sig: HexString }> = [];
+  const pubkeys: CommitteePubkey[] = [];
+  for (const seed of seeds) {
+    const { pubkey, sig } = signPayload(seed, digest);
+    const pkHex = u8aToHex(pubkey) as HexString;
+    sigs.push({ pubkey: pkHex, sig: u8aToHex(sig) as HexString });
+    pubkeys.push(pkHex as CommitteePubkey);
+  }
+  return { voucher: { ...base, committeeSigs: sigs }, pubkeys };
 }
 
 function makeBfpr() {
@@ -131,6 +211,15 @@ const baseConfig: KeeperConfig = {
   pollIntervalMs: 10,
   maxBatchSize: 32,
   dryRun: false,
+  // Task #76a: keeper constructor refuses to start without a script-hash
+  // binding for POLICY_SCRIPT_CBOR.
+  aegisPolicyV1ScriptHash: PLACEHOLDER_HASH,
+  // #73 chain-identity tuple bound into the voucher digest the keeper
+  // re-verifies before paying Cardano fees. `makeSignedVoucher` signs
+  // digests bound to these constants.
+  materiosChainId: TEST_CHAIN_ID,
+  networkMagic: TEST_NETWORK_MAGIC,
+  settlementVersion: TEST_SETTLEMENT_VERSION,
 };
 
 // --------------------------- issue #16: runtime guard ----------------------
@@ -182,7 +271,9 @@ describe("issue #17: keeper slot-drift retry", () => {
 
   it("test_keeper_retries_on_slot_mismatch: 2 slot-mismatch failures → 3rd succeeds", async () => {
     const batch = makeBatch(1);
-    const voucher = makeVoucher(batch.intentId as unknown as HexString);
+    const { voucher, pubkeys } = makeSignedVoucher(
+      batch.intentId as unknown as HexString,
+    );
     const rpc = fakeRpc([batch], voucher);
 
     // submit fails with slot-mismatch twice, succeeds third time.
@@ -208,8 +299,9 @@ describe("issue #17: keeper slot-drift retry", () => {
       cardano,
       state,
       keeperCardanoAddr: "addr_test1keeper",
-      policyScriptCbor: ("0x" + "00".repeat(4)) as HexString,
+      policyScriptCbor: PLACEHOLDER_CBOR,
       fetchFairnessProof: async () => makeBfpr(),
+      fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
       logger: () => {},
     });
 
@@ -226,7 +318,9 @@ describe("issue #17: keeper slot-drift retry", () => {
 
   it("test_keeper_does_not_retry_on_non_slot_error: insufficient funds → 1 attempt, fails", async () => {
     const batch = makeBatch(2);
-    const voucher = makeVoucher(batch.intentId as unknown as HexString);
+    const { voucher, pubkeys } = makeSignedVoucher(
+      batch.intentId as unknown as HexString,
+    );
     const rpc = fakeRpc([batch], voucher);
 
     const submitTx = vi.fn().mockRejectedValue(new Error("InsufficientFundsUTxO: not enough ada"));
@@ -238,8 +332,9 @@ describe("issue #17: keeper slot-drift retry", () => {
       cardano,
       state,
       keeperCardanoAddr: "addr_test1keeper",
-      policyScriptCbor: ("0x" + "00".repeat(4)) as HexString,
+      policyScriptCbor: PLACEHOLDER_CBOR,
       fetchFairnessProof: async () => makeBfpr(),
+      fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
       logger: () => {},
     });
 
@@ -254,7 +349,9 @@ describe("issue #17: keeper slot-drift retry", () => {
 
   it("test_keeper_throws_after_max_retries: 3 slot-mismatch failures → marked failed", async () => {
     const batch = makeBatch(3);
-    const voucher = makeVoucher(batch.intentId as unknown as HexString);
+    const { voucher, pubkeys } = makeSignedVoucher(
+      batch.intentId as unknown as HexString,
+    );
     const rpc = fakeRpc([batch], voucher);
 
     const submitTx = vi
@@ -268,8 +365,9 @@ describe("issue #17: keeper slot-drift retry", () => {
       cardano,
       state,
       keeperCardanoAddr: "addr_test1keeper",
-      policyScriptCbor: ("0x" + "00".repeat(4)) as HexString,
+      policyScriptCbor: PLACEHOLDER_CBOR,
       fetchFairnessProof: async () => makeBfpr(),
+      fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
       logger: () => {},
     });
 
@@ -288,7 +386,9 @@ describe("issue #17: keeper slot-drift retry", () => {
 
   it("test_keeper_reads_fresh_tip_on_each_retry: getCurrentSlot called per attempt", async () => {
     const batch = makeBatch(4);
-    const voucher = makeVoucher(batch.intentId as unknown as HexString);
+    const { voucher, pubkeys } = makeSignedVoucher(
+      batch.intentId as unknown as HexString,
+    );
     const rpc = fakeRpc([batch], voucher);
 
     const submitTx = vi
@@ -310,8 +410,9 @@ describe("issue #17: keeper slot-drift retry", () => {
       cardano,
       state,
       keeperCardanoAddr: "addr_test1keeper",
-      policyScriptCbor: ("0x" + "00".repeat(4)) as HexString,
+      policyScriptCbor: PLACEHOLDER_CBOR,
       fetchFairnessProof: async () => makeBfpr(),
+      fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
       logger: () => {},
     });
 

@@ -94,18 +94,35 @@ pub const TAG_RVBN: &[u8; 4] = b"RVBN";
 /// upcoming ABIN/RVBN tags so a SBIN digest can never be replayed onto a
 /// committee-signed pre-image.
 pub const TAG_SBIN: &[u8; 4] = b"SBIN";
+/// Task #74 (sec-review): domain tag for the per-call `attest_intent`
+/// signature pre-image. Pre-fix `attest_intent` accepted a `(pubkey, sig)`
+/// bundle and crossed threshold based on length alone — Substrate trusted
+/// Cardano to verify the sig later. That meant the chain transitioned
+/// intent state on UNVERIFIED bundles. This domain tag binds the signed
+/// payload to the specific `intent_id` that's being attested so the runtime
+/// can sr25519-verify each signature locally before incrementing the
+/// pending bundle. Domain-separated from ABIN (the batch path) so a per-
+/// call signature can never replay onto a batch payload.
+pub const TAG_INTA: &[u8; 4] = b"INTA";
 
 /// Canonical digest signed by committee members when authorizing a
 /// `credit_deposit(target, amount, cardano_tx_hash)` call (Issue #7).
 ///
-/// `blake2_256(b"CRDP" || target_bytes (32B) || amount_ada (LE u64)
+/// Pre-image now begins with a 32-byte Materios chain-identity prefix (#73)
+/// so a bundle signed on preprod is structurally invalid on mainnet/testnet
+/// or after a chain reset:
+///
+/// `blake2_256(b"CRDP" || materios_chain_id (32B)
+///             || target_bytes (32B) || amount_ada (LE u64)
 ///             || cardano_tx_hash (32B))`
 pub fn credit_deposit_payload(
+    materios_chain_id: &[u8; 32],
     target_bytes: &[u8; 32],
     amount_ada: u64,
     cardano_tx_hash: &[u8; 32],
 ) -> [u8; 32] {
-    let mut body = alloc::vec::Vec::with_capacity(32 + 8 + 32);
+    let mut body = alloc::vec::Vec::with_capacity(32 + 32 + 8 + 32);
+    body.extend_from_slice(materios_chain_id);
     body.extend_from_slice(target_bytes);
     body.extend_from_slice(&amount_ada.to_le_bytes());
     body.extend_from_slice(cardano_tx_hash);
@@ -115,14 +132,19 @@ pub fn credit_deposit_payload(
 /// Canonical digest signed by committee members when authorizing a
 /// `settle_claim(claim_id, cardano_tx_hash, settled_direct)` call (Issue #7).
 ///
-/// `blake2_256(b"STCL" || claim_id (32B) || cardano_tx_hash (32B)
+/// Pre-image now begins with a 32-byte Materios chain-identity prefix (#73).
+///
+/// `blake2_256(b"STCL" || materios_chain_id (32B)
+///             || claim_id (32B) || cardano_tx_hash (32B)
 ///             || settled_direct (1B))`
 pub fn settle_claim_payload(
+    materios_chain_id: &[u8; 32],
     claim_id: &IntentId,
     cardano_tx_hash: &[u8; 32],
     settled_direct: bool,
 ) -> [u8; 32] {
-    let mut body = alloc::vec::Vec::with_capacity(32 + 32 + 1);
+    let mut body = alloc::vec::Vec::with_capacity(32 + 32 + 32 + 1);
+    body.extend_from_slice(materios_chain_id);
     body.extend_from_slice(claim_id.as_bytes());
     body.extend_from_slice(cardano_tx_hash);
     body.push(if settled_direct { 1u8 } else { 0u8 });
@@ -132,19 +154,16 @@ pub fn settle_claim_payload(
 /// Task #174: canonical digest signed by committee members when authorizing
 /// a `request_voucher(claim_id, intent_id, voucher, fairness_proof)` call.
 ///
-/// `blake2_256(b"RVCH" || claim_id (32B) || intent_id (32B)
+/// Pre-image now begins with a 32-byte Materios chain-identity prefix (#73).
+///
+/// `blake2_256(b"RVCH" || materios_chain_id (32B)
+///             || claim_id (32B) || intent_id (32B)
 ///             || voucher_digest (32B) || bfpr_digest (32B))`
 ///
-/// All four 32-byte inputs are deterministic functions of state visible to
-/// every honest operator at the moment of voucher mint:
-///   - `claim_id`, `intent_id`: chosen by the keeper, included verbatim in
-///     the dispatch.
-///   - `voucher_digest`: `compute_voucher_digest(&voucher)`. Pure function of
-///     the voucher struct (which the pallet stores as-is).
-///   - `bfpr_digest`: `compute_fairness_proof_digest(&fairness_proof)`. Pure
-///     function of the fairness-proof struct, and the pallet rejects with
-///     `FairnessDigestMismatch` unless `voucher.batch_fairness_proof_digest`
-///     matches it — so the two digests cross-check.
+/// `voucher_digest` here is the chain-identity-bound CBOR form computed by
+/// [`crate::voucher_canonicalize::compute_voucher_digest_with_address`]
+/// (legacy SCALE form deleted, #79). All inputs are deterministic functions
+/// of state visible to every honest operator at the moment of voucher mint.
 ///
 /// Per `feedback_mofn_hash_determinism.md` no operator-local state (wall
 /// clock, Cardano epoch, locally-computed verification level) appears in
@@ -153,12 +172,14 @@ pub fn settle_claim_payload(
 /// members can no longer pass `is_member`, so old bundles can't be replayed
 /// after a committee rotation.
 pub fn request_voucher_payload(
+    materios_chain_id: &[u8; 32],
     claim_id: &ClaimId,
     intent_id: &IntentId,
     voucher_digest: &[u8; 32],
     bfpr_digest: &[u8; 32],
 ) -> [u8; 32] {
-    let mut body = alloc::vec::Vec::with_capacity(32 + 32 + 32 + 32);
+    let mut body = alloc::vec::Vec::with_capacity(32 + 32 + 32 + 32 + 32);
+    body.extend_from_slice(materios_chain_id);
     body.extend_from_slice(claim_id.as_bytes());
     body.extend_from_slice(intent_id.as_bytes());
     body.extend_from_slice(voucher_digest);
@@ -169,8 +190,9 @@ pub fn request_voucher_payload(
 /// Canonical digest signed by committee members when authorizing a
 /// `settle_batch_atomic(entries)` call (Task #177).
 ///
-/// Pre-image:
-/// `blake2_256(b"STBA"
+/// Pre-image now begins with a 32-byte Materios chain-identity prefix (#73).
+///
+/// `blake2_256(b"STBA" || materios_chain_id (32B)
 ///   || u32_le(entries.len())
 ///   || for each entry e: e.claim_id (32B) || e.cardano_tx_hash (32B)
 ///                        || (e.settled_direct as u8))`
@@ -184,10 +206,13 @@ pub fn request_voucher_payload(
 /// (claim_ids, cardano_tx_hashes, settled_direct flags) appear in the
 /// pre-image — no operator-local state.
 pub fn settle_batch_atomic_payload(
+    materios_chain_id: &[u8; 32],
     entries: &[SettleBatchEntry],
 ) -> [u8; 32] {
     let n = entries.len() as u32;
-    let mut body = alloc::vec::Vec::with_capacity(4 + entries.len() * (32 + 32 + 1));
+    let mut body =
+        alloc::vec::Vec::with_capacity(32 + 4 + entries.len() * (32 + 32 + 1));
+    body.extend_from_slice(materios_chain_id);
     body.extend_from_slice(&n.to_le_bytes());
     for e in entries.iter() {
         body.extend_from_slice(e.claim_id.as_bytes());
@@ -198,9 +223,11 @@ pub fn settle_batch_atomic_payload(
 }
 
 /// Task #211: canonical digest signed by committee members when authorizing
-/// an `attest_batch_intents(intent_ids)` call. Pre-image:
+/// an `attest_batch_intents(intent_ids)` call. Pre-image now begins with a
+/// 32-byte Materios chain-identity prefix (#73).
 ///
-/// `blake2_256(b"ABIN" || u32_le(N) || N×intent_id (32B each))`
+/// `blake2_256(b"ABIN" || materios_chain_id (32B)
+///             || u32_le(N) || N×intent_id (32B each))`
 ///
 /// Flat byte stream — NOT SCALE — so the digest is independent of the
 /// substrate-interface BoundedVec wrapping quirk
@@ -213,10 +240,12 @@ pub fn settle_batch_atomic_payload(
 /// announced intent_ids list, so threshold can never wedge from divergent
 /// pre-images.
 pub fn attest_batch_intents_payload(
+    materios_chain_id: &[u8; 32],
     intent_ids: &[IntentId],
 ) -> [u8; 32] {
     let n = intent_ids.len() as u32;
-    let mut body = alloc::vec::Vec::with_capacity(4 + intent_ids.len() * 32);
+    let mut body = alloc::vec::Vec::with_capacity(32 + 4 + intent_ids.len() * 32);
+    body.extend_from_slice(materios_chain_id);
     body.extend_from_slice(&n.to_le_bytes());
     for iid in intent_ids.iter() {
         body.extend_from_slice(iid.as_bytes());
@@ -225,28 +254,30 @@ pub fn attest_batch_intents_payload(
 }
 
 /// Task #212: canonical digest signed by committee members when
-/// authorizing a `request_batch_vouchers(entries)` call. Pre-image:
+/// authorizing a `request_batch_vouchers(entries)` call. Pre-image now
+/// begins with a 32-byte Materios chain-identity prefix (#73).
 ///
-/// `blake2_256(b"RVBN" || u32_le(N)
+/// `blake2_256(b"RVBN" || materios_chain_id (32B) || u32_le(N)
 ///             || N x (claim_id (32B) || intent_id (32B)
 ///                     || voucher_digest (32B) || bfpr_digest (32B)))`
 ///
-/// Each per-entry tuple is identical in shape to the spec-206 single-call
-/// `request_voucher_payload` body — the batch path just concatenates N of
-/// them after a 4-byte length prefix and re-tags with RVBN. The
-/// `voucher_digest` + `bfpr_digest` are computed deterministically by the
-/// pallet from each entry's `voucher` + `fairness_proof` (canonical SCALE)
-/// before this digest is hashed, so the keeper and committee always see
-/// the same pre-image.
+/// Each per-entry tuple's `voucher_digest` is the chain-identity-bound CBOR
+/// form computed by `compute_voucher_digest_with_address` (#79). The pallet
+/// re-derives this digest deterministically from each entry's `voucher`
+/// before hashing, so the keeper and committee always see the same
+/// pre-image.
 ///
 /// Per `feedback_mofn_hash_determinism.md`: only chain-derived state
 /// (claim_ids, intent_ids, deterministic Voucher + BFPR digests) appears
 /// in the pre-image — no operator-local fields.
 pub fn request_batch_vouchers_payload(
+    materios_chain_id: &[u8; 32],
     entries: &[(ClaimId, IntentId, [u8; 32], [u8; 32])],
 ) -> [u8; 32] {
     let n = entries.len() as u32;
-    let mut body = alloc::vec::Vec::with_capacity(4 + entries.len() * (32 + 32 + 32 + 32));
+    let mut body =
+        alloc::vec::Vec::with_capacity(32 + 4 + entries.len() * (32 + 32 + 32 + 32));
+    body.extend_from_slice(materios_chain_id);
     body.extend_from_slice(&n.to_le_bytes());
     for (claim_id, intent_id, voucher_d, bfpr_d) in entries.iter() {
         body.extend_from_slice(claim_id.as_bytes());
@@ -260,9 +291,11 @@ pub fn request_batch_vouchers_payload(
 /// Task #210: canonical batch digest emitted in the `BatchIntentsSubmitted`
 /// event. There is NO M-of-N gate on `submit_batch_intents` (it's the
 /// user-side stage), so this digest is purely an indexer-facing identity
-/// for the batch — it does NOT serve as a sig pre-image. Format:
+/// for the batch — it does NOT serve as a sig pre-image. Pre-image is now
+/// chain-id-bound (#73) for parity with the M-of-N family.
 ///
-/// `blake2_256(b"SBIN" || u32_le(N) || N×scale(IntentKind))`
+/// `blake2_256(b"SBIN" || materios_chain_id (32B)
+///             || u32_le(N) || N×scale(IntentKind))`
 ///
 /// The IntentKind SCALE encoding is identical to what the pallet hashes into
 /// IntentId (modulo the per-intent submitter/nonce/block fields), so a
@@ -271,15 +304,51 @@ pub fn request_batch_vouchers_payload(
 /// included N prefix prevents trivial digest collision between two batches
 /// that share a kind list of different lengths.
 pub fn submit_batch_intents_payload(
+    materios_chain_id: &[u8; 32],
     entries: &[SubmitIntentEntry],
 ) -> [u8; 32] {
     let n = entries.len() as u32;
     let mut body = alloc::vec::Vec::new();
+    body.extend_from_slice(materios_chain_id);
     body.extend_from_slice(&n.to_le_bytes());
     for e in entries.iter() {
         body.extend_from_slice(&e.kind.encode());
     }
     crate::types::domain_hash(*TAG_SBIN, &body)
+}
+
+/// Task #74 (sec-review): canonical digest signed by a single committee
+/// member when authorizing one increment of an `attest_intent(intent_id, ...)`
+/// pending bundle. Pre-image:
+///
+/// `blake2_256(b"INTA" || intent_id (32B))`
+///
+/// Pre-fix the runtime accepted the `(pubkey, sig)` bundle on `attest_intent`
+/// without verifying the signature (the comment claimed Cardano would
+/// re-verify later). The chain still advanced state — Pending -> Attested —
+/// based on bundle LENGTH alone, so any committee member could submit
+/// garbage signatures and walk the threshold. This pre-image domain-tags
+/// the signed payload with `INTA` and binds it to the specific `intent_id`
+/// the caller is voting on, so the runtime can sr25519-verify the
+/// signature locally via `T::SigVerifier::verify` before mutating storage.
+///
+/// Per `feedback_mofn_hash_determinism.md` rule: only chain-derived
+/// `intent_id` appears in the pre-image — no operator-local state.
+///
+// TODO(sec-review): chain-id binding lands in #73. Once the chain-id
+// hardening pass merges, the pre-image grows to:
+//   `blake2_256(b"INTA" || materios_chain_id || intent_id || ...)`
+// matching the same pattern landing on CRDP/STCL/RVCH/STBA/ABIN/RVBN.
+// Coordinate with the #73 worktree before bumping this digest — Aiken /
+// keeper / SDK fixtures must update in lockstep.
+pub fn attest_intent_payload(
+    materios_chain_id: &[u8; 32],
+    intent_id: &IntentId,
+) -> [u8; 32] {
+    let mut body = alloc::vec::Vec::with_capacity(32 + 32);
+    body.extend_from_slice(materios_chain_id);
+    body.extend_from_slice(intent_id.as_bytes());
+    crate::types::domain_hash(*TAG_INTA, &body)
 }
 
 #[frame_support::pallet]
@@ -368,6 +437,35 @@ pub mod pallet {
         /// stays well within `MaxPendingBatches`).
         #[pallet::constant]
         type MaxSubmitBatch: Get<u32>;
+
+        /// Task #73: 32-byte Materios chain identity (genesis hash). Pinned
+        /// into every committee-signed pre-image so a bundle signed on
+        /// preprod is structurally invalid on mainnet/testnet/post-reset.
+        /// In the production runtime, plumb the actual genesis hash via
+        /// `parameter_types! { pub MateriosChainId: H256 = ... }`.
+        #[pallet::constant]
+        type MateriosChainId: Get<sp_core::H256>;
+
+        /// Task #73: Cardano network magic (1 = preprod, 764824073 = mainnet,
+        /// 2 = preview). Encoded LE u32 in the voucher digest pre-image so a
+        /// preprod-signed voucher can never settle on mainnet (or vice versa).
+        #[pallet::constant]
+        type NetworkMagic: Get<u32>;
+
+        /// Task #73: 28-byte blake2b224 hash of the deployed `aegis_policy_v1`
+        /// Aiken validator. Pinned into the voucher digest pre-image so a
+        /// signed voucher is bound to the SPECIFIC policy script that's
+        /// currently the on-chain source of truth — pre/post Aiken redeploy
+        /// or pre/post `aiken blueprint apply` changes domain-separate
+        /// automatically.
+        #[pallet::constant]
+        type AegisPolicyV1ScriptHash: Get<[u8; 28]>;
+
+        /// Task #73: Settlement-protocol semver. Bumped on any breaking
+        /// pre-image change so pre-bump and post-bump bundles are
+        /// domain-separated even when all other fields collide.
+        #[pallet::constant]
+        type SettlementVersion: Get<u32>;
     }
 
     /// Abstraction for verifying an `sr25519` signature over a committee
@@ -714,6 +812,27 @@ pub mod pallet {
         /// matching the Issue #5 `CoverageOverflow` precedent on the
         /// voucher-mint stage.
         SubmitBatchPremiumOverflow,
+        /// Task #79: the voucher's `beneficiary_cardano_addr` is not a valid
+        /// CIP-0019 type-0 (payment VK + stake VK inline) address. The
+        /// canonical voucher digest only supports this shape in v1; vouchers
+        /// issued to script-payment / pointer / type-1+ addresses MUST be
+        /// rejected here so the keeper's mirror digest cannot diverge.
+        InvalidBeneficiaryAddress,
+        /// Task #75 (sec-review): caller submitted a `signatures` Vec longer
+        /// than `MaxCommittee`. Pre-fix the unbounded Vec walked into
+        /// `ensure_threshold_signatures` and ran a full sr25519 verify pass
+        /// over EVERY entry before the BoundedVec-storage truncate ever
+        /// fired — a 1024-entry submission burned 1024 verifies before
+        /// bailing. Capping at the top of every M-of-N extrinsic makes the
+        /// DoS surface a constant `MaxCommittee` worth of work.
+        TooManySignatures,
+        /// Task #74 (sec-review): `set_min_signer_threshold` rejected because
+        /// the requested floor exceeds the live committee threshold (which
+        /// is the chain's authoritative source for "how many distinct
+        /// committee sigs exist"). Without this clamp, a root caller could
+        /// brick every M-of-N extrinsic by requiring more sigs than the
+        /// committee has members.
+        ThresholdAboveCommittee,
     }
 
     // ---------------------------------------------------------------------
@@ -826,6 +945,21 @@ pub mod pallet {
         /// `intent_id`. First bundle to cross threshold transitions state to
         /// Attested and stores the final `AttestationSigs`. Subsequent calls
         /// are no-ops.
+        ///
+        /// Task #74 (sec-review):
+        /// - Adds runtime sr25519 verification of `(pubkey, sig)` against the
+        ///   canonical INTA pre-image (`b"INTA" || intent_id`). Pre-fix the
+        ///   pallet trusted Cardano to verify later, so the chain transitioned
+        ///   state on UNVERIFIED bundles. Now every signature must verify
+        ///   locally via `T::SigVerifier::verify` before its slot in the
+        ///   pending bundle counts.
+        /// - Duplicate pubkey is now a HARD error (`Error::DuplicatePubkey`)
+        ///   instead of a silent `Ok(())` — replay attempts must be visible
+        ///   in failed-extrinsic counters, not absorbed.
+        /// - Bundle-grow + threshold-cross logic runs inside
+        ///   `with_storage_layer` so two `attest_intent` calls in the same
+        ///   block can't race past threshold mid-mutation: the second call
+        ///   either sees the first's committed state or rolls back atomically.
         #[pallet::call_index(1)]
         #[pallet::weight((Weight::from_parts(50_000_000, 0), DispatchClass::Operational, Pays::No))]
         pub fn attest_intent(
@@ -851,41 +985,74 @@ pub mod pallet {
                 Error::<T>::CallerPubkeyMismatch
             );
 
-            // If already Attested, make this a no-op (idempotent).
-            let mut intent =
+            // If already Attested (or terminal), make this a no-op
+            // (idempotent). Done BEFORE sig-verify so a stale call from a
+            // late-arriving signer doesn't waste verify cycles.
+            let intent =
                 Intents::<T>::get(intent_id).ok_or(Error::<T>::IntentNotFound)?;
             if intent.status != IntentStatus::Pending {
                 return Ok(());
             }
 
-            // We don't crypto-verify the ed25519 sig against `intent_id` bytes
-            // here at runtime — that's the Cardano validator's job per spec §1.2
-            // (Aiken verifies committee sigs). Substrate only enforces that
-            // the caller is a committee member and that (pubkey, sig) are
-            // well-formed and non-duplicated. That keeps attestation cheap and
-            // avoids double-verification (ed25519 is verified at Cardano time).
+            // Task #74: runtime sr25519 verification on the canonical INTA
+            // pre-image. Without this the chain advances state on garbage
+            // signatures because "Cardano verifies later" — but Cardano only
+            // sees the bundle at settle/voucher time, after Materios already
+            // transitioned the intent. Verify NOW so unverifiable bundles
+            // never count. INTA pre-image is chain-identity-bound (#73)
+            // alongside the other six M-of-N tags so a bundle signed on
+            // preprod can't replay on a different Materios chain.
+            let chain_id = Self::materios_chain_id_bytes();
+            let payload = attest_intent_payload(&chain_id, &intent_id);
+            ensure!(
+                T::SigVerifier::verify(&pubkey, &sig, &payload),
+                Error::<T>::InvalidSignature
+            );
 
-            // Append to the pending bundle; reject duplicates by pubkey.
-            let mut bundle = PendingAttestations::<T>::get(intent_id);
-            if bundle.iter().any(|(p, _)| p == &pubkey) {
-                return Ok(()); // idempotent on duplicate pubkey
-            }
-            bundle
-                .try_push((pubkey, sig))
-                .map_err(|_| Error::<T>::TooManySigs)?;
-            PendingAttestations::<T>::insert(intent_id, bundle.clone());
+            // Task #74: bundle accumulation + threshold transition runs
+            // inside one transactional storage layer so two concurrent
+            // attest_intent calls in the same block can't both transition
+            // state from a stale read of PendingAttestations. The closure
+            // either commits both the bundle insert AND any threshold-
+            // crossing intent flip, or rolls back atomically.
+            frame_support::storage::with_storage_layer::<
+                (),
+                sp_runtime::DispatchError,
+                _,
+            >(|| {
+                let mut bundle = PendingAttestations::<T>::get(intent_id);
+                // Task #74: duplicate pubkey is now a hard error
+                // (Error::DuplicatePubkey) instead of a silent Ok(()).
+                // Replay attempts must surface in failed-extrinsic counts.
+                ensure!(
+                    !bundle.iter().any(|(p, _)| p == &pubkey),
+                    Error::<T>::DuplicatePubkey
+                );
+                bundle
+                    .try_push((pubkey, sig))
+                    .map_err(|_| Error::<T>::TooManySigs)?;
+                PendingAttestations::<T>::insert(intent_id, bundle.clone());
 
-            let threshold = T::CommitteeMembership::threshold();
-            if bundle.len() as u32 >= threshold {
-                intent.status = IntentStatus::Attested;
-                Intents::<T>::insert(intent_id, intent);
-                AttestationSigs::<T>::insert(intent_id, bundle.clone());
-                PendingAttestations::<T>::remove(intent_id);
-                Self::deposit_event(Event::IntentAttested {
-                    intent_id,
-                    attestor_count: bundle.len() as u32,
-                });
-            }
+                let threshold = T::CommitteeMembership::threshold();
+                if bundle.len() as u32 >= threshold {
+                    let mut intent = Intents::<T>::get(intent_id)
+                        .ok_or(Error::<T>::IntentNotFound)?;
+                    // Re-check status inside the storage layer in case a
+                    // sibling call already crossed threshold. Idempotent
+                    // no-op if so.
+                    if intent.status == IntentStatus::Pending {
+                        intent.status = IntentStatus::Attested;
+                        Intents::<T>::insert(intent_id, intent);
+                        AttestationSigs::<T>::insert(intent_id, bundle.clone());
+                        PendingAttestations::<T>::remove(intent_id);
+                        Self::deposit_event(Event::IntentAttested {
+                            intent_id,
+                            attestor_count: bundle.len() as u32,
+                        });
+                    }
+                }
+                Ok(())
+            })?;
             Ok(())
         }
 
@@ -923,6 +1090,15 @@ pub mod pallet {
                 T::CommitteeMembership::is_member(&who),
                 Error::<T>::NotCommitteeMember
             );
+            // Task #75 (sec-review): cap unbounded `signatures` len at
+            // MaxCommittee BEFORE any sig-verify cycle. Pre-fix an attacker
+            // could submit a 1024-entry Vec and burn 1024 sr25519 verifies
+            // in `ensure_threshold_signatures` before the BoundedVec
+            // truncate ever fired — a trivial DoS once the chain is public.
+            ensure!(
+                signatures.len() <= T::MaxCommittee::get() as usize,
+                Error::<T>::TooManySignatures
+            );
 
             // Check duplicate-voucher first so callers get an unambiguous error
             // when they retry with the same claim_id.
@@ -951,8 +1127,32 @@ pub mod pallet {
             // state slips in. The same `ensure_threshold_signatures` routine
             // used by settle_claim/credit_deposit gives us caller-binding,
             // distinct-signer, member-only, and per-sig sr25519 verification.
-            let voucher_digest_pre = compute_voucher_digest(&voucher);
+            //
+            // #79: voucher_digest is the chain-identity-bound CBOR form (the
+            // legacy SCALE form is gone). The pallet computes from voucher
+            // fields + chain-config so the keeper's mirror digest cannot
+            // diverge.
+            let chain_id = Self::materios_chain_id_bytes();
+            let aegis_script_hash = T::AegisPolicyV1ScriptHash::get();
+            let beneficiary_cbor =
+                Self::beneficiary_cbor_for(&voucher.beneficiary_cardano_addr)?;
+            let voucher_digest_pre = crate::voucher_canonicalize::compute_voucher_digest_with_address(
+                crate::voucher_canonicalize::ChainIdentity {
+                    materios_chain_id: &chain_id,
+                    network_magic: T::NetworkMagic::get(),
+                    aegis_policy_script_hash: &aegis_script_hash,
+                    settlement_version: T::SettlementVersion::get(),
+                },
+                &voucher.claim_id,
+                &voucher.policy_id,
+                &beneficiary_cbor,
+                voucher.amount_ada,
+                &voucher.batch_fairness_proof_digest,
+                voucher.issued_block,
+                voucher.expiry_slot_cardano,
+            );
             let voucher_payload = request_voucher_payload(
+                &chain_id,
                 &claim_id,
                 &intent_id,
                 &voucher_digest_pre,
@@ -1049,12 +1249,23 @@ pub mod pallet {
                 T::CommitteeMembership::is_member(&who),
                 Error::<T>::NotCommitteeMember
             );
+            // Task #75 (sec-review): cap unbounded `signatures` len at
+            // MaxCommittee BEFORE any sig-verify cycle.
+            ensure!(
+                signatures.len() <= T::MaxCommittee::get() as usize,
+                Error::<T>::TooManySignatures
+            );
 
             // Issue #7: require M-of-N distinct committee signatures over the
             // canonical payload. The origin itself MUST sign (otherwise any
             // member could replay stale signature bundles), so we build the
             // digest including who and verify inclusion.
+            //
+            // #73: pre-image is now bound to the Materios chain-id so a bundle
+            // signed on preprod cannot land on mainnet.
+            let chain_id = Self::materios_chain_id_bytes();
             let payload = settle_claim_payload(
+                &chain_id,
                 &claim_id,
                 &cardano_tx_hash,
                 settled_direct,
@@ -1080,10 +1291,27 @@ pub mod pallet {
             // Issue #6: intent is now terminal; drop from index.
             Self::remove_from_pending_batches(intent_id);
 
-            // Decrement outstanding coverage.
+            // Decrement outstanding coverage AND total NAV.
+            //
+            // Task #82 (sec-review): pre-fix `credit_deposit` grew
+            // `total_nav_ada` 1:1 on every deposit but no path EVER
+            // decremented it on payout. NAV monotonically grew, pool
+            // utilization (= outstanding / nav) drifted toward zero forever,
+            // and the 75% cap effectively disabled itself after enough
+            // payouts. Now: settling a claim drains the actual `amount`
+            // from NAV (capital really is gone — it was paid out on
+            // Cardano). `expire_policy_mirror` does NOT touch NAV — the
+            // unclaimed premium still belongs to the pool.
+            //
+            // Saturating_sub keeps the runtime panic-free. If we ever hit
+            // the saturating floor, the post-state is honest (zero) and
+            // the `BatchSettled` / `ClaimSettled` event records the real
+            // payout amount, so off-chain monitors can flag the divergence
+            // for forensic follow-up.
             PoolUtilization::<T>::mutate(|u| {
                 u.outstanding_coverage_ada =
                     u.outstanding_coverage_ada.saturating_sub(amount);
+                u.total_nav_ada = u.total_nav_ada.saturating_sub(amount);
             });
 
             Self::deposit_event(Event::ClaimSettled {
@@ -1143,14 +1371,25 @@ pub mod pallet {
                 T::CommitteeMembership::is_member(&who),
                 Error::<T>::NotCommitteeMember
             );
+            // Task #75 (sec-review): cap unbounded `signatures` len at
+            // MaxCommittee BEFORE any sig-verify cycle.
+            ensure!(
+                signatures.len() <= T::MaxCommittee::get() as usize,
+                Error::<T>::TooManySignatures
+            );
 
             // Issue #7: M-of-N gate. Previously any single committee member
             // could unilaterally credit any ADA amount onto any account —
             // trivial pool drain. We now require `MinSignerThreshold`
             // distinct committee signatures over the canonical payload
             // (target, amount, tx_hash) and verify each at runtime.
+            //
+            // #73: pre-image is now bound to the Materios chain-id so a bundle
+            // signed on preprod cannot land on mainnet.
+            let chain_id = Self::materios_chain_id_bytes();
             let target_bytes = crate::account_to_bytes(&target);
             let payload = credit_deposit_payload(
+                &chain_id,
                 &target_bytes,
                 amount_ada,
                 &cardano_tx_hash,
@@ -1197,6 +1436,16 @@ pub mod pallet {
         /// Issue #7: Root-only governance knob to tune the M-of-N floor at
         /// runtime (preprod launches with 2, mainnet bumps to 3 via this
         /// extrinsic). Setting 0 resets to `DefaultMinSignerThreshold`.
+        ///
+        /// Task #74 (sec-review): enforces the invariant `MinSignerThreshold
+        /// <= committee_threshold` so the local pallet floor cannot diverge
+        /// above the committee-governance pallet's authoritative threshold.
+        /// Without this, a root call could lock all M-of-N extrinsics by
+        /// requiring more sigs than the committee has members. The committee
+        /// threshold itself is rotated via `pallet_committee_governance::
+        /// propose_threshold_change` + `execute_rotation` — that path
+        /// already validates `1 <= new <= members.len()`. This extrinsic is
+        /// the OTHER lever; clamping here keeps both knobs consistent.
         #[pallet::call_index(8)]
         #[pallet::weight((Weight::from_parts(10_000_000, 0), DispatchClass::Operational, Pays::No))]
         pub fn set_min_signer_threshold(
@@ -1209,6 +1458,18 @@ pub mod pallet {
             } else {
                 new_threshold
             };
+            // Task #74 (sec-review) — threshold consolidation invariant.
+            // Reject any value that exceeds the live committee threshold
+            // (the source of truth for "how many distinct committee
+            // signatures exist"). If the local floor were allowed to
+            // exceed it, every M-of-N extrinsic would dead-lock with
+            // InsufficientSignatures forever (the committee couldn't
+            // produce that many sigs).
+            let committee_threshold = T::CommitteeMembership::threshold();
+            ensure!(
+                v <= committee_threshold,
+                Error::<T>::ThresholdAboveCommittee
+            );
             MinSignerThreshold::<T>::put(v);
             Ok(())
         }
@@ -1266,11 +1527,20 @@ pub mod pallet {
                 T::CommitteeMembership::is_member(&who),
                 Error::<T>::NotCommitteeMember
             );
+            // Task #75 (sec-review): cap unbounded `signatures` len at
+            // MaxCommittee BEFORE any sig-verify cycle.
+            ensure!(
+                signatures.len() <= T::MaxCommittee::get() as usize,
+                Error::<T>::TooManySignatures
+            );
             ensure!(!entries.is_empty(), Error::<T>::EmptyBatch);
 
             // Compute batch digest ONCE over all entries. Single sig-verify
             // pass below — this is where the ~100x throughput unlock lives.
-            let payload = settle_batch_atomic_payload(entries.as_slice());
+            //
+            // #73: pre-image is now bound to the Materios chain-id.
+            let chain_id = Self::materios_chain_id_bytes();
+            let payload = settle_batch_atomic_payload(&chain_id, entries.as_slice());
             Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
 
             // Pass 1: detect duplicate claim_ids INSIDE the batch up-front
@@ -1328,12 +1598,23 @@ pub mod pallet {
                             total_amount_unsettled.saturating_add(amount);
                     }
 
-                    // Decrement outstanding coverage in ONE mutate call (vs N
-                    // separate mutates) — same storage-write economics as
-                    // `settle_claim` summed across N calls, but cheaper.
+                    // Decrement outstanding coverage AND total NAV in ONE
+                    // mutate call (vs N separate mutates) — same storage-
+                    // write economics as `settle_claim` summed across N
+                    // calls, but cheaper.
+                    //
+                    // Task #82 (sec-review): NAV decrement matches
+                    // `settle_claim`'s post-fix behaviour. Capital really
+                    // is gone (paid out on Cardano), so it must leave the
+                    // NAV bucket too. Pre-fix this site only updated
+                    // `outstanding_coverage_ada`, leaving NAV monotonically
+                    // growing across settlements.
                     PoolUtilization::<T>::mutate(|u| {
                         u.outstanding_coverage_ada = u
                             .outstanding_coverage_ada
+                            .saturating_sub(total_amount_unsettled);
+                        u.total_nav_ada = u
+                            .total_nav_ada
                             .saturating_sub(total_amount_unsettled);
                     });
 
@@ -1416,12 +1697,26 @@ pub mod pallet {
                 T::CommitteeMembership::is_member(&who),
                 Error::<T>::NotCommitteeMember
             );
+            // Task #75 (sec-review): cap unbounded `signatures` len at
+            // MaxCommittee BEFORE the per-sig verify pass below. Pre-fix the
+            // BoundedVec::try_from truncate ran AFTER ensure_threshold_signatures
+            // (so a 1024-entry attacker bundle burned 1024 sr25519 verifies
+            // before bailing). Capping here makes the DoS surface a constant
+            // MaxCommittee worth of work.
+            ensure!(
+                signatures.len() <= T::MaxCommittee::get() as usize,
+                Error::<T>::TooManySignatures
+            );
             ensure!(!intent_ids.is_empty(), Error::<T>::EmptyAttestBatch);
 
             // Compute the canonical ABIN digest ONCE over all intent_ids,
             // then verify the M-of-N sig bundle against it ONCE — the
             // throughput unlock.
-            let payload = attest_batch_intents_payload(intent_ids.as_slice());
+            //
+            // #73: pre-image is now bound to the Materios chain-id.
+            let chain_id = Self::materios_chain_id_bytes();
+            let payload =
+                attest_batch_intents_payload(&chain_id, intent_ids.as_slice());
             Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
 
             // Pass 1: detect duplicate intent_ids inside the batch up-front
@@ -1568,6 +1863,12 @@ pub mod pallet {
                 T::CommitteeMembership::is_member(&who),
                 Error::<T>::NotCommitteeMember
             );
+            // Task #75 (sec-review): cap unbounded `signatures` len at
+            // MaxCommittee BEFORE any sig-verify cycle.
+            ensure!(
+                signatures.len() <= T::MaxCommittee::get() as usize,
+                Error::<T>::TooManySignatures
+            );
             ensure!(!entries.is_empty(), Error::<T>::EmptyVoucherBatch);
 
             // Pass 0: detect duplicate claim_ids inside the batch up-front.
@@ -1588,6 +1889,18 @@ pub mod pallet {
             // bfpr_digest)` pair the pallet just validated — no operator-
             // local state slips into the canonical pre-image (per
             // `feedback_mofn_hash_determinism.md`).
+            //
+            // #79: voucher_digest uses the chain-identity-bound CBOR form
+            // (legacy SCALE form is gone) so the keeper's mirror digest is
+            // guaranteed to match.
+            let chain_id = Self::materios_chain_id_bytes();
+            let aegis_script_hash = T::AegisPolicyV1ScriptHash::get();
+            let chain_identity = crate::voucher_canonicalize::ChainIdentity {
+                materios_chain_id: &chain_id,
+                network_magic: T::NetworkMagic::get(),
+                aegis_policy_script_hash: &aegis_script_hash,
+                settlement_version: T::SettlementVersion::get(),
+            };
             let mut tuples: alloc::vec::Vec<(ClaimId, IntentId, [u8; 32], [u8; 32])> =
                 alloc::vec::Vec::with_capacity(n);
             for entry in entries.iter() {
@@ -1598,7 +1911,19 @@ pub mod pallet {
                     entry.voucher.batch_fairness_proof_digest == bfpr_digest,
                     Error::<T>::FairnessDigestMismatch
                 );
-                let voucher_digest = compute_voucher_digest(&entry.voucher);
+                let beneficiary_cbor =
+                    Self::beneficiary_cbor_for(&entry.voucher.beneficiary_cardano_addr)?;
+                let voucher_digest =
+                    crate::voucher_canonicalize::compute_voucher_digest_with_address(
+                        chain_identity,
+                        &entry.voucher.claim_id,
+                        &entry.voucher.policy_id,
+                        &beneficiary_cbor,
+                        entry.voucher.amount_ada,
+                        &entry.voucher.batch_fairness_proof_digest,
+                        entry.voucher.issued_block,
+                        entry.voucher.expiry_slot_cardano,
+                    );
                 tuples.push((
                     entry.claim_id,
                     entry.intent_id,
@@ -1610,7 +1935,9 @@ pub mod pallet {
             // ONE sig-verify pass over the whole batch — the throughput
             // unlock. Domain-tagged with RVBN so a per-entry RVCH
             // signature can never replay onto the batch path.
-            let payload = request_batch_vouchers_payload(&tuples);
+            //
+            // #73: pre-image is bound to the Materios chain-id.
+            let payload = request_batch_vouchers_payload(&chain_id, &tuples);
             Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
 
             // Atomic mutation phase. Each per-entry mutation mirrors the
@@ -1768,7 +2095,12 @@ pub mod pallet {
             // it's safe to do up-front. Costs O(sum of SCALE-encoded kinds)
             // which is dominated by the BoundedVec encoding the user already
             // paid to land.
-            let batch_digest = submit_batch_intents_payload(entries.as_slice());
+            //
+            // #73: pre-image is bound to the Materios chain-id for parity
+            // with the M-of-N family.
+            let chain_id = Self::materios_chain_id_bytes();
+            let batch_digest =
+                submit_batch_intents_payload(&chain_id, entries.as_slice());
 
             // Pre-flight: sum BuyPolicy premiums across the batch. Reject
             // overflow before mutating storage so a craft-an-overflow
@@ -1992,6 +2324,37 @@ pub mod pallet {
             });
         }
 
+        /// Task #73: thin wrapper around `T::MateriosChainId::get()` returning
+        /// the raw 32-byte H256 view used by every pre-image helper. Inlined
+        /// at every call site so the chain-id pull happens once per extrinsic.
+        pub fn materios_chain_id_bytes() -> [u8; 32] {
+            T::MateriosChainId::get().0
+        }
+
+        /// Task #79: build the canonical Plutus V3 Data CBOR for a voucher's
+        /// beneficiary address. Vouchers carry the raw CIP-0019 type-0 buffer
+        /// (`0x01 || payment_hash(28) || stake_hash(28)`); the canonical
+        /// digest binds the Aiken-equivalent CBOR shape, so we re-derive it
+        /// here rather than trusting an attacker-provided pre-encoded blob.
+        ///
+        /// Address shapes other than type-0 (script-payment, pointer, etc.)
+        /// are NOT supported in the v1 voucher schema and are surfaced as
+        /// `InvalidBeneficiaryAddress`.
+        pub fn beneficiary_cbor_for(
+            addr: &BoundedVec<u8, ConstU32<MAX_CARDANO_ADDR>>,
+        ) -> Result<[u8; 80], DispatchError> {
+            let raw: &[u8] = addr.as_slice();
+            let (payment_hash, stake_hash) =
+                crate::voucher_canonicalize::split_type0_address_bytes(raw)
+                    .map_err(|_| Error::<T>::InvalidBeneficiaryAddress)?;
+            Ok(crate::voucher_canonicalize::build_type0_address_cbor(
+                crate::voucher_canonicalize::Type0AddressHashes {
+                    payment_hash: &payment_hash,
+                    stake_hash: &stake_hash,
+                },
+            ))
+        }
+
         /// Issue #7: verify that `signatures` contains at least the effective
         /// `MinSignerThreshold` distinct, valid sr25519 signatures over
         /// `payload`, each produced by a current committee member. The caller
@@ -2082,6 +2445,11 @@ pub mod pallet {
 // Re-export for downstream / Aiken-parity SDK.
 pub use crate::types::{
     compute_committee_set_digest, compute_fairness_proof_digest, compute_intent_id,
-    compute_voucher_digest, domain_hash, RequestVoucherEntry, SettleBatchEntry,
-    SubmitIntentEntry,
+    domain_hash, RequestVoucherEntry, SettleBatchEntry, SubmitIntentEntry,
+};
+// #79: the SCALE-form voucher digest is gone. The canonical helper is now
+// `voucher_canonicalize::compute_voucher_digest_with_address` which binds the
+// chain-identity fields (#73) and the Aiken-mirrored Plutus V3 Data CBOR.
+pub use crate::voucher_canonicalize::{
+    compute_voucher_digest_with_address, ChainIdentity,
 };

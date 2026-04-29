@@ -150,43 +150,26 @@ export function intentId(intent: Pick<Intent, "submitter" | "nonce" | "kind" | "
 }
 
 /**
- * Voucher digest (§1.7):
- *   claim_id (32B) || policy_id (32B) || beneficiary_addr_bytes ||
- *   amount_ada (u64 LE) || bfpr_digest (32B) || issued_block (u32 LE) ||
- *   expiry_slot_cardano (u64 LE)
+ * #79: the legacy SCALE-based `voucherDigest` is GONE. The pallet's mirror
+ * helper was deleted to resolve a SCALE-vs-CBOR divergence with the Aiken
+ * validator. The canonical voucher digest is now ONLY computed via
+ * [`voucherDigestWithAddress`] below, which binds the chain-identity fields
+ * from #73 plus the Aiken-mirrored Plutus V3 Data CBOR of the beneficiary.
  *
- * Note beneficiary_addr_bytes is encoded with compact-length prefix here to
- * stay unambiguous; the Aiken validator mirrors this exact layout.
- */
-export function voucherDigest(voucher: Voucher): HexString {
-  const claimId = hexToU8a(voucher.claimId);
-  const policyId = hexToU8a(voucher.policyId);
-  const bfprDigest = hexToU8a(voucher.batchFairnessProofDigest);
-  if (claimId.length !== 32) throw new Error("claimId must be 32B");
-  if (policyId.length !== 32) throw new Error("policyId must be 32B");
-  if (bfprDigest.length !== 32) throw new Error("bfpr digest must be 32B");
-
-  const body = u8aConcat(
-    claimId,
-    policyId,
-    encodeBytesWithCompactLen(voucher.beneficiaryCardanoAddr),
-    u64LE(voucher.amountAda),
-    bfprDigest,
-    u32LE(voucher.issuedBlock),
-    u64LE(voucher.expirySlotCardano),
-  );
-  return domainHashHex(DomainTag.Voucher, body);
-}
-
-/**
- * Voucher digest with beneficiary as Plutus V3 Data CBOR (three-way parity).
+ * Voucher digest with beneficiary as Plutus V3 Data CBOR (three-way parity)
+ * + chain-identity prefix (#73). Pre-image:
+ *
+ *   `b"VCHR" || materios_chain_id (32B) || network_magic (LE u32, 4B)
+ *           || aegis_policy_v1_script_hash (28B) || settlement_version (LE u32, 4B)
+ *           || claim_id (32B) || policy_id (32B) || beneficiary_address_cbor
+ *           || amount_ada (LE u64, 8B) || bfpr_digest (32B)
+ *           || issued_block (LE u32, 4B) || expiry_slot_cardano (LE u64, 8B)`
  *
  * Matches Team B's merged Aiken `canonical_voucher_body` which raw-concats
  * the CBOR-encoded beneficiary (NO SCALE length prefix). Use this for any
  * voucher that will be verified against aegis-policy-v1 on Cardano.
  *
- * Anchored in `docs/test-vectors.json::voucher_digest_with_address` at
- * `ae73d78970eb486376fb9d5e4d00cba0a5b2a2200c935d942cc258b12a7f8405`.
+ * Anchored in `docs/test-vectors.json::voucher_digest_with_address`.
  */
 export function voucherDigestWithAddress(args: {
   claimId: HexString;
@@ -197,15 +180,33 @@ export function voucherDigestWithAddress(args: {
   batchFairnessProofDigest: HexString;
   issuedBlock: number;
   expirySlotCardano: bigint;
+  /** #73: 32-byte Materios genesis hash. */
+  materiosChainId: HexString;
+  /** #73: Cardano network magic (1 = preprod, 764824073 = mainnet). */
+  networkMagic: number;
+  /** #73: 28-byte deployed `aegis_policy_v1` blake2b224 hash. */
+  aegisPolicyV1ScriptHash: HexString;
+  /** #73: settlement-protocol semver. */
+  settlementVersion: number;
 }): HexString {
   const claimId = hexToU8a(args.claimId);
   const policyId = hexToU8a(args.policyId);
   const bfpr = hexToU8a(args.batchFairnessProofDigest);
+  const chainId = hexToU8a(args.materiosChainId);
+  const scriptHash = hexToU8a(args.aegisPolicyV1ScriptHash);
   if (claimId.length !== 32) throw new Error("claimId must be 32B");
   if (policyId.length !== 32) throw new Error("policyId must be 32B");
   if (bfpr.length !== 32) throw new Error("bfpr digest must be 32B");
+  if (chainId.length !== 32) throw new Error("materiosChainId must be 32B");
+  if (scriptHash.length !== 28) {
+    throw new Error("aegisPolicyV1ScriptHash must be 28B");
+  }
 
   const body = u8aConcat(
+    chainId,
+    u32LE(args.networkMagic),
+    scriptHash,
+    u32LE(args.settlementVersion),
     claimId,
     policyId,
     args.beneficiaryAddressCbor,

@@ -29,6 +29,23 @@ export class MateriosRpcClient {
   private readonly rpcUrl: string;
   private readonly signerUri?: string;
   private provider?: WsProvider;
+  /**
+   * Task #77: per-signer nonce gate. Serialises `accountNextIndex →
+   * signAndSend RPC accept` so concurrent callers under the same signer
+   * cannot both read the same on-chain nonce and collide in the mempool.
+   *
+   * The chain advances when each `signAndSend` resolves the local
+   * Promise<unsub>; the next caller awaits that resolution before reading
+   * `accountNextIndex` again. Inclusion (in-block) waits happen OUTSIDE
+   * the gate so we don't bottleneck on block production.
+   *
+   * Reset to a fresh resolved Promise on `disconnect()` so a future
+   * re-connect doesn't inherit a never-resolving gate.
+   *
+   * Mirrors the production fix shipped in receipt-submitter.mjs
+   * (feedback_polkadot_nonce_race_on_burst.md, 2026-04-24).
+   */
+  private nonceChain: Promise<void> = Promise.resolve();
 
   constructor(opts: MateriosRpcClientOptions) {
     this.rpcUrl = opts.rpcUrl;
@@ -53,12 +70,18 @@ export class MateriosRpcClient {
         throw new Error(`Invalid signerUri (${name}) — raw keyring error suppressed`);
       }
     }
+    // Reset the nonce chain on every fresh connect so a stalled prior gate
+    // doesn't permanently wedge new submits.
+    this.nonceChain = Promise.resolve();
   }
 
   async disconnect(): Promise<void> {
     if (this.api?.isConnected) await this.api.disconnect();
     this.api = undefined;
     this.provider = undefined;
+    // Reset the nonce-gate chain — any never-resolving promise from the
+    // pre-disconnect signAndSend can permanently wedge new submissions.
+    this.nonceChain = Promise.resolve();
   }
 
   getApi(): ApiPromise {
@@ -115,24 +138,102 @@ export class MateriosRpcClient {
     const api = this.getApi();
     const signer = this.getSigner();
     const ext = (api.tx as any)[section][method](...args);
+
+    // Task #77: nonce-gate guards the (accountNextIndex → signAndSend RPC)
+    // window. Concurrent callers (e.g. keeper.reconcileInflight running
+    // settle_claim for many vouchers in a `for…of`) would otherwise all
+    // read the same on-chain nonce and the second tx would land with
+    // `1014: Priority is too low`, silently dropping the claim.
+    //
+    // The gate releases as soon as the RPC accepts the tx into the pool
+    // (the signAndSend promise resolves with an unsub fn). Inclusion-wait
+    // happens AFTER the gate releases.
+    //
+    // Mirrors receipt-submitter.mjs (2026-04-24) — battle-tested under
+    // burst submits.
     return new Promise((resolve, reject) => {
-      let unsub: (() => void) | null = null;
-      ext
-        .signAndSend(signer, (result: any) => {
-          if (result.status.isInBlock) {
-            const blockHash = result.status.asInBlock.toHex() as HexString;
-            const txHash = ext.hash.toHex() as HexString;
-            unsub?.();
-            resolve({ txHash, blockHash });
-          } else if (result.isError) {
-            unsub?.();
-            reject(new Error(`extrinsic ${section}.${method} errored`));
+      const prev = this.nonceChain;
+      let releaseGate: (() => void) | undefined;
+      this.nonceChain = new Promise<void>((r) => {
+        releaseGate = r;
+      });
+      const release = (): void => {
+        if (releaseGate) {
+          releaseGate();
+          releaseGate = undefined;
+        }
+      };
+
+      prev
+        .then(async () => {
+          let nonce: number;
+          try {
+            const next = await api.rpc.system.accountNextIndex(signer.address);
+            // `Index` (a.k.a. AccountNonce) is a u32 in the runtime; toNumber()
+            // is safe for any account that hasn't sent ~4B txs.
+            nonce = (next as any).toNumber
+              ? (next as any).toNumber()
+              : Number(next.toString());
+          } catch (err) {
+            // accountNextIndex itself failed — release the gate to keep
+            // queued callers moving and surface the error.
+            release();
+            reject(err instanceof Error ? err : new Error(String(err)));
+            return;
+          }
+
+          let unsub: (() => void) | null = null;
+          let settled = false;
+          const done = (
+            value: { txHash: HexString; blockHash: HexString | null } | null,
+            err: Error | null,
+          ): void => {
+            if (settled) return;
+            settled = true;
+            if (unsub) unsub();
+            release();
+            if (err) reject(err);
+            else if (value) resolve(value);
+          };
+
+          try {
+            const unsubPromise = ext.signAndSend(
+              signer,
+              { nonce },
+              (result: any) => {
+                if (result?.status?.isInBlock) {
+                  const blockHash = result.status.asInBlock.toHex() as HexString;
+                  const txHash = ext.hash.toHex() as HexString;
+                  done({ txHash, blockHash }, null);
+                } else if (result?.isError) {
+                  done(
+                    null,
+                    new Error(
+                      `extrinsic ${section}.${method} errored (nonce=${nonce})`,
+                    ),
+                  );
+                }
+              },
+            );
+            unsubPromise
+              .then((u: () => void) => {
+                unsub = u;
+                // The RPC accepted the tx into the pool; subsequent
+                // accountNextIndex queries will now return nonce+1. Release
+                // the gate so the next queued caller can claim its nonce.
+                release();
+              })
+              .catch((e: unknown) => {
+                done(null, e instanceof Error ? e : new Error(String(e)));
+              });
+          } catch (e) {
+            done(null, e instanceof Error ? e : new Error(String(e)));
           }
         })
-        .then((u: () => void) => {
-          unsub = u;
-        })
-        .catch(reject);
+        .catch((e) => {
+          release();
+          reject(e instanceof Error ? e : new Error(String(e)));
+        });
     });
   }
 

@@ -21,10 +21,19 @@
 //! ```
 
 use pallet_intent_settlement::voucher_canonicalize::{
-    build_type0_address_cbor, compute_voucher_digest_with_address, Type0AddressHashes,
+    build_type0_address_cbor, compute_voucher_digest_with_address, ChainIdentity,
+    Type0AddressHashes,
 };
 use pallet_intent_settlement::types::TAG_VCHR;
 use sp_core::{hashing::blake2_256, H256};
+
+/// #73 fixture: chain-identity prefix used for the parity vector. Matches the
+/// `materios_chain_id_hex` field in `docs/test-vectors.json` (regenerated
+/// alongside this test for the SDK's parity.test.ts mirror).
+const PARITY_CHAIN_ID: [u8; 32] = [0x73u8; 32];
+const PARITY_NETWORK_MAGIC: u32 = 1u32;
+const PARITY_AEGIS_SCRIPT_HASH: [u8; 28] = [0x42u8; 28];
+const PARITY_SETTLEMENT_VERSION: u32 = 1u32;
 
 // -------- tiny self-contained hex decoder (the pallet itself avoids adding a
 // `hex` dep — see tests.rs::mod hex). We duplicate the same helper here. -----
@@ -106,8 +115,15 @@ fn voucher_digest_with_address_three_way_parity() {
          touching any other side.",
     );
 
-    // Step 2: reproduce the full 196-byte canonical voucher body + digest.
+    // Step 2: reproduce the full 264-byte canonical voucher body + digest.
+    // (Body grew from 196B to 264B in #73 — added 68B chain-identity prefix.)
     let digest = compute_voucher_digest_with_address(
+        ChainIdentity {
+            materios_chain_id: &PARITY_CHAIN_ID,
+            network_magic: PARITY_NETWORK_MAGIC,
+            aegis_policy_script_hash: &PARITY_AEGIS_SCRIPT_HASH,
+            settlement_version: PARITY_SETTLEMENT_VERSION,
+        },
         &H256::from(claim_id),
         &H256::from(policy_id),
         &cbor,

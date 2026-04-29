@@ -82,23 +82,30 @@ function require32(bytes: Uint8Array, field: string): void {
 }
 
 /**
- * Byte-identical to Rust `settle_claim_payload(claim_id, tx_hash, settled_direct)`.
+ * Byte-identical to Rust `settle_claim_payload(materios_chain_id, claim_id,
+ * tx_hash, settled_direct)`.
  *
- * Pre-image: `b"STCL" || claim_id (32B) || cardano_tx_hash (32B) || settled_direct (1B)`
+ * Pre-image (#73): `b"STCL" || materios_chain_id (32B) || claim_id (32B)
+ *                   || cardano_tx_hash (32B) || settled_direct (1B)`
  *
  * @returns 32-byte blake2_256 digest that committee members must sign.
  */
 export function settleClaimPayload(args: {
+  /** #73: 32-byte Materios genesis hash. */
+  materiosChainId: HexString;
   claimId: HexString;
   /** 32-byte Cardano transaction hash, hex-prefixed. */
   cardanoTxHash: HexString;
   settledDirect: boolean;
 }): Uint8Array {
+  const chainId = hexToU8a(args.materiosChainId);
   const claimId = hexToU8a(args.claimId);
   const cardanoTxHash = hexToU8a(args.cardanoTxHash);
+  require32(chainId, "materiosChainId");
   require32(claimId, "claimId");
   require32(cardanoTxHash, "cardanoTxHash");
   const body = u8aConcat(
+    chainId,
     claimId,
     cardanoTxHash,
     new Uint8Array([args.settledDirect ? 1 : 0]),
@@ -113,25 +120,36 @@ export function settleClaimPayload(args: {
 }
 
 /**
- * Byte-identical to Rust `credit_deposit_payload(target, amount_ada, tx_hash)`.
+ * Byte-identical to Rust `credit_deposit_payload(materios_chain_id, target,
+ * amount_ada, tx_hash)`.
  *
- * Pre-image: `b"CRDP" || target (32B) || amount_ada (LE u64) || cardano_tx_hash (32B)`
+ * Pre-image (#73): `b"CRDP" || materios_chain_id (32B) || target (32B)
+ *                   || amount_ada (LE u64) || cardano_tx_hash (32B)`
  *
- * @param depositor 32-byte SS58 pubkey of the credited account (see spec §6).
- * @param amountAda Amount in lovelace (u64).
- * @param cardanoTxHash 32-byte Cardano deposit tx hash.
  * @returns 32-byte blake2_256 digest that committee members must sign.
  */
 export function creditDepositPayload(args: {
+  /** #73: 32-byte Materios genesis hash. */
+  materiosChainId: HexString;
+  /** 32-byte SS58 pubkey of the credited account (see spec §6). */
   depositor: HexString;
+  /** Amount in lovelace (u64). */
   amountAda: bigint;
+  /** 32-byte Cardano deposit tx hash. */
   cardanoTxHash: HexString;
 }): Uint8Array {
+  const chainId = hexToU8a(args.materiosChainId);
   const depositor = hexToU8a(args.depositor);
   const cardanoTxHash = hexToU8a(args.cardanoTxHash);
+  require32(chainId, "materiosChainId");
   require32(depositor, "depositor");
   require32(cardanoTxHash, "cardanoTxHash");
-  const body = u8aConcat(depositor, u64LE(args.amountAda), cardanoTxHash);
+  const body = u8aConcat(
+    chainId,
+    depositor,
+    u64LE(args.amountAda),
+    cardanoTxHash,
+  );
   const digest = blake2AsU8a(u8aConcat(TAG_CRDP, body), 256);
   if (digest.length !== 32) {
     throw new Error(`blake2_256 digest length != 32 (got ${digest.length})`);
@@ -169,13 +187,16 @@ export function creditDepositPayload(args: {
  * @returns 32-byte blake2_256 digest that committee members must sign.
  */
 export function requestVoucherPayload(args: {
+  /** #73: 32-byte Materios genesis hash. */
+  materiosChainId: HexString;
   /** 32-byte claim id (H256), hex-prefixed. */
   claimId: HexString;
   /** 32-byte intent id (H256), hex-prefixed. */
   intentId: HexString;
   /**
    * 32-byte digest of the `Voucher` struct. Compute via
-   * `hashing.ts::voucherDigest` and hand the same bytes here.
+   * `hashing.ts::voucherDigestWithAddress` (the chain-identity-bound CBOR
+   * form) and hand the same bytes here.
    */
   voucherDigest: HexString;
   /**
@@ -185,15 +206,17 @@ export function requestVoucherPayload(args: {
    */
   bfprDigest: HexString;
 }): Uint8Array {
+  const chainId = hexToU8a(args.materiosChainId);
   const claimId = hexToU8a(args.claimId);
   const intentId = hexToU8a(args.intentId);
   const voucherDigest = hexToU8a(args.voucherDigest);
   const bfprDigest = hexToU8a(args.bfprDigest);
+  require32(chainId, "materiosChainId");
   require32(claimId, "claimId");
   require32(intentId, "intentId");
   require32(voucherDigest, "voucherDigest");
   require32(bfprDigest, "bfprDigest");
-  const body = u8aConcat(claimId, intentId, voucherDigest, bfprDigest);
+  const body = u8aConcat(chainId, claimId, intentId, voucherDigest, bfprDigest);
   const digest = blake2AsU8a(u8aConcat(TAG_RVCH, body), 256);
   if (digest.length !== 32) {
     throw new Error(`blake2_256 digest length != 32 (got ${digest.length})`);
@@ -224,11 +247,15 @@ export function requestVoucherPayload(args: {
  * @returns 32-byte blake2_256 digest committee members must sign.
  */
 export function attestBatchIntentsPayload(args: {
+  /** #73: 32-byte Materios genesis hash. */
+  materiosChainId: HexString;
   /** List of 32-byte intent IDs (H256), hex-prefixed. */
   intentIds: HexString[];
 }): Uint8Array {
+  const chainId = hexToU8a(args.materiosChainId);
+  require32(chainId, "materiosChainId");
   const n = args.intentIds.length;
-  const parts: Uint8Array[] = [TAG_ABIN, u32LE(n)];
+  const parts: Uint8Array[] = [TAG_ABIN, chainId, u32LE(n)];
   for (const id of args.intentIds) {
     const idBytes = hexToU8a(id);
     if (idBytes.length !== 32) {
@@ -271,6 +298,8 @@ export function attestBatchIntentsPayload(args: {
  * @returns 32-byte blake2_256 digest committee members must sign.
  */
 export function requestBatchVouchersPayload(args: {
+  /** #73: 32-byte Materios genesis hash. */
+  materiosChainId: HexString;
   entries: {
     claimId: HexString;
     intentId: HexString;
@@ -278,8 +307,10 @@ export function requestBatchVouchersPayload(args: {
     bfprDigest: HexString;
   }[];
 }): Uint8Array {
+  const chainId = hexToU8a(args.materiosChainId);
+  require32(chainId, "materiosChainId");
   const n = args.entries.length;
-  const parts: Uint8Array[] = [TAG_RVBN, u32LE(n)];
+  const parts: Uint8Array[] = [TAG_RVBN, chainId, u32LE(n)];
   for (const e of args.entries) {
     const cid = hexToU8a(e.claimId);
     const iid = hexToU8a(e.intentId);
@@ -327,10 +358,14 @@ export function requestBatchVouchersPayload(args: {
  * @returns 32-byte blake2_256 digest matching the Rust pallet emission.
  */
 export function submitBatchIntentsPayload(args: {
+  /** #73: 32-byte Materios genesis hash. */
+  materiosChainId: HexString;
   entries: { kind: IntentKind }[];
 }): Uint8Array {
+  const chainId = hexToU8a(args.materiosChainId);
+  require32(chainId, "materiosChainId");
   const n = args.entries.length;
-  const parts: Uint8Array[] = [TAG_SBIN, u32LE(n)];
+  const parts: Uint8Array[] = [TAG_SBIN, chainId, u32LE(n)];
   for (const e of args.entries) {
     parts.push(encodeIntentKind(e.kind));
   }

@@ -1,7 +1,7 @@
 {
   "name": "@fluxpointstudios/materios-intent-settlement-keeper",
   "version": "0.1.0",
-  "description": "Permissionless keeper + committee daemon for Materios intent-settlement. Reads Materios via RPC, batches intents, submits Cardano txs, settles back.",
+  "description": "Committee-operated keeper for Materios intent-settlement. Reads Materios via RPC, batches intents, submits Cardano txs, settles back. v0.1 requires the keeper to hold a committee key for settle_claim threshold sigs; a permissionless request+attest split is planned for a future release. See SECURITY.md for the trust-model status.",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
