@@ -20,6 +20,7 @@ import path from "node:path";
 import {
   verifyVoucherSigs,
 } from "./voucher-sig-verify.js";
+import type { ChainIdentity } from "./voucher-sig-verify.js";
 import { Keeper } from "./keeper.js";
 import { KeeperStateStore } from "./state.js";
 import { computePlutusV3ScriptHash } from "./script-hash.js";
@@ -33,7 +34,9 @@ import type {
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
 import {
   intentId as computeIntentId,
-  voucherDigest,
+  voucherDigestWithAddress,
+  encodeType0AddressCbor,
+  splitType0AddressBytes,
   signPayload,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
 import { hexToU8a, u8aToHex } from "@polkadot/util";
@@ -46,13 +49,50 @@ beforeAll(async () => {
 const PLACEHOLDER_CBOR = ("0x" + "00".repeat(4)) as HexString;
 const PLACEHOLDER_HASH = computePlutusV3ScriptHash(PLACEHOLDER_CBOR);
 
+// #73 + #79: pinned chain-identity tuple. The pallet integration runtime
+// uses `TestAegisPolicyV1ScriptHash = 0x42*28` for its parity tests, but
+// the keeper's task #76a startup gate enforces
+// `blake2b_224(0x03||POLICY_SCRIPT_CBOR) == aegisPolicyV1ScriptHash`. To
+// keep both invariants honest in this in-process test we pin
+// `aegisPolicyV1ScriptHash` to the actual hash of the placeholder CBOR
+// — the digest computation is symmetric across `signedBy` and
+// `verifyVoucherSigs` as long as both sides use the same constant.
+const TEST_CHAIN_ID: HexString = ("0x" + "73".repeat(32)) as HexString;
+const TEST_AEGIS_SCRIPT_HASH: HexString = PLACEHOLDER_HASH;
+const TEST_NETWORK_MAGIC = 1;
+const TEST_SETTLEMENT_VERSION = 1;
+const TEST_CHAIN_IDENTITY: ChainIdentity = {
+  materiosChainId: TEST_CHAIN_ID,
+  networkMagic: TEST_NETWORK_MAGIC,
+  aegisPolicyV1ScriptHash: TEST_AEGIS_SCRIPT_HASH,
+  settlementVersion: TEST_SETTLEMENT_VERSION,
+};
+
+/**
+ * #79: build a 57-byte CIP-0019 type-0 address buffer with `fill` as the
+ * body byte. The `voucherDigestWithAddress` derivation requires a real
+ * type-0 layout (header || payment_hash(28) || stake_hash(28)) so the
+ * SDK's `splitType0AddressBytes` doesn't reject the input. Tests pin a
+ * deterministic fill byte per voucher so digests don't accidentally
+ * collide across cases.
+ */
+function type0Address(fill: number): Uint8Array {
+  const out = new Uint8Array(57);
+  out[0] = 0x01;
+  for (let i = 1; i < 57; i++) out[i] = fill & 0xff;
+  return out;
+}
+
 // -- Voucher builders -------------------------------------------------------
 
-function freshVoucher(claimId: HexString = ("0x" + "07".repeat(32)) as HexString): Voucher {
+function freshVoucher(
+  claimId: HexString = ("0x" + "07".repeat(32)) as HexString,
+  addrFill = 0xab,
+): Voucher {
   return {
     claimId,
     policyId: ("0x" + "ee".repeat(32)) as HexString,
-    beneficiaryCardanoAddr: new TextEncoder().encode("addr_test1xyz"),
+    beneficiaryCardanoAddr: type0Address(addrFill),
     amountAda: 10_000_000n,
     batchFairnessProofDigest: ("0x" + "dd".repeat(32)) as HexString,
     issuedBlock: 110,
@@ -61,11 +101,35 @@ function freshVoucher(claimId: HexString = ("0x" + "07".repeat(32)) as HexString
   };
 }
 
+/**
+ * Compute the canonical voucher digest the same way `verifyVoucherSigs`
+ * does — split → cbor → voucherDigestWithAddress with the pinned test
+ * chain-identity tuple. The `signedBy` helper signs THIS exact digest so
+ * the verify gate accepts.
+ */
+function testVoucherDigest(voucher: Voucher): HexString {
+  const hashes = splitType0AddressBytes(voucher.beneficiaryCardanoAddr);
+  const cbor = encodeType0AddressCbor(hashes);
+  return voucherDigestWithAddress({
+    claimId: voucher.claimId,
+    policyId: voucher.policyId,
+    beneficiaryAddressCbor: cbor,
+    amountAda: voucher.amountAda,
+    batchFairnessProofDigest: voucher.batchFairnessProofDigest,
+    issuedBlock: voucher.issuedBlock,
+    expirySlotCardano: voucher.expirySlotCardano,
+    materiosChainId: TEST_CHAIN_IDENTITY.materiosChainId,
+    networkMagic: TEST_CHAIN_IDENTITY.networkMagic,
+    aegisPolicyV1ScriptHash: TEST_CHAIN_IDENTITY.aegisPolicyV1ScriptHash,
+    settlementVersion: TEST_CHAIN_IDENTITY.settlementVersion,
+  });
+}
+
 function signedBy(voucher: Voucher, seeds: string[]): {
   voucher: Voucher;
   pubkeys: CommitteePubkey[];
 } {
-  const digest = hexToU8a(voucherDigest(voucher));
+  const digest = hexToU8a(testVoucherDigest(voucher));
   const sigs: Array<{ pubkey: HexString; sig: HexString }> = [];
   const pubkeys: CommitteePubkey[] = [];
   for (const seed of seeds) {
@@ -77,6 +141,18 @@ function signedBy(voucher: Voucher, seeds: string[]): {
   return { voucher: { ...voucher, committeeSigs: sigs }, pubkeys };
 }
 
+/** Build a verifyVoucherSigs options bag with the pinned test chain-identity tuple. */
+function verifyOpts(
+  pubkeys: readonly CommitteePubkey[],
+  threshold: number,
+): Parameters<typeof verifyVoucherSigs>[1] {
+  return {
+    committeeMembers: pubkeys,
+    threshold,
+    chainIdentity: TEST_CHAIN_IDENTITY,
+  };
+}
+
 // -------------------------------------------------------------------------
 // Pure-function unit tests for verifyVoucherSigs.
 // -------------------------------------------------------------------------
@@ -84,10 +160,7 @@ function signedBy(voucher: Voucher, seeds: string[]): {
 describe("verifyVoucherSigs (Task #76b)", () => {
   it("accepts a voucher with N valid sigs and threshold N", () => {
     const { voucher, pubkeys } = signedBy(freshVoucher(), ["//Alice", "//Bob"]);
-    const res = verifyVoucherSigs(voucher, {
-      committeeMembers: pubkeys,
-      threshold: 2,
-    });
+    const res = verifyVoucherSigs(voucher, verifyOpts(pubkeys, 2));
     expect(res.ok).toBe(true);
     if (res.ok) {
       expect(res.verifiedCount).toBe(2);
@@ -97,19 +170,16 @@ describe("verifyVoucherSigs (Task #76b)", () => {
 
   it("accepts a voucher with M valid sigs and threshold ≤ M", () => {
     const { voucher, pubkeys } = signedBy(freshVoucher(), ["//Alice", "//Bob"]);
-    const res = verifyVoucherSigs(voucher, {
-      committeeMembers: pubkeys,
-      threshold: 1,
-    });
+    const res = verifyVoucherSigs(voucher, verifyOpts(pubkeys, 1));
     expect(res.ok).toBe(true);
   });
 
   it("rejects an empty committeeSigs list", () => {
     const v = freshVoucher();
-    const res = verifyVoucherSigs(v, {
-      committeeMembers: [("0x" + "ff".repeat(32)) as CommitteePubkey],
-      threshold: 1,
-    });
+    const res = verifyVoucherSigs(
+      v,
+      verifyOpts([("0x" + "ff".repeat(32)) as CommitteePubkey], 1),
+    );
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toBe("no_signatures");
   });
@@ -124,10 +194,7 @@ describe("verifyVoucherSigs (Task #76b)", () => {
       ...voucher,
       committeeSigs: [{ pubkey: voucher.committeeSigs[0]!.pubkey, sig: tamperedSig }],
     };
-    const res = verifyVoucherSigs(tampered, {
-      committeeMembers: pubkeys,
-      threshold: 1,
-    });
+    const res = verifyVoucherSigs(tampered, verifyOpts(pubkeys, 1));
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toBe("insufficient_unique_valid_sigs");
   });
@@ -136,17 +203,14 @@ describe("verifyVoucherSigs (Task #76b)", () => {
     const { voucher } = signedBy(freshVoucher(), ["//Eve"]);
     // Committee snapshot does NOT include Eve.
     const aliceOnly = signedBy(freshVoucher(), ["//Alice"]);
-    const res = verifyVoucherSigs(voucher, {
-      committeeMembers: aliceOnly.pubkeys,
-      threshold: 1,
-    });
+    const res = verifyVoucherSigs(voucher, verifyOpts(aliceOnly.pubkeys, 1));
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toBe("non_member_signer");
   });
 
   it("rejects a voucher with duplicate signer (matches pallet DuplicateSigner)", () => {
     const v = freshVoucher();
-    const digest = hexToU8a(voucherDigest(v));
+    const digest = hexToU8a(testVoucherDigest(v));
     const { pubkey, sig } = signPayload("//Alice", digest);
     const pkHex = u8aToHex(pubkey) as HexString;
     const dup: Voucher = {
@@ -156,10 +220,10 @@ describe("verifyVoucherSigs (Task #76b)", () => {
         { pubkey: pkHex, sig: u8aToHex(sig) as HexString },
       ],
     };
-    const res = verifyVoucherSigs(dup, {
-      committeeMembers: [pkHex as CommitteePubkey],
-      threshold: 1,
-    });
+    const res = verifyVoucherSigs(
+      dup,
+      verifyOpts([pkHex as CommitteePubkey], 1),
+    );
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toBe("duplicate_signer");
   });
@@ -179,10 +243,7 @@ describe("verifyVoucherSigs (Task #76b)", () => {
         },
       ],
     };
-    const res = verifyVoucherSigs(tampered, {
-      committeeMembers: pubkeys,
-      threshold: 2,
-    });
+    const res = verifyVoucherSigs(tampered, verifyOpts(pubkeys, 2));
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toBe("insufficient_unique_valid_sigs");
   });
@@ -193,10 +254,7 @@ describe("verifyVoucherSigs (Task #76b)", () => {
       ...voucher,
       committeeSigs: [{ pubkey: "not-a-hex-string" as HexString, sig: voucher.committeeSigs[0]!.sig }],
     };
-    const res = verifyVoucherSigs(malformed, {
-      committeeMembers: pubkeys,
-      threshold: 1,
-    });
+    const res = verifyVoucherSigs(malformed, verifyOpts(pubkeys, 1));
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toBe("bad_pubkey_format");
   });
@@ -207,20 +265,14 @@ describe("verifyVoucherSigs (Task #76b)", () => {
       ...voucher,
       committeeSigs: [{ pubkey: voucher.committeeSigs[0]!.pubkey, sig: "0xbad" as HexString }],
     };
-    const res = verifyVoucherSigs(malformed, {
-      committeeMembers: pubkeys,
-      threshold: 1,
-    });
+    const res = verifyVoucherSigs(malformed, verifyOpts(pubkeys, 1));
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toBe("bad_sig_format");
   });
 
   it("rejects threshold == 0 (defensive — pallet would too)", () => {
     const { voucher, pubkeys } = signedBy(freshVoucher(), ["//Alice"]);
-    const res = verifyVoucherSigs(voucher, {
-      committeeMembers: pubkeys,
-      threshold: 0,
-    });
+    const res = verifyVoucherSigs(voucher, verifyOpts(pubkeys, 0));
     expect(res.ok).toBe(false);
   });
 });
@@ -304,6 +356,13 @@ const baseConfig: KeeperConfig = {
   maxBatchSize: 32,
   dryRun: false,
   aegisPolicyV1ScriptHash: PLACEHOLDER_HASH,
+  // #73: Keeper.processBatch passes these into verifyVoucherSigs when
+  // sig-verifying a voucher. The values match the pinned test
+  // chain-identity tuple `signedBy` uses to produce sigs, so the
+  // end-to-end gate accepts.
+  materiosChainId: TEST_CHAIN_ID,
+  networkMagic: TEST_NETWORK_MAGIC,
+  settlementVersion: TEST_SETTLEMENT_VERSION,
 };
 
 describe("Keeper.processBatch — Task #76b end-to-end gate", () => {

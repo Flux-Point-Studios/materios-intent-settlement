@@ -291,6 +291,16 @@ export class Keeper {
       const sigCheck = verifyVoucherSigs(voucher, {
         committeeMembers: this.committeeSnapshot.members,
         threshold: this.committeeSnapshot.threshold,
+        // #73 + #79: chain-identity tuple bound into the canonical
+        // voucher digest. The deployed Aiken validator and the pallet's
+        // runtime-side recompute use these exact constants — passing
+        // them here keeps local verify and chain verify byte-identical.
+        chainIdentity: {
+          materiosChainId: this.config.materiosChainId,
+          networkMagic: this.config.networkMagic,
+          aegisPolicyV1ScriptHash: this.config.aegisPolicyV1ScriptHash,
+          settlementVersion: this.config.settlementVersion,
+        },
       });
       if (!sigCheck.ok) {
         this.metrics.voucherSigVerifyFailures += 1;
@@ -431,6 +441,10 @@ export class Keeper {
       // committee peers is a follow-up once the pallet is live on a runtime.
       const settledDirect = false;
       const payload = settleClaimPayload({
+        // #73: chain-identity is bound into the STCL pre-image so a
+        // settle_claim sig can never replay across networks or settlement
+        // versions.
+        materiosChainId: this.config.materiosChainId,
         claimId: sub.claimId,
         cardanoTxHash: sub.cardanoTxHash,
         settledDirect,

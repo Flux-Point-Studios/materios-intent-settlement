@@ -130,13 +130,33 @@ export interface KeeperConfig {
   maxBatchSize: number; // default 32
   dryRun: boolean;
   /**
-   * Team B round-2 addition: the deployed `aegis_policy_v1` script hash
-   * (post `aiken blueprint apply`). Nullable until the blueprint lands on
-   * preprod / mainnet; when set, the keeper stamps it into every
-   * AegisPolicyParams it builds and rejects tx submission if the
-   * subsidiary scripts were compiled with a different hash.
+   * #73 chain-identity tuple. These four fields are bound into every
+   * committee-signed digest (voucher pre-image, settle_claim payload,
+   * credit_deposit payload, etc.) so a sig from one chain can never replay
+   * on another, and a sig over the deployed Aiken validator can never
+   * replay if the validator is redeployed at a different hash.
+   *
+   * `materiosChainId` is a 32-byte genesis hash (hex). Production keepers
+   * should query `system.chain` / `chain.getBlockHash(0)` at startup; tests
+   * pin a fixture (`0x73*32`).
+   *
+   * `networkMagic` is the Cardano protocol magic — 1 for preprod /
+   * preview, 764824073 for mainnet.
+   *
+   * `aegisPolicyV1ScriptHash` is the deployed `aegis_policy_v1` script
+   * blake2b_224 hash (28 bytes hex). Required (non-nullable) — task #76a's
+   * keeper-startup script-hash gate would refuse to start without it
+   * anyway, and the canonical voucher digest now mandates it. Nullable
+   * was a transitional pre-deploy concession; post-#79 every keeper must
+   * pin the deployed hash.
+   *
+   * `settlementVersion` is the settlement-protocol semver (u32). Bump on
+   * any pre-image change to invalidate old committee sigs.
    */
-  aegisPolicyV1ScriptHash?: HexString | null;
+  materiosChainId: HexString;
+  networkMagic: number;
+  aegisPolicyV1ScriptHash: HexString;
+  settlementVersion: number;
 }
 
 /** Committee daemon config. */

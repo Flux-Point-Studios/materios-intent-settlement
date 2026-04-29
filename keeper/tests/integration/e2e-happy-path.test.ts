@@ -22,7 +22,9 @@ import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { hexToU8a, u8aToHex } from "@polkadot/util";
 import {
   intentId as computeIntentId,
-  voucherDigest,
+  voucherDigestWithAddress,
+  encodeType0AddressCbor,
+  splitType0AddressBytes,
   signPayload,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
 import type {
@@ -40,6 +42,21 @@ import { computePlutusV3ScriptHash } from "../../src/script-hash.js";
 
 const PLACEHOLDER_CBOR = ("0x" + "00".repeat(4)) as HexString;
 const PLACEHOLDER_HASH = computePlutusV3ScriptHash(PLACEHOLDER_CBOR);
+
+// #73 + #79: pinned chain-identity tuple. The script-hash field must
+// equal blake2b_224(0x03||CBOR) for the keeper's #76a startup gate, so
+// pin to the actual hash of the placeholder CBOR.
+const TEST_CHAIN_ID: HexString = ("0x" + "73".repeat(32)) as HexString;
+const TEST_AEGIS_SCRIPT_HASH: HexString = PLACEHOLDER_HASH;
+const TEST_NETWORK_MAGIC = 1;
+const TEST_SETTLEMENT_VERSION = 1;
+
+function type0Address(fill: number): Uint8Array {
+  const out = new Uint8Array(57);
+  out[0] = 0x01;
+  for (let i = 1; i < 57; i++) out[i] = fill & 0xff;
+  return out;
+}
 
 function fakeCardano(): ICardanoProvider {
   const slot = 1_000_000n;
@@ -98,16 +115,34 @@ function makeIntentAndBatch(): {
   const baseVoucher: Voucher = {
     claimId: id as unknown as HexString,
     policyId: ("0x" + "cd".repeat(32)) as HexString,
-    beneficiaryCardanoAddr: new TextEncoder().encode("addr_test1xabc"),
+    // #79: type-0 CIP-0019 buffer required by the chain-identity-bound
+    // voucherDigestWithAddress derivation.
+    beneficiaryCardanoAddr: type0Address(0xab),
     amountAda: 1_000_000n,
     batchFairnessProofDigest: ("0x" + "dd".repeat(32)) as HexString,
     issuedBlock: 110,
     expirySlotCardano: 10_000_000n,
     committeeSigs: [],
   };
-  // Task #76b: real sr25519 sig over the canonical voucher digest. The
+  // Task #76b: real sr25519 sig over the canonical
+  // voucherDigestWithAddress (chain-identity-bound CBOR form). The
   // committee snapshot below pins //Alice as the lone member.
-  const digest = hexToU8a(voucherDigest(baseVoucher));
+  const hashes = splitType0AddressBytes(baseVoucher.beneficiaryCardanoAddr);
+  const cbor = encodeType0AddressCbor(hashes);
+  const digestHex = voucherDigestWithAddress({
+    claimId: baseVoucher.claimId,
+    policyId: baseVoucher.policyId,
+    beneficiaryAddressCbor: cbor,
+    amountAda: baseVoucher.amountAda,
+    batchFairnessProofDigest: baseVoucher.batchFairnessProofDigest,
+    issuedBlock: baseVoucher.issuedBlock,
+    expirySlotCardano: baseVoucher.expirySlotCardano,
+    materiosChainId: TEST_CHAIN_ID,
+    networkMagic: TEST_NETWORK_MAGIC,
+    aegisPolicyV1ScriptHash: TEST_AEGIS_SCRIPT_HASH,
+    settlementVersion: TEST_SETTLEMENT_VERSION,
+  });
+  const digest = hexToU8a(digestHex);
   const { pubkey, sig } = signPayload("//Alice", digest);
   const pubkeyHex = u8aToHex(pubkey) as HexString;
   const voucher: Voucher = {
@@ -192,6 +227,11 @@ describe("E2E happy path — intent → attest → batch → submit → settle",
         dryRun: false,
         // Task #76a: bind the script-hash that matches PLACEHOLDER_CBOR.
         aegisPolicyV1ScriptHash: PLACEHOLDER_HASH,
+        // #73: chain-identity tuple bound into the voucher digest.
+        // makeIntentAndBatch signs against these constants.
+        materiosChainId: TEST_CHAIN_ID,
+        networkMagic: TEST_NETWORK_MAGIC,
+        settlementVersion: TEST_SETTLEMENT_VERSION,
       },
       {
         rpc: keeperRpc as any,
