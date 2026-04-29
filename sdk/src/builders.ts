@@ -106,6 +106,11 @@ export function buildPremiumDepositDatum(args: {
  * fields `beneficiaryBytes` + `policyId` are derived from inputs; we also
  * pre-compute the expected voucher digest so callers can assert it matches
  * what the committee signed before attempting submission.
+ *
+ * #73 / #79: voucherDigestWithAddress now requires the chain-identity tuple
+ * (materiosChainId, networkMagic, aegisPolicyV1ScriptHash, settlementVersion)
+ * to bind the digest to the specific Materios chain + Cardano network +
+ * deployed policy + settlement-protocol version.
  */
 export function buildRefundCredit(args: {
   voucherBytes: Uint8Array;
@@ -119,6 +124,14 @@ export function buildRefundCredit(args: {
   claimId: ClaimId;
   bfpDigest: HexString;
   currentSlot: SlotNumber;
+  /** #73: 32-byte Materios genesis hash. */
+  materiosChainId: HexString;
+  /** #73: Cardano network magic (1 = preprod, 764824073 = mainnet). */
+  networkMagic: number;
+  /** #73: 28-byte deployed `aegis_policy_v1` blake2b224 hash. */
+  aegisPolicyV1ScriptHash: HexString;
+  /** #73: settlement-protocol semver. */
+  settlementVersion: number;
 }): RefundRedeemerFields & { precomputedVoucherDigest: HexString } {
   const hashes = splitType0AddressBytes(args.beneficiary);
   const beneficiaryBytes = encodeType0AddressCbor(hashes);
@@ -130,6 +143,10 @@ export function buildRefundCredit(args: {
     batchFairnessProofDigest: args.bfpDigest,
     issuedBlock: args.issuedBlock,
     expirySlotCardano: args.expirySlotCardano,
+    materiosChainId: args.materiosChainId,
+    networkMagic: args.networkMagic,
+    aegisPolicyV1ScriptHash: args.aegisPolicyV1ScriptHash,
+    settlementVersion: args.settlementVersion,
   });
   return {
     voucherBytes: args.voucherBytes,

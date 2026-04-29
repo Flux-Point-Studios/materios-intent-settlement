@@ -263,27 +263,15 @@ pub fn compute_fairness_proof_digest(proof: &BatchFairnessProof) -> [u8; 32] {
     domain_hash(*TAG_BFPR, &proof.encode())
 }
 
-/// Canonical Voucher digest (the object committee members ed25519-sign):
-///
-/// `blake2_256(b"VCHR" || claim_id || policy_id || beneficiary_bytes
-///            || amount (LE u64) || bfpr_digest || issued_block (LE u32)
-///            || expiry_slot (LE u64))`
-///
-/// NOTE: SCALE-encodes `beneficiary_cardano_addr` via its compact-length
-/// prefix + raw bytes so an Aiken mirror can reconstruct with
-/// `cbor.serialise` on an equivalent `ByteArray`.
-pub fn compute_voucher_digest(v: &Voucher) -> [u8; 32] {
-    let mut body = sp_std::vec::Vec::new();
-    body.extend_from_slice(v.claim_id.as_bytes());
-    body.extend_from_slice(v.policy_id.as_bytes());
-    // encode bech32 address as scale bytes (length-prefixed) so both sides agree
-    body.extend_from_slice(&v.beneficiary_cardano_addr.encode());
-    body.extend_from_slice(&v.amount_ada.to_le_bytes());
-    body.extend_from_slice(&v.batch_fairness_proof_digest);
-    body.extend_from_slice(&v.issued_block.to_le_bytes());
-    body.extend_from_slice(&v.expiry_slot_cardano.to_le_bytes());
-    domain_hash(*TAG_VCHR, &body)
-}
+// SECURITY: the legacy `compute_voucher_digest` (SCALE-encoded address form)
+// is intentionally GONE. It diverged from Aiken's `canonical_voucher_body`
+// (which raw-concats the Plutus V3 Data CBOR of the address), and threshold
+// could wedge with `CertHashMismatch` if the keeper's mirror digest didn't
+// match the pallet's. The canonical voucher digest is now ONLY computed via
+// [`crate::voucher_canonicalize::compute_voucher_digest_with_address`], which
+// also binds `materios_chain_id`, `network_magic`, `aegis_policy_script_hash`,
+// and `settlement_version` so a signed bundle on preprod is structurally
+// invalid on mainnet/testnet/post-reset (#73 / #79).
 
 /// Canonical committee-set digest (for Cardano mirror ext field).
 /// `blake2_256(b"CMTT" || scale_vec(pubkeys) || threshold (LE u32))`

@@ -238,10 +238,21 @@ mod benchmarks {
                 ).unwrap(),
             };
             let bfpr_d = compute_fairness_proof_digest(&bfpr);
+            // #79: voucher digest now requires a CIP-0019 type-0 address
+            // shape so the canonical CBOR-bound digest can be derived.
+            let mut addr = sp_std::vec::Vec::with_capacity(57);
+            addr.push(0x01u8);
+            for _ in 0..28 {
+                addr.push(0xB1u8);
+            }
+            for _ in 0..28 {
+                addr.push(0xB1u8);
+            }
             let voucher = Voucher {
                 claim_id,
                 policy_id: PolicyId::from([0u8; 32]),
-                beneficiary_cardano_addr: Default::default(),
+                beneficiary_cardano_addr: frame_support::BoundedVec::try_from(addr)
+                    .expect("57B fits ConstU32<MAX_CARDANO_ADDR>"),
                 amount_ada: 1_000,
                 batch_fairness_proof_digest: bfpr_d,
                 issued_block: 1,

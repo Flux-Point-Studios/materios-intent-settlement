@@ -44,7 +44,6 @@ export {
   intentId,
   intentIdPreimage,
   encodeIntentKind,
-  voucherDigest,
   voucherDigestWithAddress,
   fairnessProofDigest,
   validateFairnessProof,

@@ -119,6 +119,11 @@ describe("buildRefundCredit / buildRefundDeposit", () => {
     claimId: ("0x" + "cc".repeat(32)) as HexString,
     bfpDigest: ("0x" + "de".repeat(32)) as HexString,
     currentSlot: 50_000n,
+    // #73: chain identity (test fixture).
+    materiosChainId: ("0x" + "73".repeat(32)) as HexString,
+    networkMagic: 1,
+    aegisPolicyV1ScriptHash: ("0x" + "42".repeat(28)) as HexString,
+    settlementVersion: 1,
   };
 
   it("derives beneficiaryBytes from the raw address", () => {
@@ -289,7 +294,17 @@ describe("canonicalVoucherBody", () => {
     // The body bytes fed through the canonical hasher must equal the digest
     // the three-way anchor pins; this is what guarantees the encoder swap
     // was a pure refactor (no byte-on-wire change).
-    const digest = hashing.voucherDigestWithAddress(args);
+    //
+    // #73: voucherDigestWithAddress now requires the chain-identity tuple.
+    // canonicalVoucherBody is the legacy 196-byte body (no chain prefix);
+    // it intentionally diverges from the digest helper's 264-byte body.
+    const digest = hashing.voucherDigestWithAddress({
+      ...args,
+      materiosChainId: ("0x" + "73".repeat(32)) as HexString,
+      networkMagic: 1,
+      aegisPolicyV1ScriptHash: ("0x" + "42".repeat(28)) as HexString,
+      settlementVersion: 1,
+    });
     expect(digest).toMatch(/^0x[0-9a-f]{64}$/);
 
     // Explicit byte-level spot-checks on the u64 LE / u32 LE regions:

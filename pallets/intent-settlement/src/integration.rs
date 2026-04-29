@@ -18,6 +18,10 @@ use crate as pallet_intent_settlement;
 use crate::pallet::{IsCommitteeMember, VerifyCommitteeSignature};
 use crate::types::*;
 use crate::{credit_deposit_payload, request_voucher_payload, settle_claim_payload};
+
+/// #73: integration-runtime test chain identity. Pinned to 0x73*32 to match
+/// `TestMateriosChainId` above. Unit tests in `tests.rs` use the same fixture.
+pub const TEST_CHAIN_ID: [u8; 32] = [0x73u8; 32];
 use codec::Encode;
 use frame_support::{
     assert_ok, construct_runtime, derive_impl, parameter_types,
@@ -59,6 +63,13 @@ parameter_types! {
     pub const MaxVoucherBatch: u32 = 256;
     /// Task #210: max submit_batch_intents size in the integration runtime.
     pub const MaxSubmitBatch: u32 = 256;
+    /// Task #73: integration-runtime chain identity (distinct from the
+    /// unit-test fixture so tests that share helpers can't accidentally
+    /// substitute the wrong constant).
+    pub const TestMateriosChainId: H256 = H256([0x73u8; 32]);
+    pub const TestNetworkMagic: u32 = 1u32;
+    pub const TestAegisPolicyV1ScriptHash: [u8; 28] = [0x42u8; 28];
+    pub const TestSettlementVersion: u32 = 1u32;
 }
 
 /// Static committee: Alice/Bob/Charlie by sr25519 dev-key AccountId. Threshold 2.
@@ -126,6 +137,50 @@ fn sign_with(seed: &str, msg: &[u8]) -> (CommitteePubkey, CommitteeSig) {
     (pair.public().0, sig.0)
 }
 
+/// #79: build a type-0 CIP-0019 address buffer with `fill` as the body byte.
+/// Header 0x01, then 28 bytes of payment hash, then 28 bytes of stake hash.
+fn type0_addr_bytes(fill: u8) -> Vec<u8> {
+    let mut out = vec![0u8; 57];
+    out[0] = 0x01;
+    for byte in out.iter_mut().skip(1) {
+        *byte = fill;
+    }
+    out
+}
+
+/// #79: helper to compute the chain-identity-bound voucher digest using the
+/// integration runtime's pinned constants. Mirrors the pallet's runtime
+/// derivation so committee sigs over this digest match what the chain
+/// actually verifies.
+fn integration_voucher_digest(voucher: &Voucher) -> [u8; 32] {
+    let raw: &[u8] = voucher.beneficiary_cardano_addr.as_slice();
+    let (payment, stake) =
+        crate::voucher_canonicalize::split_type0_address_bytes(raw)
+            .expect("integration tests use type-0 addresses");
+    let cbor = crate::voucher_canonicalize::build_type0_address_cbor(
+        crate::voucher_canonicalize::Type0AddressHashes {
+            payment_hash: &payment,
+            stake_hash: &stake,
+        },
+    );
+    let aegis_script = TestAegisPolicyV1ScriptHash::get();
+    crate::voucher_canonicalize::compute_voucher_digest_with_address(
+        crate::voucher_canonicalize::ChainIdentity {
+            materios_chain_id: &TEST_CHAIN_ID,
+            network_magic: TestNetworkMagic::get(),
+            aegis_policy_script_hash: &aegis_script,
+            settlement_version: TestSettlementVersion::get(),
+        },
+        &voucher.claim_id,
+        &voucher.policy_id,
+        &cbor,
+        voucher.amount_ada,
+        &voucher.batch_fairness_proof_digest,
+        voucher.issued_block,
+        voucher.expiry_slot_cardano,
+    )
+}
+
 impl pallet_intent_settlement::pallet::Config for Testnet {
     type RuntimeEvent = RuntimeEvent;
     type MaxCommittee = MaxCommittee;
@@ -140,6 +195,10 @@ impl pallet_intent_settlement::pallet::Config for Testnet {
     type MaxAttestBatch = MaxAttestBatch;
     type MaxVoucherBatch = MaxVoucherBatch;
     type MaxSubmitBatch = MaxSubmitBatch;
+    type MateriosChainId = TestMateriosChainId;
+    type NetworkMagic = TestNetworkMagic;
+    type AegisPolicyV1ScriptHash = TestAegisPolicyV1ScriptHash;
+    type SettlementVersion = TestSettlementVersion;
 }
 
 fn user_account() -> sp_runtime::AccountId32 {
@@ -181,6 +240,7 @@ fn full_lifecycle_submit_attest_voucher_settle() {
         let mut target_bytes = [0u8; 32];
         target_bytes.copy_from_slice(&user.encode()[..32]);
         let deposit_payload = credit_deposit_payload(
+            &TEST_CHAIN_ID,
             &target_bytes,
             10_000_000u64,
             &cardano_tx,
@@ -204,7 +264,7 @@ fn full_lifecycle_submit_attest_voucher_settle() {
             strike: 500_000,
             term_slots: 86_400,
             premium_ada: 2_000_000,
-            beneficiary_cardano_addr: BoundedVec::try_from(vec![0xB1; 57]).unwrap(),
+            beneficiary_cardano_addr: BoundedVec::try_from(type0_addr_bytes(0xB1)).unwrap(),
         };
         let mut submitter_bytes = [0u8; 32];
         submitter_bytes.copy_from_slice(&user.encode()[..32]);
@@ -260,7 +320,7 @@ fn full_lifecycle_submit_attest_voucher_settle() {
         let voucher = Voucher {
             claim_id,
             policy_id: H256::from([0x99; 32]),
-            beneficiary_cardano_addr: BoundedVec::try_from(vec![0xB1; 57]).unwrap(),
+            beneficiary_cardano_addr: BoundedVec::try_from(type0_addr_bytes(0xB1)).unwrap(),
             amount_ada: 2_000_000,
             batch_fairness_proof_digest: compute_fairness_proof_digest(&bfpr),
             issued_block: 4,
@@ -271,12 +331,13 @@ fn full_lifecycle_submit_attest_voucher_settle() {
             ])
             .unwrap(),
         };
-        // Task #174: M-of-N committee sigs over the canonical
-        // request_voucher pre-image (b"RVCH" || claim_id || intent_id ||
-        // voucher_digest || bfpr_digest).
-        let voucher_digest = crate::types::compute_voucher_digest(&voucher);
+        // Task #174 + #73 + #79: M-of-N committee sigs over the canonical
+        // chain-id-bound request_voucher pre-image. voucher_digest is the
+        // CBOR-with-address form (legacy SCALE form deleted).
+        let voucher_digest = integration_voucher_digest(&voucher);
         let bfpr_digest = crate::types::compute_fairness_proof_digest(&bfpr);
         let voucher_payload = request_voucher_payload(
+            &TEST_CHAIN_ID,
             &claim_id,
             &expected_id,
             &voucher_digest,
@@ -301,7 +362,8 @@ fn full_lifecycle_submit_attest_voucher_settle() {
 
         // Block 5: committee mirrors Cardano settlement — also M-of-N gated.
         System::set_block_number(5);
-        let settle_payload = settle_claim_payload(&claim_id, &[0xDE; 32], false);
+        let settle_payload =
+            settle_claim_payload(&TEST_CHAIN_ID, &claim_id, &[0xDE; 32], false);
         let settle_sigs = vec![
             sign_with("//Alice", &settle_payload),
             sign_with("//Bob", &settle_payload),
@@ -446,7 +508,7 @@ fn rv_setup_attested(
         strike: 500_000,
         term_slots: 86_400,
         premium_ada: 2_000_000,
-        beneficiary_cardano_addr: BoundedVec::try_from(vec![0xB1; 57]).unwrap(),
+        beneficiary_cardano_addr: BoundedVec::try_from(type0_addr_bytes(0xB1)).unwrap(),
     };
     let mut submitter_bytes = [0u8; 32];
     submitter_bytes.copy_from_slice(&user.encode()[..32]);
@@ -457,7 +519,12 @@ fn rv_setup_attested(
     let cardano_tx = [0xAA; 32];
     let mut target_bytes = [0u8; 32];
     target_bytes.copy_from_slice(&user.encode()[..32]);
-    let crdp = credit_deposit_payload(&target_bytes, 10_000_000u64, &cardano_tx);
+    let crdp = credit_deposit_payload(
+        &TEST_CHAIN_ID,
+        &target_bytes,
+        10_000_000u64,
+        &cardano_tx,
+    );
     let crdp_sigs = vec![sign_with("//Alice", &crdp), sign_with("//Bob", &crdp)];
     assert_ok!(IntentSettlement::credit_deposit(
         RuntimeOrigin::signed(alice.clone()),
@@ -509,7 +576,7 @@ fn rv_setup_attested(
     let voucher = Voucher {
         claim_id,
         policy_id: H256::from([0x99; 32]),
-        beneficiary_cardano_addr: BoundedVec::try_from(vec![0xB1; 57]).unwrap(),
+        beneficiary_cardano_addr: BoundedVec::try_from(type0_addr_bytes(0xB1)).unwrap(),
         amount_ada: 2_000_000,
         batch_fairness_proof_digest: bfpr_digest,
         issued_block: System::block_number() as u32,
@@ -520,8 +587,9 @@ fn rv_setup_attested(
         ])
         .unwrap(),
     };
-    let voucher_digest = compute_voucher_digest(&voucher);
+    let voucher_digest = integration_voucher_digest(&voucher);
     let payload = request_voucher_payload(
+        &TEST_CHAIN_ID,
         &claim_id,
         &intent_id,
         &voucher_digest,
@@ -608,7 +676,8 @@ fn task174_request_voucher_t5_bad_sig_over_wrong_preimage_rejected() {
         let user = user_account();
         let (alice, _bob, _charlie) = committee_accounts();
         let (intent_id, claim_id, bfpr, voucher, payload) = rv_setup_attested(&user);
-        let wrong_payload = settle_claim_payload(&claim_id, &[0u8; 32], false);
+        let wrong_payload =
+            settle_claim_payload(&TEST_CHAIN_ID, &claim_id, &[0u8; 32], false);
         let sigs = vec![
             sign_with("//Alice", &payload),
             sign_with("//Bob", &wrong_payload), // wrong digest under the right pubkey
@@ -720,9 +789,10 @@ fn task174_request_voucher_t9_preimage_determinism_across_operators() {
             rv_setup_attested(&user);
 
         // Operator 1 (Alice): recomputes pre-image from scratch.
-        let voucher_digest_1 = compute_voucher_digest(&voucher);
+        let voucher_digest_1 = integration_voucher_digest(&voucher);
         let bfpr_digest_1 = compute_fairness_proof_digest(&bfpr);
         let payload_1 = request_voucher_payload(
+            &TEST_CHAIN_ID,
             &claim_id,
             &intent_id,
             &voucher_digest_1,
@@ -731,9 +801,10 @@ fn task174_request_voucher_t9_preimage_determinism_across_operators() {
         let alice_sig = sign_with("//Alice", &payload_1);
 
         // Operator 2 (Bob): same recompute, must produce byte-identical digest.
-        let voucher_digest_2 = compute_voucher_digest(&voucher);
+        let voucher_digest_2 = integration_voucher_digest(&voucher);
         let bfpr_digest_2 = compute_fairness_proof_digest(&bfpr);
         let payload_2 = request_voucher_payload(
+            &TEST_CHAIN_ID,
             &claim_id,
             &intent_id,
             &voucher_digest_2,
@@ -791,7 +862,7 @@ fn task211_attest_batch_intents_real_runtime_happy_path() {
         }
 
         // Build canonical ABIN pre-image and 2-of-3 sig bundle (real sr25519).
-        let payload = crate::attest_batch_intents_payload(&iids);
+        let payload = crate::attest_batch_intents_payload(&TEST_CHAIN_ID, &iids);
         let alice_sig = sign_with("//Alice", &payload);
         let bob_sig = sign_with("//Bob", &payload);
 
@@ -831,7 +902,12 @@ fn task210_submit_batch_intents_atomic_revert_real_runtime() {
         let cardano_tx = [0xAA; 32];
         let mut target_bytes = [0u8; 32];
         target_bytes.copy_from_slice(&user.encode()[..32]);
-        let crdp = credit_deposit_payload(&target_bytes, 100_000_000u64, &cardano_tx);
+        let crdp = credit_deposit_payload(
+            &TEST_CHAIN_ID,
+            &target_bytes,
+            100_000_000u64,
+            &cardano_tx,
+        );
         let crdp_sigs = vec![sign_with("//Alice", &crdp), sign_with("//Bob", &crdp)];
         assert_ok!(IntentSettlement::credit_deposit(
             RuntimeOrigin::signed(alice),
@@ -858,7 +934,7 @@ fn task210_submit_batch_intents_atomic_revert_real_runtime() {
                 strike: 1,
                 term_slots: 86_400,
                 premium_ada: premium,
-                beneficiary_cardano_addr: BoundedVec::try_from(vec![0xB1; 57]).unwrap(),
+                beneficiary_cardano_addr: BoundedVec::try_from(type0_addr_bytes(0xB1)).unwrap(),
             },
         };
         let entries = vec![
@@ -915,7 +991,8 @@ fn task211_attest_batch_intents_real_runtime_atomic_revert() {
         let bogus = H256::from([0xFFu8; 32]);
         let mut with_bogus = vec![iids[0], bogus, iids[1]];
 
-        let payload = crate::attest_batch_intents_payload(&with_bogus);
+        let payload =
+            crate::attest_batch_intents_payload(&TEST_CHAIN_ID, &with_bogus);
         let alice_sig = sign_with("//Alice", &payload);
         let bob_sig = sign_with("//Bob", &payload);
         let bv: BoundedVec<IntentId, MaxAttestBatch> =
@@ -960,7 +1037,12 @@ fn task212_request_batch_vouchers_real_runtime_happy_path() {
         let cardano_tx = [0xCC; 32];
         let mut target_bytes = [0u8; 32];
         target_bytes.copy_from_slice(&user.encode()[..32]);
-        let crdp = credit_deposit_payload(&target_bytes, amount * 4, &cardano_tx);
+        let crdp = credit_deposit_payload(
+            &TEST_CHAIN_ID,
+            &target_bytes,
+            amount * 4,
+            &cardano_tx,
+        );
         let crdp_sigs = vec![sign_with("//Alice", &crdp), sign_with("//Bob", &crdp)];
         assert_ok!(IntentSettlement::credit_deposit(
             RuntimeOrigin::signed(alice.clone()),
@@ -977,7 +1059,7 @@ fn task212_request_batch_vouchers_real_runtime_happy_path() {
                 strike: 1,
                 term_slots: 86_400,
                 premium_ada: amount,
-                beneficiary_cardano_addr: BoundedVec::try_from(vec![0xB1; 57]).unwrap(),
+                beneficiary_cardano_addr: BoundedVec::try_from(type0_addr_bytes(0xB1)).unwrap(),
             };
             let mut sb = [0u8; 32];
             sb.copy_from_slice(&user.encode()[..32]);
@@ -1032,7 +1114,7 @@ fn task212_request_batch_vouchers_real_runtime_happy_path() {
                 let voucher = Voucher {
                     claim_id,
                     policy_id: H256::from([0x99; 32]),
-                    beneficiary_cardano_addr: BoundedVec::try_from(vec![0xB1; 57]).unwrap(),
+                    beneficiary_cardano_addr: BoundedVec::try_from(type0_addr_bytes(0xB1)).unwrap(),
                     amount_ada: amount,
                     batch_fairness_proof_digest: bfpr_d,
                     issued_block: System::block_number() as u32,
@@ -1058,11 +1140,12 @@ fn task212_request_batch_vouchers_real_runtime_happy_path() {
             .iter()
             .map(|e| {
                 let bd = compute_fairness_proof_digest(&e.fairness_proof);
-                let vd = compute_voucher_digest(&e.voucher);
+                let vd = integration_voucher_digest(&e.voucher);
                 (e.claim_id, e.intent_id, vd, bd)
             })
             .collect();
-        let payload = crate::request_batch_vouchers_payload(&tuples);
+        let payload =
+            crate::request_batch_vouchers_payload(&TEST_CHAIN_ID, &tuples);
         let alice_sig = sign_with("//Alice", &payload);
         let bob_sig = sign_with("//Bob", &payload);
 
@@ -1096,6 +1179,7 @@ fn task210_submit_batch_intents_happy_path_real_runtime() {
         // Pre-credit user with enough headroom for 5 BuyPolicy premiums.
         let cardano_tx = [0xCC; 32];
         let crdp = credit_deposit_payload(
+            &TEST_CHAIN_ID,
             &{
                 let mut t = [0u8; 32];
                 t.copy_from_slice(&user.encode()[..32]);
@@ -1120,7 +1204,7 @@ fn task210_submit_batch_intents_happy_path_real_runtime() {
                     strike: 1,
                     term_slots: 86_400,
                     premium_ada: 1_000,
-                    beneficiary_cardano_addr: BoundedVec::try_from(vec![0xB1; 57]).unwrap(),
+                    beneficiary_cardano_addr: BoundedVec::try_from(type0_addr_bytes(0xB1)).unwrap(),
                 },
             })
             .collect();

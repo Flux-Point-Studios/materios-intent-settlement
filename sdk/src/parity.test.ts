@@ -54,8 +54,9 @@ describe("voucher_digest_with_address three-way parity", () => {
 
   it("has the voucher_digest_with_address vector present", () => {
     expect(v).toBeDefined();
+    // #73: regenerated for the chain-identity-bound pre-image.
     expect(v.expected_hex).toBe(
-      "ae73d78970eb486376fb9d5e4d00cba0a5b2a2200c935d942cc258b12a7f8405",
+      "554898acdfc6f4d38ce9ea854cd64762d6c0eb81c391fcd85ea20f9e3a99b23d",
     );
   });
 
@@ -80,6 +81,11 @@ describe("voucher_digest_with_address three-way parity", () => {
       batchFairnessProofDigest: ("0x" + v.bfpr_digest_hex) as HexString,
       issuedBlock: v.issued_block,
       expirySlotCardano: BigInt(v.expiry_slot_cardano),
+      materiosChainId: ("0x" + v.materios_chain_id_hex) as HexString,
+      networkMagic: v.network_magic,
+      aegisPolicyV1ScriptHash:
+        ("0x" + v.aegis_policy_v1_script_hash_hex) as HexString,
+      settlementVersion: v.settlement_version,
     });
     expect(digest).toBe(("0x" + v.expected_hex) as HexString);
   });

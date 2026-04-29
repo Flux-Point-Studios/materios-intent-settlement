@@ -35,7 +35,16 @@
     "expected_hex": "8c59bcf52eabf6db9d5ccd382aa7cbdb67b6a6acee1551b7724a9ddf6872d813"
   },
   "voucher_digest_with_address": {
-    "_description": "THREE-WAY CROSS-CHAIN ANCHOR for voucher bodies that include a serialised Cardano Address. The beneficiary_address_cbor_hex below is what Aiken's `builtin.serialise_data(Address)` produces in Plutus V3 for the given bech32 address. Rust must reproduce this via `pallas_codec::plutus_data::PlutusData::encode_cbor(&address_data)` with the same indefinite-length constr CBOR shape; TS must reproduce it via Lucid's `Data.to(address, Address)` encoder. If any encoder produces a different `beneficiary_address_cbor_hex`, every BatchClaimVoucher / RefundCredit / RefundDeposit tx will silently reject on-chain.",
+    "_description": "THREE-WAY CROSS-CHAIN ANCHOR for voucher bodies that include a serialised Cardano Address AND the chain-identity fields from #73. The beneficiary_address_cbor_hex below is what Aiken's `builtin.serialise_data(Address)` produces in Plutus V3 for the given bech32 address. Rust must reproduce this via `pallas_codec::plutus_data::PlutusData::encode_cbor(&address_data)` with the same indefinite-length constr CBOR shape; TS must reproduce it via Lucid's `Data.to(address, Address)` encoder. If any encoder produces a different `beneficiary_address_cbor_hex`, every BatchClaimVoucher / RefundCredit / RefundDeposit tx will silently reject on-chain.",
+    "_chain_identity_note": "#73: chain-identity prefix is now bound INTO the voucher digest pre-image. A bundle signed with one (chain_id, network_magic, script_hash, settlement_version) tuple is structurally invalid against any other tuple — preprod can't replay onto mainnet, pre/post Aiken redeploy domain-separates, etc.",
+    "materios_chain_id_hex": "7373737373737373737373737373737373737373737373737373737373737373",
+    "_materios_chain_id_note": "Test fixture chain id (32 × 0x73). Production runtime plumbs `frame_system::BlockHash::<T>::get(0u32)`.",
+    "network_magic": 1,
+    "_network_magic_note": "Cardano preprod = 1. Encoded LE u32: 01000000.",
+    "aegis_policy_v1_script_hash_hex": "42424242424242424242424242424242424242424242424242424242",
+    "_aegis_policy_v1_script_hash_note": "Test fixture (28 × 0x42). Production value is the deployed `aegis_policy_v1` blake2b224 hash.",
+    "settlement_version": 1,
+    "_settlement_version_note": "Bumped on any breaking pre-image change. Encoded LE u32: 01000000.",
     "_address_bech32": "addr1qx2h3pcsp6l9lxc0nujfdrczrmmstvju024xxvjcu2ywptslud3z94x5tgw8p0aefdjm8wxwrt0j49y384nuxgsjd9xq89stdk",
     "_address_shape": "CIP-0019 type-0 (payment VK + stake VK inline)",
     "payment_vk_hash_hex": "957887100ebe5f9b0f9f24968f021ef705b25c7aaa633258e288e0ae",
@@ -53,9 +62,9 @@
     "_expiry_slot_note": "Encoded as u64 little-endian: 9f86010000000000.",
     "fee_lovelace": 500000,
     "_fee_lovelace_note": "Not in the canonical voucher pre-image (fee is a separate keeper-fee redeemer field). Included here for Team A/C builder reference only.",
-    "_canonical_body_layout": "claim_id(32B) || policy_id(32B) || beneficiary_address_cbor(80B) || amount_ada_u64_le(8B) || bfpr_digest(32B) || issued_block_u32_le(4B) || expiry_slot_cardano_u64_le(8B) = 196B total",
-    "expected_hex": "ae73d78970eb486376fb9d5e4d00cba0a5b2a2200c935d942cc258b12a7f8405",
-    "_expected_hex_note": "blake2b_256(tag_voucher ++ canonical_body) = blake2b_256(b\"VCHR\" ++ body). Aiken pinned source-of-truth: test_vectors.ak::vec_pinned_vchr_with_address."
+    "_canonical_body_layout": "materios_chain_id(32B) || network_magic_u32_le(4B) || aegis_policy_v1_script_hash(28B) || settlement_version_u32_le(4B) || claim_id(32B) || policy_id(32B) || beneficiary_address_cbor(80B) || amount_ada_u64_le(8B) || bfpr_digest(32B) || issued_block_u32_le(4B) || expiry_slot_cardano_u64_le(8B) = 264B total (was 196B pre-#73).",
+    "expected_hex": "554898acdfc6f4d38ce9ea854cd64762d6c0eb81c391fcd85ea20f9e3a99b23d",
+    "_expected_hex_note": "blake2b_256(tag_voucher ++ canonical_body) = blake2b_256(b\"VCHR\" ++ body). Aiken pinned source-of-truth: test_vectors.ak::vec_pinned_vchr_with_address (regenerate alongside #73 chain-id binding)."
   },
   "teamA_realistic_vectors": {
     "_note": "Realistic test cases Team A's pallet uses \u2014 same Blake2b-256 primitive, different (more substantive) pre-image bodies. All 6 vectors reproduce byte-for-byte via hashlib.blake2b(digest_size=32).",

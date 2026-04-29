@@ -23,6 +23,10 @@ import type { HexString } from "./types.js";
 // a real sr25519 keypair so the verifier can round-trip the bundle.
 await cryptoWaitReady();
 
+// #73: chain-identity fixture pinned across the SDK + Rust pallet test
+// suite. 32 × 0x73. Production runtimes plumb the actual genesis hash.
+const TEST_CHAIN_ID = ("0x" + "73".repeat(32)) as HexString;
+
 // ---------------------------------------------------------------------------
 // Domain-tag sanity (matches pallet constants TAG_CRDP / TAG_STCL).
 // ---------------------------------------------------------------------------
@@ -57,21 +61,19 @@ describe("multisig domain tags", () => {
 // Payload parity tests.
 //
 // Expected hex digests below were computed from the canonical Rust payload
-// builders (`pallets/intent-settlement/src/lib.rs::credit_deposit_payload` /
-// `settle_claim_payload`) using the same sp_core::hashing::blake2_256 that
-// pallet uses at runtime. See PR description for the generator program and
-// the companion fixture added to `pallets/intent-settlement/src/tests.rs`.
+// builders with chain_id = 32×0x73 (#73). See `tests.rs::FIXTURE_*_HEX`.
 // ---------------------------------------------------------------------------
 
 describe("creditDepositPayload — Rust parity", () => {
   it("matches Rust fixture A (all-0x07 target, amount=1000, all-0x01 tx)", () => {
     const digest = creditDepositPayload({
+      materiosChainId: TEST_CHAIN_ID,
       depositor: ("0x" + "07".repeat(32)) as HexString,
       amountAda: 1_000n,
       cardanoTxHash: ("0x" + "01".repeat(32)) as HexString,
     });
     expect(u8aToHex(digest)).toBe(
-      "0xd61b0438a19adc712cd0d01b4fee1174f5a8eb5df931918dac9ae0e2f32d51db",
+      "0x80ca7ca008d0fe64f934c66fc079ecc9f1ef09bc4a217d183e68f2f9792030b4",
     );
   });
 
@@ -84,17 +86,19 @@ describe("creditDepositPayload — Rust parity", () => {
     for (let i = 0; i < 32; i++) tx_b[i] = (((i ^ 0xab) + 1) & 0xff) as number;
 
     const digest = creditDepositPayload({
+      materiosChainId: TEST_CHAIN_ID,
       depositor: u8aToHex(target_b) as HexString,
       amountAda: 2_000_000n,
       cardanoTxHash: u8aToHex(tx_b) as HexString,
     });
     expect(u8aToHex(digest)).toBe(
-      "0x56e006017231f0f62d48ed5739446e31fbfaab94ad3e68117ca57393b3db8c4f",
+      "0xf569b8ae2bcd6b03bfbb48b7c936573c50ac3825c328ef7bc3edf5eece6b691c",
     );
   });
 
   it("returns a 32-byte digest", () => {
     const digest = creditDepositPayload({
+      materiosChainId: TEST_CHAIN_ID,
       depositor: ("0x" + "00".repeat(32)) as HexString,
       amountAda: 0n,
       cardanoTxHash: ("0x" + "00".repeat(32)) as HexString,
@@ -104,11 +108,13 @@ describe("creditDepositPayload — Rust parity", () => {
 
   it("is sensitive to amount (u64 LE encoding)", () => {
     const a = creditDepositPayload({
+      materiosChainId: TEST_CHAIN_ID,
       depositor: ("0x" + "07".repeat(32)) as HexString,
       amountAda: 1_000n,
       cardanoTxHash: ("0x" + "01".repeat(32)) as HexString,
     });
     const b = creditDepositPayload({
+      materiosChainId: TEST_CHAIN_ID,
       depositor: ("0x" + "07".repeat(32)) as HexString,
       amountAda: 1_001n,
       cardanoTxHash: ("0x" + "01".repeat(32)) as HexString,
@@ -116,9 +122,26 @@ describe("creditDepositPayload — Rust parity", () => {
     expect(u8aToHex(a)).not.toBe(u8aToHex(b));
   });
 
+  it("#73: is sensitive to materiosChainId — preprod vs mainnet", () => {
+    const onPreprod = creditDepositPayload({
+      materiosChainId: TEST_CHAIN_ID,
+      depositor: ("0x" + "07".repeat(32)) as HexString,
+      amountAda: 1_000n,
+      cardanoTxHash: ("0x" + "01".repeat(32)) as HexString,
+    });
+    const onMainnet = creditDepositPayload({
+      materiosChainId: ("0x" + "99".repeat(32)) as HexString,
+      depositor: ("0x" + "07".repeat(32)) as HexString,
+      amountAda: 1_000n,
+      cardanoTxHash: ("0x" + "01".repeat(32)) as HexString,
+    });
+    expect(u8aToHex(onPreprod)).not.toBe(u8aToHex(onMainnet));
+  });
+
   it("rejects non-32-byte depositor", () => {
     expect(() =>
       creditDepositPayload({
+        materiosChainId: TEST_CHAIN_ID,
         depositor: ("0x" + "07".repeat(16)) as HexString,
         amountAda: 1n,
         cardanoTxHash: ("0x" + "01".repeat(32)) as HexString,
@@ -129,9 +152,21 @@ describe("creditDepositPayload — Rust parity", () => {
   it("rejects non-32-byte cardanoTxHash", () => {
     expect(() =>
       creditDepositPayload({
+        materiosChainId: TEST_CHAIN_ID,
         depositor: ("0x" + "07".repeat(32)) as HexString,
         amountAda: 1n,
         cardanoTxHash: ("0x" + "01".repeat(16)) as HexString,
+      }),
+    ).toThrow();
+  });
+
+  it("rejects non-32-byte materiosChainId (#73)", () => {
+    expect(() =>
+      creditDepositPayload({
+        materiosChainId: ("0x" + "07".repeat(16)) as HexString,
+        depositor: ("0x" + "07".repeat(32)) as HexString,
+        amountAda: 1n,
+        cardanoTxHash: ("0x" + "01".repeat(32)) as HexString,
       }),
     ).toThrow();
   });
@@ -140,23 +175,25 @@ describe("creditDepositPayload — Rust parity", () => {
 describe("settleClaimPayload — Rust parity", () => {
   it("matches Rust fixture C (all-0x07 claim, all-0x01 tx, direct=false)", () => {
     const digest = settleClaimPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "07".repeat(32)) as HexString,
       cardanoTxHash: ("0x" + "01".repeat(32)) as HexString,
       settledDirect: false,
     });
     expect(u8aToHex(digest)).toBe(
-      "0x59be22f98eb07437195ca49bda86e1ff6ba495c8d19a0ac11d207e20d2dff285",
+      "0xb0a3133f8e2508ea0c3ed8f78d9444c55cc88c1593a984ecfadc90906a1d0b6f",
     );
   });
 
   it("matches Rust fixture D (same inputs but direct=true — must differ)", () => {
     const digest = settleClaimPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "07".repeat(32)) as HexString,
       cardanoTxHash: ("0x" + "01".repeat(32)) as HexString,
       settledDirect: true,
     });
     expect(u8aToHex(digest)).toBe(
-      "0xae3761839a7a605a75d9643427e2b768436316e2cdda877e9f4c508ec6374b08",
+      "0x211464d3b3e199c5caea322a7959e565929a45fdcb5e44ff99403e350c88f584",
     );
   });
 
@@ -169,26 +206,29 @@ describe("settleClaimPayload — Rust parity", () => {
     for (let i = 0; i < 32; i++) tx_e[i] = (((i ^ 0xcc) + 1) & 0xff) as number;
 
     const falseDigest = settleClaimPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: u8aToHex(claim_e) as HexString,
       cardanoTxHash: u8aToHex(tx_e) as HexString,
       settledDirect: false,
     });
     const trueDigest = settleClaimPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: u8aToHex(claim_e) as HexString,
       cardanoTxHash: u8aToHex(tx_e) as HexString,
       settledDirect: true,
     });
 
     expect(u8aToHex(falseDigest)).toBe(
-      "0x7493705c88435cdf3faf46b1f5031281b777c6320ec3b71375ca06bb5b427e4a",
+      "0xfcb8b391f750b12693b119e5b4a54800fa1ef84ccf8914a7fc18169e7bb7b088",
     );
     expect(u8aToHex(trueDigest)).toBe(
-      "0x94b4d41f29528f1b00cf3de7df4f5bd22f27521d769f04547bb69f3b459862d6",
+      "0xe77d47efed4f6529b1556d7406d38fd97e541ee744296da11521776ef382afbd",
     );
   });
 
   it("returns a 32-byte digest", () => {
     const digest = settleClaimPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "00".repeat(32)) as HexString,
       cardanoTxHash: ("0x" + "00".repeat(32)) as HexString,
       settledDirect: false,
@@ -200,11 +240,13 @@ describe("settleClaimPayload — Rust parity", () => {
     // Same 32B bytes as "claim" vs "depositor" — digests must still differ
     // because of the 4-byte domain tag at the front.
     const sd = settleClaimPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "42".repeat(32)) as HexString,
       cardanoTxHash: ("0x" + "99".repeat(32)) as HexString,
       settledDirect: false,
     });
     const cd = creditDepositPayload({
+      materiosChainId: TEST_CHAIN_ID,
       depositor: ("0x" + "42".repeat(32)) as HexString,
       amountAda: 0n, // zero body tail won't salvage equal digests
       cardanoTxHash: ("0x" + "99".repeat(32)) as HexString,
@@ -229,6 +271,7 @@ describe("signPayload", () => {
 
   it("signatures verify against the signer's pubkey + payload", () => {
     const payload = settleClaimPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "aa".repeat(32)) as HexString,
       cardanoTxHash: ("0x" + "bb".repeat(32)) as HexString,
       settledDirect: false,
@@ -268,6 +311,7 @@ describe("signPayload", () => {
 describe("buildSigBundle", () => {
   const samplePayload = (): Uint8Array =>
     settleClaimPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "aa".repeat(32)) as HexString,
       cardanoTxHash: ("0x" + "bb".repeat(32)) as HexString,
       settledDirect: false,
@@ -362,6 +406,7 @@ describe("buildSigBundle", () => {
 
   it("round-trips with the real creditDepositPayload shape", () => {
     const payload = creditDepositPayload({
+      materiosChainId: TEST_CHAIN_ID,
       depositor: ("0x" + "07".repeat(32)) as HexString,
       amountAda: 5_000_000n,
       cardanoTxHash: ("0x" + "01".repeat(32)) as HexString,
@@ -380,29 +425,27 @@ describe("buildSigBundle", () => {
 // ---------------------------------------------------------------------------
 // Task #174 — `requestVoucherPayload` parity with Rust + helper sanity.
 //
-// The Rust counterpart is `request_voucher_payload(claim_id, intent_id,
-// voucher_digest, bfpr_digest)` in `pallets/intent-settlement/src/lib.rs`.
 // Fixture F's expected hex is pinned in
-// `pallets/intent-settlement/src/tests.rs::TASK_174_FIXTURE_F_HEX` and
-// matches the value asserted below — any drift fails loudly in both Rust
-// and TS CI.
+// `pallets/intent-settlement/src/tests.rs::FIXTURE_RVCH_F_HEX`.
 // ---------------------------------------------------------------------------
 
 describe("requestVoucherPayload — Rust parity (Task #174)", () => {
   it("matches Rust fixture F (claim=0x07.., intent=0x11.., voucher_digest=0x22.., bfpr_digest=0x33..)", () => {
     const digest = requestVoucherPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "07".repeat(32)) as HexString,
       intentId: ("0x" + "11".repeat(32)) as HexString,
       voucherDigest: ("0x" + "22".repeat(32)) as HexString,
       bfprDigest: ("0x" + "33".repeat(32)) as HexString,
     });
     expect(u8aToHex(digest)).toBe(
-      "0xb3a165c261b9a5b76ec4d22779d0ae2fb56ef0bd8f3da3fcb48a40f1e8b1fdd4",
+      "0x61d097786f93582b10784bec0d9f3d3136f65d11e54648226e0df53ec13e5e7d",
     );
   });
 
   it("returns a 32-byte digest", () => {
     const digest = requestVoucherPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "00".repeat(32)) as HexString,
       intentId: ("0x" + "00".repeat(32)) as HexString,
       voucherDigest: ("0x" + "00".repeat(32)) as HexString,
@@ -413,12 +456,14 @@ describe("requestVoucherPayload — Rust parity (Task #174)", () => {
 
   it("is sensitive to claimId", () => {
     const a = requestVoucherPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "07".repeat(32)) as HexString,
       intentId: ("0x" + "11".repeat(32)) as HexString,
       voucherDigest: ("0x" + "22".repeat(32)) as HexString,
       bfprDigest: ("0x" + "33".repeat(32)) as HexString,
     });
     const b = requestVoucherPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "08".repeat(32)) as HexString, // <- single byte flip
       intentId: ("0x" + "11".repeat(32)) as HexString,
       voucherDigest: ("0x" + "22".repeat(32)) as HexString,
@@ -433,12 +478,14 @@ describe("requestVoucherPayload — Rust parity (Task #174)", () => {
     // a sig for the swapped pair. The pallet's pre-image is positional, so
     // the SDK helper must mirror that sensitivity.
     const a = requestVoucherPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "07".repeat(32)) as HexString,
       intentId: ("0x" + "11".repeat(32)) as HexString,
       voucherDigest: ("0x" + "22".repeat(32)) as HexString,
       bfprDigest: ("0x" + "33".repeat(32)) as HexString,
     });
     const swapped = requestVoucherPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "07".repeat(32)) as HexString,
       intentId: ("0x" + "11".repeat(32)) as HexString,
       voucherDigest: ("0x" + "33".repeat(32)) as HexString, // <- swapped
@@ -451,17 +498,20 @@ describe("requestVoucherPayload — Rust parity (Task #174)", () => {
     // Same 32B chunks fed to all three should still produce three distinct
     // digests because of the 4-byte domain tag prefix.
     const rv = requestVoucherPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "42".repeat(32)) as HexString,
       intentId: ("0x" + "42".repeat(32)) as HexString,
       voucherDigest: ("0x" + "42".repeat(32)) as HexString,
       bfprDigest: ("0x" + "42".repeat(32)) as HexString,
     });
     const sd = settleClaimPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "42".repeat(32)) as HexString,
       cardanoTxHash: ("0x" + "42".repeat(32)) as HexString,
       settledDirect: false,
     });
     const cd = creditDepositPayload({
+      materiosChainId: TEST_CHAIN_ID,
       depositor: ("0x" + "42".repeat(32)) as HexString,
       amountAda: 0n,
       cardanoTxHash: ("0x" + "42".repeat(32)) as HexString,
@@ -476,6 +526,7 @@ describe("requestVoucherPayload — Rust parity (Task #174)", () => {
     const short16 = ("0x" + "07".repeat(16)) as HexString;
     expect(() =>
       requestVoucherPayload({
+        materiosChainId: TEST_CHAIN_ID,
         claimId: short16,
         intentId: ok32,
         voucherDigest: ok32,
@@ -484,6 +535,7 @@ describe("requestVoucherPayload — Rust parity (Task #174)", () => {
     ).toThrow();
     expect(() =>
       requestVoucherPayload({
+        materiosChainId: TEST_CHAIN_ID,
         claimId: ok32,
         intentId: short16,
         voucherDigest: ok32,
@@ -492,6 +544,7 @@ describe("requestVoucherPayload — Rust parity (Task #174)", () => {
     ).toThrow();
     expect(() =>
       requestVoucherPayload({
+        materiosChainId: TEST_CHAIN_ID,
         claimId: ok32,
         intentId: ok32,
         voucherDigest: short16,
@@ -500,6 +553,7 @@ describe("requestVoucherPayload — Rust parity (Task #174)", () => {
     ).toThrow();
     expect(() =>
       requestVoucherPayload({
+        materiosChainId: TEST_CHAIN_ID,
         claimId: ok32,
         intentId: ok32,
         voucherDigest: ok32,
@@ -511,11 +565,8 @@ describe("requestVoucherPayload — Rust parity (Task #174)", () => {
 
 describe("requestVoucherPayload + buildSigBundle round-trip (Task #174)", () => {
   it("each sig in the bundle verifies under the request_voucher digest", () => {
-    // T10 from the brief: the SDK helper that constructs the sig envelope
-    // must produce the SAME bytes as a hand-rolled blake2b + sr25519 — and
-    // those bytes must verify back. This is the regression test that
-    // catches helper drift before any chain submit is attempted.
     const payload = requestVoucherPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "aa".repeat(32)) as HexString,
       intentId: ("0x" + "bb".repeat(32)) as HexString,
       voucherDigest: ("0x" + "cc".repeat(32)) as HexString,
@@ -533,11 +584,8 @@ describe("requestVoucherPayload + buildSigBundle round-trip (Task #174)", () => 
   });
 
   it("hand-rolled signature over the same digest matches the helper bundle entry", () => {
-    // Belt-and-braces: signPayload (low-level) and buildSigBundle (caller-
-    // first ordering) must agree on what //Alice signs over the request_-
-    // voucher digest. If they ever drift, this fails before bundle hits
-    // the chain.
     const payload = requestVoucherPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "01".repeat(32)) as HexString,
       intentId: ("0x" + "02".repeat(32)) as HexString,
       voucherDigest: ("0x" + "03".repeat(32)) as HexString,
@@ -550,10 +598,6 @@ describe("requestVoucherPayload + buildSigBundle round-trip (Task #174)", () => 
       payload,
     });
     expect(u8aToHex(bundle[0]!.pubkey)).toBe(u8aToHex(handRolled.pubkey));
-    // sr25519 sigs are randomized per call (Schnorrkel adds nonce entropy)
-    // so we can't byte-compare. But both sigs must verify under the same
-    // pubkey + payload — that's the cross-check that protects against
-    // helper-vs-low-level drift.
     expect(sr25519Verify(payload, bundle[0]!.sig, bundle[0]!.pubkey)).toBe(true);
     expect(sr25519Verify(payload, handRolled.sig, handRolled.pubkey)).toBe(true);
   });
@@ -566,6 +610,7 @@ describe("requestVoucherPayload + buildSigBundle round-trip (Task #174)", () => 
 describe("attestBatchIntentsPayload — Rust parity (Task #211)", () => {
   it("matches Rust fixture H (3 intent_ids 0x07*32 / 0x11*32 / 0x22*32)", () => {
     const digest = attestBatchIntentsPayload({
+      materiosChainId: TEST_CHAIN_ID,
       intentIds: [
         ("0x" + "07".repeat(32)) as HexString,
         ("0x" + "11".repeat(32)) as HexString,
@@ -573,12 +618,13 @@ describe("attestBatchIntentsPayload — Rust parity (Task #211)", () => {
       ],
     });
     expect(u8aToHex(digest)).toBe(
-      "0x13d4c95e1e392553a6b6462eb0f5a24244007ec2410242b6de8297097a17b613",
+      "0x357d464882c4cc9e8af6c41dcd10f52ba689c1e3a1b7b6424297abea573d47dc",
     );
   });
 
   it("returns a 32-byte digest and is sensitive to ordering", () => {
     const a = attestBatchIntentsPayload({
+      materiosChainId: TEST_CHAIN_ID,
       intentIds: [
         ("0x" + "07".repeat(32)) as HexString,
         ("0x" + "11".repeat(32)) as HexString,
@@ -586,6 +632,7 @@ describe("attestBatchIntentsPayload — Rust parity (Task #211)", () => {
     });
     expect(a.length).toBe(32);
     const reversed = attestBatchIntentsPayload({
+      materiosChainId: TEST_CHAIN_ID,
       intentIds: [
         ("0x" + "11".repeat(32)) as HexString,
         ("0x" + "07".repeat(32)) as HexString,
@@ -595,9 +642,13 @@ describe("attestBatchIntentsPayload — Rust parity (Task #211)", () => {
   });
 
   it("includes N prefix — empty batch hashes to a deterministic non-zero digest", () => {
-    const empty = attestBatchIntentsPayload({ intentIds: [] });
+    const empty = attestBatchIntentsPayload({
+      materiosChainId: TEST_CHAIN_ID,
+      intentIds: [],
+    });
     expect(empty.length).toBe(32);
     const one = attestBatchIntentsPayload({
+      materiosChainId: TEST_CHAIN_ID,
       intentIds: [("0x" + "07".repeat(32)) as HexString],
     });
     expect(u8aToHex(empty)).not.toBe(u8aToHex(one));
@@ -606,6 +657,7 @@ describe("attestBatchIntentsPayload — Rust parity (Task #211)", () => {
   it("rejects non-32-byte intent_ids", () => {
     expect(() =>
       attestBatchIntentsPayload({
+        materiosChainId: TEST_CHAIN_ID,
         intentIds: [("0x" + "07".repeat(16)) as HexString],
       }),
     ).toThrow();
@@ -613,9 +665,11 @@ describe("attestBatchIntentsPayload — Rust parity (Task #211)", () => {
 
   it("domain-separated from settleClaimPayload (STCL)", () => {
     const ab = attestBatchIntentsPayload({
+      materiosChainId: TEST_CHAIN_ID,
       intentIds: [("0x" + "42".repeat(32)) as HexString],
     });
     const sc = settleClaimPayload({
+      materiosChainId: TEST_CHAIN_ID,
       claimId: ("0x" + "42".repeat(32)) as HexString,
       cardanoTxHash: ("0x" + "00".repeat(32)) as HexString,
       settledDirect: false,
@@ -631,6 +685,7 @@ describe("attestBatchIntentsPayload — Rust parity (Task #211)", () => {
 describe("requestBatchVouchersPayload — Rust parity (Task #212)", () => {
   it("matches Rust fixture I (2 entries with structured tuple bytes)", () => {
     const digest = requestBatchVouchersPayload({
+      materiosChainId: TEST_CHAIN_ID,
       entries: [
         {
           claimId: ("0x" + "07".repeat(32)) as HexString,
@@ -647,12 +702,13 @@ describe("requestBatchVouchersPayload — Rust parity (Task #212)", () => {
       ],
     });
     expect(u8aToHex(digest)).toBe(
-      "0xf82d8e395614d905f0a12f78adf5e6562f6493247327bcbac42f5aeba3f34873",
+      "0x363ba6b0c2d91cc0b7c01dd8c35a3505b619d5ea7eff3c9479b3a4ff4e3aa2ab",
     );
   });
 
   it("returns 32 bytes and is sensitive to ordering", () => {
     const a = requestBatchVouchersPayload({
+      materiosChainId: TEST_CHAIN_ID,
       entries: [
         {
           claimId: ("0x" + "07".repeat(32)) as HexString,
@@ -670,6 +726,7 @@ describe("requestBatchVouchersPayload — Rust parity (Task #212)", () => {
     });
     expect(a.length).toBe(32);
     const reversed = requestBatchVouchersPayload({
+      materiosChainId: TEST_CHAIN_ID,
       entries: [
         {
           claimId: ("0x" + "44".repeat(32)) as HexString,
@@ -691,6 +748,7 @@ describe("requestBatchVouchersPayload — Rust parity (Task #212)", () => {
   it("rejects non-32-byte entry fields", () => {
     expect(() =>
       requestBatchVouchersPayload({
+        materiosChainId: TEST_CHAIN_ID,
         entries: [
           {
             claimId: ("0x" + "07".repeat(16)) as HexString, // SHORT
@@ -712,8 +770,14 @@ describe("requestBatchVouchersPayload — Rust parity (Task #212)", () => {
       voucherDigest: ("0x" + "33".repeat(32)) as HexString,
       bfprDigest: ("0x" + "44".repeat(32)) as HexString,
     };
-    const rvch = requestVoucherPayload(single);
-    const rvbn = requestBatchVouchersPayload({ entries: [single] });
+    const rvch = requestVoucherPayload({
+      materiosChainId: TEST_CHAIN_ID,
+      ...single,
+    });
+    const rvbn = requestBatchVouchersPayload({
+      materiosChainId: TEST_CHAIN_ID,
+      entries: [single],
+    });
     expect(u8aToHex(rvch)).not.toBe(u8aToHex(rvbn));
   });
 });
@@ -726,6 +790,7 @@ describe("submitBatchIntentsPayload — Rust parity (Task #210)", () => {
   it("matches Rust fixture G (3 RequestPayout entries, ascending policy ids)", () => {
     const evidence = new Uint8Array(4);
     const digest = submitBatchIntentsPayload({
+      materiosChainId: TEST_CHAIN_ID,
       entries: [
         {
           kind: {
@@ -751,13 +816,14 @@ describe("submitBatchIntentsPayload — Rust parity (Task #210)", () => {
       ],
     });
     expect(u8aToHex(digest)).toBe(
-      "0xa6644ed7143c4460cb5d0b1fab0fd1de6badee4e663b1a6d11d1c223404afb0a",
+      "0x5e5a531a065e50077dcccb1f8ad03ba5f070be8235417a0291d138f72b3deaa8",
     );
   });
 
   it("returns a 32-byte digest and is sensitive to entry ordering", () => {
     const ev = new Uint8Array(4);
     const a = submitBatchIntentsPayload({
+      materiosChainId: TEST_CHAIN_ID,
       entries: [
         {
           kind: {
@@ -777,6 +843,7 @@ describe("submitBatchIntentsPayload — Rust parity (Task #210)", () => {
     });
     expect(a.length).toBe(32);
     const reversed = submitBatchIntentsPayload({
+      materiosChainId: TEST_CHAIN_ID,
       entries: [
         {
           kind: {
@@ -798,9 +865,13 @@ describe("submitBatchIntentsPayload — Rust parity (Task #210)", () => {
   });
 
   it("includes N prefix — empty batch hashes to a deterministic non-zero digest", () => {
-    const empty = submitBatchIntentsPayload({ entries: [] });
+    const empty = submitBatchIntentsPayload({
+      materiosChainId: TEST_CHAIN_ID,
+      entries: [],
+    });
     expect(empty.length).toBe(32);
     const one = submitBatchIntentsPayload({
+      materiosChainId: TEST_CHAIN_ID,
       entries: [
         {
           kind: {
