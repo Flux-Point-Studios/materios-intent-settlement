@@ -59,6 +59,20 @@ parameter_types! {
     pub const MaxVoucherBatch: u32 = 256;
     /// Task #210: test-runtime bound on `submit_batch_intents` size.
     pub const MaxSubmitBatch: u32 = 256;
+    /// Task #73: test fixture for the chain-identity prefix. Distinct from
+    /// zero so unit tests fail loudly if a runtime forgets to plumb the
+    /// chain_id into a pre-image helper.
+    pub const TestMateriosChainId: H256 = H256([0x73u8; 32]);
+    /// Task #73: preprod-shaped network magic (not real-cardano-1, just a
+    /// stable test marker).
+    pub const TestNetworkMagic: u32 = 1u32;
+    /// Task #73: 28-byte placeholder script-hash for the deployed Aiken
+    /// `aegis_policy_v1`. Distinct from zero so unit tests catch a runtime
+    /// that forgets to wire the constant.
+    pub const TestAegisPolicyV1ScriptHash: [u8; 28] = [0x42u8; 28];
+    /// Task #73: settlement-protocol version 1 (initial; bumps coordinated
+    /// across pallet + SDK + Aiken validator).
+    pub const TestSettlementVersion: u32 = 1u32;
 }
 
 /// Issue #4 helper: our tests use `u64` AccountIds. Derive a synthetic
@@ -161,6 +175,10 @@ impl pallet_intent_settlement::pallet::Config for Test {
     type MaxAttestBatch = MaxAttestBatch;
     type MaxVoucherBatch = MaxVoucherBatch;
     type MaxSubmitBatch = MaxSubmitBatch;
+    type MateriosChainId = TestMateriosChainId;
+    type NetworkMagic = TestNetworkMagic;
+    type AegisPolicyV1ScriptHash = TestAegisPolicyV1ScriptHash;
+    type SettlementVersion = TestSettlementVersion;
 }
 
 pub const ALICE: u64 = 100;
@@ -194,12 +212,20 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
 }
 
 fn bp(id: u8, strike: u64, premium: u64) -> IntentKind {
+    // #79: type-0 address shape (header 0x01 + 28-byte payment + 28-byte
+    // stake) so vouchers minted from this BuyPolicy can be canonicalised
+    // by the new CBOR-bound digest helper.
+    let mut addr = vec![0u8; 57];
+    addr[0] = 0x01;
+    for byte in addr.iter_mut().skip(1) {
+        *byte = 0xA1;
+    }
     IntentKind::BuyPolicy {
         product_id: H256::from([id; 32]),
         strike,
         term_slots: 86_400,
         premium_ada: premium,
-        beneficiary_cardano_addr: BoundedVec::try_from(vec![0xA1u8; 57]).unwrap(),
+        beneficiary_cardano_addr: BoundedVec::try_from(addr).unwrap(),
     }
 }
 
@@ -476,10 +502,18 @@ fn good_voucher(
     bfpr: &BatchFairnessProof,
     amount: u64,
 ) -> Voucher {
+    // #79: beneficiary_cardano_addr MUST be a CIP-0019 type-0 address now
+    // (header 0x01 + 28-byte payment + 28-byte stake) since the canonical
+    // voucher digest derives the Plutus V3 Data CBOR from these halves.
+    let mut addr = vec![0u8; 57];
+    addr[0] = 0x01;
+    for byte in addr.iter_mut().skip(1) {
+        *byte = 0xB1;
+    }
     Voucher {
         claim_id,
         policy_id: H256::from([9u8; 32]),
-        beneficiary_cardano_addr: BoundedVec::try_from(vec![0xB1u8; 57]).unwrap(),
+        beneficiary_cardano_addr: BoundedVec::try_from(addr).unwrap(),
         amount_ada: amount,
         batch_fairness_proof_digest: compute_fairness_proof_digest(bfpr),
         issued_block: 2,
@@ -1765,12 +1799,30 @@ fn test_set_min_signer_threshold_root_only() {
 // Sanity: the canonical payload hashers are deterministic + domain-separated.
 #[test]
 fn test_multisig_payload_hashers_domain_separated() {
-    let a = credit_deposit_payload(&[7u8; 32], 1_000, &[1u8; 32]);
-    let b = credit_deposit_payload(&[7u8; 32], 1_000, &[1u8; 32]);
-    let c = settle_claim_payload(&H256::from([7u8; 32]), &[1u8; 32], false);
+    let a = credit_deposit_payload(&TEST_CHAIN_ID, &[7u8; 32], 1_000, &[1u8; 32]);
+    let b = credit_deposit_payload(&TEST_CHAIN_ID, &[7u8; 32], 1_000, &[1u8; 32]);
+    let c = settle_claim_payload(
+        &TEST_CHAIN_ID,
+        &H256::from([7u8; 32]),
+        &[1u8; 32],
+        false,
+    );
     assert_eq!(a, b);
     assert_ne!(a, c);
+
+    // #73: a different chain-id MUST produce a different digest, otherwise the
+    // chain-identity binding is broken and a preprod bundle could replay on
+    // mainnet.
+    let other_chain_id = [0x99u8; 32];
+    let a_other =
+        credit_deposit_payload(&other_chain_id, &[7u8; 32], 1_000, &[1u8; 32]);
+    assert_ne!(a, a_other, "chain-id MUST domain-separate the digest");
 }
+
+/// Task #73: 32-byte chain-identity fixture used by every parity test in this
+/// suite. Distinct from zero so a runtime that fails to plumb the chain-id
+/// constant fails LOUDLY.
+pub const TEST_CHAIN_ID: [u8; 32] = [0x73u8; 32];
 
 // ---------------------------------------------------------------------------
 // Cross-layer parity fixtures for the multisig payload hashers.
@@ -1799,13 +1851,14 @@ fn hex_32(h: [u8; 32]) -> String {
 #[test]
 fn test_credit_deposit_payload_parity_fixture_a() {
     // Fixture A — matches SDK test "creditDepositPayload matches Rust fixture A".
+    // Pinned chain_id = TEST_CHAIN_ID (32 × 0x73). #73.
     let target = [0x07u8; 32];
     let amount: u64 = 1_000;
     let tx = [0x01u8; 32];
-    let digest = credit_deposit_payload(&target, amount, &tx);
+    let digest = credit_deposit_payload(&TEST_CHAIN_ID, &target, amount, &tx);
     assert_eq!(
         hex_32(digest),
-        "d61b0438a19adc712cd0d01b4fee1174f5a8eb5df931918dac9ae0e2f32d51db",
+        FIXTURE_CRDP_A_HEX,
         "CRDP fixture A digest drifted — regenerate SDK fixtures too"
     );
 }
@@ -1814,6 +1867,7 @@ fn test_credit_deposit_payload_parity_fixture_a() {
 fn test_credit_deposit_payload_parity_fixture_b() {
     // Fixture B — structured target/tx, 2M lovelace. Matches SDK test
     // "creditDepositPayload matches Rust fixture B".
+    // Pinned chain_id = TEST_CHAIN_ID (32 × 0x73). #73.
     let mut target = [0u8; 32];
     for i in 0..32 {
         target[i] = (i as u8).wrapping_mul(7).wrapping_add(3);
@@ -1823,10 +1877,10 @@ fn test_credit_deposit_payload_parity_fixture_b() {
     for i in 0..32 {
         tx[i] = ((i as u8) ^ 0xAB).wrapping_add(1);
     }
-    let digest = credit_deposit_payload(&target, amount, &tx);
+    let digest = credit_deposit_payload(&TEST_CHAIN_ID, &target, amount, &tx);
     assert_eq!(
         hex_32(digest),
-        "56e006017231f0f62d48ed5739446e31fbfaab94ad3e68117ca57393b3db8c4f",
+        FIXTURE_CRDP_B_HEX,
         "CRDP fixture B digest drifted — regenerate SDK fixtures too"
     );
 }
@@ -1836,18 +1890,19 @@ fn test_settle_claim_payload_parity_fixture_c_and_d() {
     // Fixture C/D — same inputs, both booleans, to pin the settled_direct
     // byte in the pre-image. Matches SDK tests
     // "settleClaimPayload matches Rust fixture C/D".
+    // Pinned chain_id = TEST_CHAIN_ID (32 × 0x73). #73.
     let claim = H256::from([0x07u8; 32]);
     let tx = [0x01u8; 32];
-    let digest_false = settle_claim_payload(&claim, &tx, false);
-    let digest_true = settle_claim_payload(&claim, &tx, true);
+    let digest_false = settle_claim_payload(&TEST_CHAIN_ID, &claim, &tx, false);
+    let digest_true = settle_claim_payload(&TEST_CHAIN_ID, &claim, &tx, true);
     assert_eq!(
         hex_32(digest_false),
-        "59be22f98eb07437195ca49bda86e1ff6ba495c8d19a0ac11d207e20d2dff285",
+        FIXTURE_STCL_C_HEX,
         "STCL fixture C (direct=false) digest drifted"
     );
     assert_eq!(
         hex_32(digest_true),
-        "ae3761839a7a605a75d9643427e2b768436316e2cdda877e9f4c508ec6374b08",
+        FIXTURE_STCL_D_HEX,
         "STCL fixture D (direct=true) digest drifted"
     );
     assert_ne!(digest_false, digest_true);
@@ -1857,6 +1912,7 @@ fn test_settle_claim_payload_parity_fixture_c_and_d() {
 fn test_settle_claim_payload_parity_fixture_e() {
     // Fixture E — structured claim/tx, both direct flags. Matches SDK test
     // "settleClaimPayload matches Rust fixture E".
+    // Pinned chain_id = TEST_CHAIN_ID (32 × 0x73). #73.
     let mut claim_bytes = [0u8; 32];
     for i in 0..32 {
         claim_bytes[i] = ((i as u8).wrapping_mul(5)) ^ 0x5A;
@@ -1866,19 +1922,36 @@ fn test_settle_claim_payload_parity_fixture_e() {
     for i in 0..32 {
         tx[i] = ((i as u8) ^ 0xCC).wrapping_add(1);
     }
-    let digest_false = settle_claim_payload(&claim, &tx, false);
-    let digest_true = settle_claim_payload(&claim, &tx, true);
+    let digest_false = settle_claim_payload(&TEST_CHAIN_ID, &claim, &tx, false);
+    let digest_true = settle_claim_payload(&TEST_CHAIN_ID, &claim, &tx, true);
     assert_eq!(
         hex_32(digest_false),
-        "7493705c88435cdf3faf46b1f5031281b777c6320ec3b71375ca06bb5b427e4a",
+        FIXTURE_STCL_E_FALSE_HEX,
         "STCL fixture E (direct=false) digest drifted"
     );
     assert_eq!(
         hex_32(digest_true),
-        "94b4d41f29528f1b00cf3de7df4f5bd22f27521d769f04547bb69f3b459862d6",
+        FIXTURE_STCL_E_TRUE_HEX,
         "STCL fixture E (direct=true) digest drifted"
     );
 }
+
+// #73 fixture hex constants (regenerated for the chain-id-bound pre-image
+// with chain_id = 32×0x73). The TS SDK's multisig.test.ts pins identical
+// strings; any drift here MUST be mirrored across both files to keep the
+// cross-layer parity guarantee.
+const FIXTURE_CRDP_A_HEX: &str =
+    "80ca7ca008d0fe64f934c66fc079ecc9f1ef09bc4a217d183e68f2f9792030b4";
+const FIXTURE_CRDP_B_HEX: &str =
+    "f569b8ae2bcd6b03bfbb48b7c936573c50ac3825c328ef7bc3edf5eece6b691c";
+const FIXTURE_STCL_C_HEX: &str =
+    "b0a3133f8e2508ea0c3ed8f78d9444c55cc88c1593a984ecfadc90906a1d0b6f";
+const FIXTURE_STCL_D_HEX: &str =
+    "211464d3b3e199c5caea322a7959e565929a45fdcb5e44ff99403e350c88f584";
+const FIXTURE_STCL_E_FALSE_HEX: &str =
+    "fcb8b391f750b12693b119e5b4a54800fa1ef84ccf8914a7fc18169e7bb7b088";
+const FIXTURE_STCL_E_TRUE_HEX: &str =
+    "e77d47efed4f6529b1556d7406d38fd97e541ee744296da11521776ef382afbd";
 
 // ---------------------------------------------------------------------------
 // Test vectors against docs/test-vectors.json
@@ -2003,7 +2076,10 @@ fn stba_sigs_for(entries: &[SettleBatchEntry]) -> Vec<(CommitteePubkey, Committe
     // MockSigVerifier is marker-byte-based, so the actual payload doesn't
     // affect verification; but we still build the digest so the production
     // path (settle_batch_atomic_payload) is exercised.
-    let _ = pallet_intent_settlement::settle_batch_atomic_payload(entries);
+    let _ = pallet_intent_settlement::settle_batch_atomic_payload(
+        &TEST_CHAIN_ID,
+        entries,
+    );
     vec![mock_sig_for(1), mock_sig_for(2)]
 }
 
@@ -2059,7 +2135,10 @@ fn batch_atomic_happy_path_settles_all_and_emits_one_event() {
         assert_eq!(count, 3);
         assert_eq!(direct, 1);
         let expected_digest =
-            pallet_intent_settlement::settle_batch_atomic_payload(&entries);
+            pallet_intent_settlement::settle_batch_atomic_payload(
+                &TEST_CHAIN_ID,
+                &entries,
+            );
         assert_eq!(digest, expected_digest);
     });
 }
@@ -2228,9 +2307,15 @@ fn batch_atomic_signature_must_match_batch_digest_not_per_entry() {
         // Compute the canonical pre-image and confirm it differs from the
         // per-entry STCL payloads (the old single-call path). This is a
         // pure-function assertion that doesn't touch the chain.
-        let batch_digest = pallet_intent_settlement::settle_batch_atomic_payload(&entries);
+        let batch_digest = pallet_intent_settlement::settle_batch_atomic_payload(
+            &TEST_CHAIN_ID,
+            &entries,
+        );
         let stcl_for_c1 = pallet_intent_settlement::settle_claim_payload(
-            &entries[0].claim_id, &entries[0].cardano_tx_hash, entries[0].settled_direct
+            &TEST_CHAIN_ID,
+            &entries[0].claim_id,
+            &entries[0].cardano_tx_hash,
+            entries[0].settled_direct,
         );
         assert_ne!(batch_digest, stcl_for_c1,
             "STBA must domain-separate from STCL — otherwise a per-claim \
@@ -2239,7 +2324,10 @@ fn batch_atomic_signature_must_match_batch_digest_not_per_entry() {
         let mut wrong_entries = entries.clone();
         wrong_entries[0].cardano_tx_hash = [42u8; 32];
         let wrong_digest =
-            pallet_intent_settlement::settle_batch_atomic_payload(&wrong_entries);
+            pallet_intent_settlement::settle_batch_atomic_payload(
+                &TEST_CHAIN_ID,
+                &wrong_entries,
+            );
         assert_ne!(batch_digest, wrong_digest);
     });
 }
@@ -2329,13 +2417,22 @@ fn batch_atomic_payload_hash_pure_function_no_operator_state() {
             settled_direct: true,
         },
     ];
-    let d1 = pallet_intent_settlement::settle_batch_atomic_payload(&entries);
-    let d2 = pallet_intent_settlement::settle_batch_atomic_payload(&entries);
+    let d1 = pallet_intent_settlement::settle_batch_atomic_payload(
+        &TEST_CHAIN_ID,
+        &entries,
+    );
+    let d2 = pallet_intent_settlement::settle_batch_atomic_payload(
+        &TEST_CHAIN_ID,
+        &entries,
+    );
     assert_eq!(d1, d2);
     // Order matters (different ordering = different digest).
     let mut reversed = entries.clone();
     reversed.reverse();
-    let d3 = pallet_intent_settlement::settle_batch_atomic_payload(&reversed);
+    let d3 = pallet_intent_settlement::settle_batch_atomic_payload(
+        &TEST_CHAIN_ID,
+        &reversed,
+    );
     assert_ne!(d1, d3);
 }
 
@@ -2396,9 +2493,49 @@ fn voucher_setup() -> (IntentId, ClaimId, BatchFairnessProof, Voucher, [u8; 32])
     let claim_id = H256::from([0x42u8; 32]);
     let bfpr = good_fairness_proof(iid, 1_000_000);
     let voucher = good_voucher(claim_id, &bfpr, 1_000_000);
-    let voucher_digest = crate::types::compute_voucher_digest(&voucher);
+    // #79: voucher_digest is now the chain-identity-bound CBOR form; the
+    // legacy SCALE form is gone. Build a type-0 address from `good_voucher`'s
+    // 57-byte placeholder (0xB1 fill) and reuse the test-runtime constants.
     let bfpr_digest = crate::types::compute_fairness_proof_digest(&bfpr);
-    let payload = request_voucher_payload(&claim_id, &iid, &voucher_digest, &bfpr_digest);
+    let raw_addr: [u8; 57] = {
+        let mut a = [0u8; 57];
+        a[0] = 0x01;
+        for byte in a.iter_mut().skip(1) {
+            *byte = 0xB1;
+        }
+        a
+    };
+    let (payment, stake) =
+        crate::voucher_canonicalize::split_type0_address_bytes(&raw_addr).unwrap();
+    let cbor = crate::voucher_canonicalize::build_type0_address_cbor(
+        crate::voucher_canonicalize::Type0AddressHashes {
+            payment_hash: &payment,
+            stake_hash: &stake,
+        },
+    );
+    let aegis_script = TestAegisPolicyV1ScriptHash::get();
+    let voucher_digest = crate::voucher_canonicalize::compute_voucher_digest_with_address(
+        crate::voucher_canonicalize::ChainIdentity {
+            materios_chain_id: &TEST_CHAIN_ID,
+            network_magic: TestNetworkMagic::get(),
+            aegis_policy_script_hash: &aegis_script,
+            settlement_version: TestSettlementVersion::get(),
+        },
+        &voucher.claim_id,
+        &voucher.policy_id,
+        &cbor,
+        voucher.amount_ada,
+        &voucher.batch_fairness_proof_digest,
+        voucher.issued_block,
+        voucher.expiry_slot_cardano,
+    );
+    let payload = request_voucher_payload(
+        &TEST_CHAIN_ID,
+        &claim_id,
+        &iid,
+        &voucher_digest,
+        &bfpr_digest,
+    );
     (iid, claim_id, bfpr, voucher, payload)
 }
 
@@ -2565,20 +2702,49 @@ fn test_request_voucher_payload_deterministic_and_domain_separated() {
     let intent_id = H256::from([0x11u8; 32]);
     let voucher_d = [0x22u8; 32];
     let bfpr_d = [0x33u8; 32];
-    let a = request_voucher_payload(&claim_id, &intent_id, &voucher_d, &bfpr_d);
-    let b = request_voucher_payload(&claim_id, &intent_id, &voucher_d, &bfpr_d);
+    let a = request_voucher_payload(
+        &TEST_CHAIN_ID,
+        &claim_id,
+        &intent_id,
+        &voucher_d,
+        &bfpr_d,
+    );
+    let b = request_voucher_payload(
+        &TEST_CHAIN_ID,
+        &claim_id,
+        &intent_id,
+        &voucher_d,
+        &bfpr_d,
+    );
     assert_eq!(a, b, "deterministic");
 
     // Domain separation: same body bytes but different tag → different digest.
-    let c = settle_claim_payload(&claim_id, &voucher_d, false);
+    let c = settle_claim_payload(&TEST_CHAIN_ID, &claim_id, &voucher_d, false);
     assert_ne!(a, c, "RVCH != STCL");
-    let d = credit_deposit_payload(&[0u8; 32], 0, &voucher_d);
+    let d = credit_deposit_payload(&TEST_CHAIN_ID, &[0u8; 32], 0, &voucher_d);
     assert_ne!(a, d, "RVCH != CRDP");
+
+    // #73: a different chain-id MUST produce a different digest.
+    let other_chain_id = [0x42u8; 32];
+    let f = request_voucher_payload(
+        &other_chain_id,
+        &claim_id,
+        &intent_id,
+        &voucher_d,
+        &bfpr_d,
+    );
+    assert_ne!(a, f, "chain-id MUST domain-separate the digest");
 
     // Field-position sensitivity: swapping voucher_digest <-> bfpr_digest
     // yields a different digest (so an attacker can't pre-compute one
     // sig that works for the swapped pair).
-    let e = request_voucher_payload(&claim_id, &intent_id, &bfpr_d, &voucher_d);
+    let e = request_voucher_payload(
+        &TEST_CHAIN_ID,
+        &claim_id,
+        &intent_id,
+        &bfpr_d,
+        &voucher_d,
+    );
     assert_ne!(a, e, "voucher_digest and bfpr_digest are not interchangeable");
 }
 
@@ -2591,7 +2757,13 @@ fn test_request_voucher_payload_parity_fixture_f() {
     let intent_id = H256::from([0x11u8; 32]);
     let voucher_d = [0x22u8; 32];
     let bfpr_d = [0x33u8; 32];
-    let digest = request_voucher_payload(&claim_id, &intent_id, &voucher_d, &bfpr_d);
+    let digest = request_voucher_payload(
+        &TEST_CHAIN_ID,
+        &claim_id,
+        &intent_id,
+        &voucher_d,
+        &bfpr_d,
+    );
     assert_eq!(
         hex_32(digest),
         TASK_174_FIXTURE_F_HEX,
@@ -2600,12 +2772,14 @@ fn test_request_voucher_payload_parity_fixture_f() {
 }
 
 /// Fixture F expected hex for `request_voucher_payload`. Generated by
-/// `sp_core::hashing::blake2_256(b"RVCH" || claim_id || intent_id ||
-///  voucher_digest || bfpr_digest)` with the constants in
-/// `test_request_voucher_payload_parity_fixture_f`. The SDK test pins the
-/// same hex so any drift in either implementation fails loudly in CI.
-const TASK_174_FIXTURE_F_HEX: &str =
-    "b3a165c261b9a5b76ec4d22779d0ae2fb56ef0bd8f3da3fcb48a40f1e8b1fdd4";
+/// `sp_core::hashing::blake2_256(b"RVCH" || materios_chain_id (32×0x73)
+///  || claim_id || intent_id || voucher_digest || bfpr_digest)` with the
+/// constants in `test_request_voucher_payload_parity_fixture_f`. The SDK
+/// test pins the same hex so any drift in either implementation fails
+/// loudly in CI.
+const TASK_174_FIXTURE_F_HEX: &str = FIXTURE_RVCH_F_HEX;
+const FIXTURE_RVCH_F_HEX: &str =
+    "61d097786f93582b10784bec0d9f3d3136f65d11e54648226e0df53ec13e5e7d";
 
 // ---------------------------------------------------------------------------
 // Task #211 — attest_batch_intents unit tests
@@ -2634,7 +2808,10 @@ fn submit_n_pending(n: u32) -> Vec<IntentId> {
 
 /// Build a 2-of-3 sig bundle for the ABIN payload over `intent_ids`.
 fn abin_sigs_for(intent_ids: &[IntentId]) -> Vec<(CommitteePubkey, CommitteeSig)> {
-    let _ = pallet_intent_settlement::attest_batch_intents_payload(intent_ids);
+    let _ = pallet_intent_settlement::attest_batch_intents_payload(
+        &TEST_CHAIN_ID,
+        intent_ids,
+    );
     vec![mock_sig_for(1), mock_sig_for(2)]
 }
 
@@ -2743,7 +2920,10 @@ fn attest_batch_happy_path_n_5_emits_per_intent_and_batch_events() {
         assert_eq!(*att, 5);
         assert_eq!(*sc, 2);
         let expected =
-            pallet_intent_settlement::attest_batch_intents_payload(&iids);
+            pallet_intent_settlement::attest_batch_intents_payload(
+                &TEST_CHAIN_ID,
+                &iids,
+            );
         assert_eq!(*digest, expected);
     });
 }
@@ -2832,8 +3012,10 @@ fn submit_batch_intents_happy_path_n_10() {
         assert_eq!(*submitter, ALICE);
         assert_eq!(*count, n);
         assert_eq!(*premium_total, 10_000);
-        let expected =
-            pallet_intent_settlement::submit_batch_intents_payload(&entries);
+        let expected = pallet_intent_settlement::submit_batch_intents_payload(
+            &TEST_CHAIN_ID,
+            &entries,
+        );
         assert_eq!(*digest, expected);
     });
 }
@@ -3112,16 +3294,23 @@ fn attest_batch_signature_must_match_batch_digest_not_per_entry() {
         H256::from([2u8; 32]),
         H256::from([3u8; 32]),
     ];
-    let batch_digest = pallet_intent_settlement::attest_batch_intents_payload(&iids);
+    let batch_digest = pallet_intent_settlement::attest_batch_intents_payload(
+        &TEST_CHAIN_ID,
+        &iids,
+    );
     // Compare to single-entry batch digest — must differ.
-    let single_digest =
-        pallet_intent_settlement::attest_batch_intents_payload(&iids[..1]);
+    let single_digest = pallet_intent_settlement::attest_batch_intents_payload(
+        &TEST_CHAIN_ID,
+        &iids[..1],
+    );
     assert_ne!(batch_digest, single_digest, "batch != single-entry batch");
     // Ordering matters.
     let mut reversed = iids.clone();
     reversed.reverse();
-    let reversed_digest =
-        pallet_intent_settlement::attest_batch_intents_payload(&reversed);
+    let reversed_digest = pallet_intent_settlement::attest_batch_intents_payload(
+        &TEST_CHAIN_ID,
+        &reversed,
+    );
     assert_ne!(batch_digest, reversed_digest);
 }
 
@@ -3272,8 +3461,14 @@ fn attest_batch_payload_deterministic_and_domain_separated() {
         H256::from([1u8; 32]),
         H256::from([2u8; 32]),
     ];
-    let a = pallet_intent_settlement::attest_batch_intents_payload(&iids);
-    let b = pallet_intent_settlement::attest_batch_intents_payload(&iids);
+    let a = pallet_intent_settlement::attest_batch_intents_payload(
+        &TEST_CHAIN_ID,
+        &iids,
+    );
+    let b = pallet_intent_settlement::attest_batch_intents_payload(
+        &TEST_CHAIN_ID,
+        &iids,
+    );
     assert_eq!(a, b, "deterministic");
     // Domain-separated from STBA. Build a single STBA entry with the same
     // 32-byte content and confirm tags drive the digest apart.
@@ -3282,7 +3477,10 @@ fn attest_batch_payload_deterministic_and_domain_separated() {
         cardano_tx_hash: [2u8; 32],
         settled_direct: false,
     }];
-    let stba = pallet_intent_settlement::settle_batch_atomic_payload(&stba_entries);
+    let stba = pallet_intent_settlement::settle_batch_atomic_payload(
+        &TEST_CHAIN_ID,
+        &stba_entries,
+    );
     assert_ne!(a, stba, "ABIN != STBA");
 }
 
@@ -3292,13 +3490,16 @@ fn attest_batch_payload_parity_fixture_h() {
     // `sdk/src/multisig.test.ts` ("attestBatchIntentsPayload matches Rust
     // fixture H"). If either side's pre-image format drifts, both fail.
     //
-    // Pinned input: 3 intent_ids 0x07*32 / 0x11*32 / 0x22*32.
+    // Pinned input: 3 intent_ids 0x07*32 / 0x11*32 / 0x22*32 + chain_id 0x73*32.
     let iids = vec![
         H256::from([0x07u8; 32]),
         H256::from([0x11u8; 32]),
         H256::from([0x22u8; 32]),
     ];
-    let digest = pallet_intent_settlement::attest_batch_intents_payload(&iids);
+    let digest = pallet_intent_settlement::attest_batch_intents_payload(
+        &TEST_CHAIN_ID,
+        &iids,
+    );
     assert_eq!(
         hex_32(digest),
         TASK_211_FIXTURE_H_HEX,
@@ -3306,8 +3507,9 @@ fn attest_batch_payload_parity_fixture_h() {
     );
 }
 
-const TASK_211_FIXTURE_H_HEX: &str =
-    "13d4c95e1e392553a6b6462eb0f5a24244007ec2410242b6de8297097a17b613";
+const TASK_211_FIXTURE_H_HEX: &str = FIXTURE_ABIN_H_HEX;
+const FIXTURE_ABIN_H_HEX: &str =
+    "357d464882c4cc9e8af6c41dcd10f52ba689c1e3a1b7b6424297abea573d47dc";
 
 // ---------------------------------------------------------------------------
 // Task #212 — request_batch_vouchers unit tests
@@ -3554,9 +3756,16 @@ fn request_batch_vouchers_signature_must_match_canonical_batch_digest() {
             [4u8; 32],
         ),
     ];
-    let rvbn = pallet_intent_settlement::request_batch_vouchers_payload(&entries);
+    let rvbn = pallet_intent_settlement::request_batch_vouchers_payload(
+        &TEST_CHAIN_ID,
+        &entries,
+    );
     let rvch = pallet_intent_settlement::request_voucher_payload(
-        &entries[0].0, &entries[0].1, &entries[0].2, &entries[0].3,
+        &TEST_CHAIN_ID,
+        &entries[0].0,
+        &entries[0].1,
+        &entries[0].2,
+        &entries[0].3,
     );
     assert_ne!(rvbn, rvch, "RVBN must domain-separate from RVCH");
 }
@@ -3605,12 +3814,21 @@ fn request_batch_vouchers_payload_deterministic_and_domain_separated() {
             [8u8; 32],
         ),
     ];
-    let a = pallet_intent_settlement::request_batch_vouchers_payload(&entries);
-    let b = pallet_intent_settlement::request_batch_vouchers_payload(&entries);
+    let a = pallet_intent_settlement::request_batch_vouchers_payload(
+        &TEST_CHAIN_ID,
+        &entries,
+    );
+    let b = pallet_intent_settlement::request_batch_vouchers_payload(
+        &TEST_CHAIN_ID,
+        &entries,
+    );
     assert_eq!(a, b, "deterministic");
     let mut reversed = entries.clone();
     reversed.reverse();
-    let c = pallet_intent_settlement::request_batch_vouchers_payload(&reversed);
+    let c = pallet_intent_settlement::request_batch_vouchers_payload(
+        &TEST_CHAIN_ID,
+        &reversed,
+    );
     assert_ne!(a, c, "order matters");
 }
 
@@ -3634,7 +3852,10 @@ fn request_batch_vouchers_payload_parity_fixture_i() {
             [0x77u8; 32],
         ),
     ];
-    let digest = pallet_intent_settlement::request_batch_vouchers_payload(&entries);
+    let digest = pallet_intent_settlement::request_batch_vouchers_payload(
+        &TEST_CHAIN_ID,
+        &entries,
+    );
     assert_eq!(
         hex_32(digest),
         TASK_212_FIXTURE_I_HEX,
@@ -3642,8 +3863,9 @@ fn request_batch_vouchers_payload_parity_fixture_i() {
     );
 }
 
-const TASK_212_FIXTURE_I_HEX: &str =
-    "f82d8e395614d905f0a12f78adf5e6562f6493247327bcbac42f5aeba3f34873";
+const TASK_212_FIXTURE_I_HEX: &str = FIXTURE_RVBN_I_HEX;
+const FIXTURE_RVBN_I_HEX: &str =
+    "363ba6b0c2d91cc0b7c01dd8c35a3505b619d5ea7eff3c9479b3a4ff4e3aa2ab";
 
 #[test]
 fn submit_batch_intents_payload_is_deterministic_and_domain_separated() {
@@ -3652,14 +3874,23 @@ fn submit_batch_intents_payload_is_deterministic_and_domain_separated() {
         rp_entry(0x02),
         bp_entry(0x03, 200),
     ];
-    let a = pallet_intent_settlement::submit_batch_intents_payload(&entries);
-    let b = pallet_intent_settlement::submit_batch_intents_payload(&entries);
+    let a = pallet_intent_settlement::submit_batch_intents_payload(
+        &TEST_CHAIN_ID,
+        &entries,
+    );
+    let b = pallet_intent_settlement::submit_batch_intents_payload(
+        &TEST_CHAIN_ID,
+        &entries,
+    );
     assert_eq!(a, b, "deterministic");
 
     // Reordering changes the digest.
     let mut reversed = entries.clone();
     reversed.reverse();
-    let c = pallet_intent_settlement::submit_batch_intents_payload(&reversed);
+    let c = pallet_intent_settlement::submit_batch_intents_payload(
+        &TEST_CHAIN_ID,
+        &reversed,
+    );
     assert_ne!(a, c, "order matters");
 
     // Domain-separated from STBA. Build a settle batch over 3 entries and
@@ -3672,7 +3903,10 @@ fn submit_batch_intents_payload_is_deterministic_and_domain_separated() {
             settled_direct: false,
         },
     ];
-    let stba = pallet_intent_settlement::settle_batch_atomic_payload(&stba_entries);
+    let stba = pallet_intent_settlement::settle_batch_atomic_payload(
+        &TEST_CHAIN_ID,
+        &stba_entries,
+    );
     assert_ne!(a, stba, "SBIN != STBA");
 }
 
@@ -3705,7 +3939,10 @@ fn submit_batch_intents_payload_parity_fixture_g() {
             },
         },
     ];
-    let digest = pallet_intent_settlement::submit_batch_intents_payload(&entries);
+    let digest = pallet_intent_settlement::submit_batch_intents_payload(
+        &TEST_CHAIN_ID,
+        &entries,
+    );
     assert_eq!(
         hex_32(digest),
         TASK_210_FIXTURE_G_HEX,
@@ -3714,12 +3951,13 @@ fn submit_batch_intents_payload_parity_fixture_g() {
 }
 
 /// Fixture G expected hex for `submit_batch_intents_payload`. Generated by
-/// `sp_core::hashing::blake2_256(b"SBIN" || u32_le(N) || N×scale(IntentKind))`
-/// with the entries pinned in `submit_batch_intents_payload_parity_fixture_g`.
-/// The SDK test pins the same hex so any drift in either implementation
-/// fails loudly in CI.
-const TASK_210_FIXTURE_G_HEX: &str =
-    "a6644ed7143c4460cb5d0b1fab0fd1de6badee4e663b1a6d11d1c223404afb0a";
+/// `sp_core::hashing::blake2_256(b"SBIN" || materios_chain_id (32×0x73)
+///  || u32_le(N) || N×scale(IntentKind))` with the entries pinned in
+/// `submit_batch_intents_payload_parity_fixture_g`. The SDK test pins the
+/// same hex so any drift in either implementation fails loudly in CI.
+const TASK_210_FIXTURE_G_HEX: &str = FIXTURE_SBIN_G_HEX;
+const FIXTURE_SBIN_G_HEX: &str =
+    "5e5a531a065e50077dcccb1f8ad03ba5f070be8235417a0291d138f72b3deaa8";
 
 // ---------------------------------------------------------------------------
 // Task #221 — pre-merge regression tests requested in PR #28 security review.
@@ -4110,6 +4348,12 @@ mod max_submit_batch_boundary {
         pub const MaxAttestBatch: u32 = 256;
         /// The boundary we're probing — production MAX_SUBMIT_BATCH = 256.
         pub const MaxSubmitBatch: u32 = 256;
+        pub const MaxVoucherBatch: u32 = 256;
+        // #73 chain-identity fixtures.
+        pub const TestMateriosChainId: H256 = H256([0x73u8; 32]);
+        pub const TestNetworkMagic: u32 = 1u32;
+        pub const TestAegisPolicyV1ScriptHash: [u8; 28] = [0x42u8; 28];
+        pub const TestSettlementVersion: u32 = 1u32;
     }
 
     fn pubkey_of(who: &u64) -> CommitteePubkey {
@@ -4161,6 +4405,11 @@ mod max_submit_batch_boundary {
         type MaxSettleBatch = MaxSettleBatch;
         type MaxAttestBatch = MaxAttestBatch;
         type MaxSubmitBatch = MaxSubmitBatch;
+        type MaxVoucherBatch = MaxVoucherBatch;
+        type MateriosChainId = TestMateriosChainId;
+        type NetworkMagic = TestNetworkMagic;
+        type AegisPolicyV1ScriptHash = TestAegisPolicyV1ScriptHash;
+        type SettlementVersion = TestSettlementVersion;
     }
 
     const ALICE: u64 = 100;

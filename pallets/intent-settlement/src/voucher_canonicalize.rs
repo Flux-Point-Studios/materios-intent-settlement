@@ -1,5 +1,5 @@
 //! Voucher canonicalization with Plutus V3 Data CBOR for the beneficiary
-//! address — the three-way cross-chain anchor.
+//! address — the three-way cross-chain anchor, with chain-identity binding.
 //!
 //! # Why this module exists
 //!
@@ -7,28 +7,22 @@
 //! `validators/aegis-policy-v1/lib/aegis/digests.ak::canonical_voucher_body`)
 //! computes the voucher body by **raw-concatenating** the Plutus V3 Data CBOR
 //! of the beneficiary `Address`, NOT by SCALE-encoding it with a
-//! compact-length prefix. The existing
-//! [`crate::types::compute_voucher_digest`] helper SCALE-encodes the address
-//! (`BoundedVec<u8>` uses compact-len + raw bytes), which produces a
-//! different pre-image and therefore a different Blake2b-256 output.
-//!
-//! Both are "valid" in isolation — but the Aiken validator is the Cardano
-//! source of truth for on-chain verification, so the pallet (Team A) and the
-//! TS SDK (Team C) MUST mirror Aiken's byte layout exactly. This module adds
-//! that second helper without breaking the first.
+//! compact-length prefix. A previous SCALE-encoded helper diverged from this
+//! and was deleted (#79); this module is now the SOLE canonical form for the
+//! voucher digest used by both the M-of-N committee gate and the Cardano
+//! validator.
 //!
 //! # Cross-team parity anchor
 //!
 //! The pinned reference vector is `voucher_digest_with_address` in
-//! `docs/test-vectors.json`:
+//! `docs/test-vectors.json`. The body layout is now (#73):
 //!
 //! ```text
-//! expected_hex = ae73d78970eb486376fb9d5e4d00cba0a5b2a2200c935d942cc258b12a7f8405
-//! ```
-//!
-//! Body layout (196 bytes, raw concat — no length prefixes):
-//!
-//! ```text
+//!   materios_chain_id               (32 bytes, blake2b genesis hash)
+//!   network_magic                   (u32 little-endian, 4 bytes)
+//!   aegis_policy_script_hash        (28 bytes, blake2b224 of the deployed
+//!                                    aegis-policy-v1 Aiken validator)
+//!   settlement_version              (u32 little-endian, 4 bytes)
 //!   claim_id                        (32 bytes)
 //!   policy_id                       (32 bytes)
 //!   beneficiary_address_cbor        (80 bytes for type-0 CIP-0019 addresses)
@@ -37,6 +31,11 @@
 //!   issued_block                    (u32 little-endian, 4 bytes)
 //!   expiry_slot_cardano             (u64 little-endian, 8 bytes)
 //! ```
+//!
+//! The four leading fields are CHAIN-IDENTITY anchors (#73): a signed bundle
+//! on preprod is structurally invalid on mainnet/testnet/post-reset because
+//! the genesis hash, Cardano network magic, deployed Aiken script hash, and
+//! settlement-protocol semver all differ.
 //!
 //! # CBOR encoding
 //!
@@ -182,17 +181,46 @@ pub fn split_type0_address_bytes(
     Ok((p, s))
 }
 
+/// Chain-identity bundle pinned into every voucher digest. Carries the four
+/// post-#73 fields that bind a signed voucher to a single Materios chain
+/// instance, a single Cardano network, a single Aiken policy deployment, and
+/// a single settlement-protocol version. None of these are operator-local —
+/// they're chain-spec constants seen identically by every honest committee
+/// member.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainIdentity<'a> {
+    /// 32-byte Materios genesis hash. Zero on mock/test runtimes that don't
+    /// have a real genesis hash; the production runtime plumbs the actual
+    /// `frame_system::BlockHash::<T>::get(0u32)` via `parameter_types!`.
+    pub materios_chain_id: &'a [u8; 32],
+    /// Cardano network magic: 1 for preprod, 764824073 for mainnet, etc.
+    /// Encoded LE u32 in the digest.
+    pub network_magic: u32,
+    /// Deployed `aegis_policy_v1` script hash (blake2b224 of the Aiken-
+    /// compiled UPLC). MUST match what's in `AegisPolicyParams.aegis_policy_v1_script_hash`
+    /// or the keeper's mirror digest will diverge.
+    pub aegis_policy_script_hash: &'a [u8; 28],
+    /// Settlement-protocol semver. Bumped on any breaking pre-image change so
+    /// pre-bump and post-bump bundles are domain-separated even if all other
+    /// fields collide.
+    pub settlement_version: u32,
+}
+
 /// Canonical voucher body that INCLUDES the beneficiary address as Plutus V3
-/// Data CBOR (rather than SCALE-length-prefixed raw bech32 bytes).
+/// Data CBOR (rather than SCALE-length-prefixed raw bech32 bytes) AND the four
+/// chain-identity fields from #73.
 ///
 /// This is the body the Aiken validator reconstructs in
 /// [`canonical_voucher_body`](https://github.com/Flux-Point-Studios/aegis-parametric-insurance-dev/blob/main/validators/aegis-policy-v1/lib/aegis/digests.ak).
 /// Byte-for-byte mirrors Aiken's output; do NOT change this function's
 /// layout without updating Aiken + TS SDK in lockstep.
 ///
-/// Returns the 196-byte canonical body (for type-0 addresses). Amount_ada is
-/// a `u64` LE; issued_block is a `u32` LE; expiry_slot is a `u64` LE.
+/// Body is `chain_identity (32+4+28+4 = 68B) || claim_id (32B) || policy_id (32B)
+/// || beneficiary_address_cbor (80B for type-0 addrs) || amount_ada (LE u64)
+/// || bfpr_digest (32B) || issued_block (LE u32) || expiry_slot (LE u64)` =
+/// 264 bytes for the typical type-0 address case.
 pub fn canonical_voucher_body_with_address(
+    chain_identity: ChainIdentity<'_>,
     claim_id: &ClaimId,
     policy_id: &PolicyId,
     beneficiary_address_cbor: &[u8],
@@ -201,8 +229,17 @@ pub fn canonical_voucher_body_with_address(
     issued_block: BlockNumber,
     expiry_slot_cardano: SlotNumber,
 ) -> Vec<u8> {
-    let mut body =
-        Vec::with_capacity(32 + 32 + beneficiary_address_cbor.len() + 8 + 32 + 4 + 8);
+    let mut body = Vec::with_capacity(
+        32 + 4 + 28 + 4 // chain identity
+        + 32 + 32 + beneficiary_address_cbor.len() + 8 + 32 + 4 + 8,
+    );
+    // Chain-identity prefix (#73). Order is fixed forever; bumping any field
+    // requires a settlement_version bump.
+    body.extend_from_slice(chain_identity.materios_chain_id);
+    body.extend_from_slice(&chain_identity.network_magic.to_le_bytes());
+    body.extend_from_slice(chain_identity.aegis_policy_script_hash);
+    body.extend_from_slice(&chain_identity.settlement_version.to_le_bytes());
+    // Voucher body proper.
     body.extend_from_slice(claim_id.as_bytes());
     body.extend_from_slice(policy_id.as_bytes());
     body.extend_from_slice(beneficiary_address_cbor);
@@ -215,6 +252,7 @@ pub fn canonical_voucher_body_with_address(
 
 /// Digest the canonical voucher-with-address body: `blake2b_256(TAG_VCHR || body)`.
 pub fn compute_voucher_digest_with_address(
+    chain_identity: ChainIdentity<'_>,
     claim_id: &ClaimId,
     policy_id: &PolicyId,
     beneficiary_address_cbor: &[u8],
@@ -224,6 +262,7 @@ pub fn compute_voucher_digest_with_address(
     expiry_slot_cardano: SlotNumber,
 ) -> [u8; 32] {
     let body = canonical_voucher_body_with_address(
+        chain_identity,
         claim_id,
         policy_id,
         beneficiary_address_cbor,
@@ -379,7 +418,15 @@ mod property_tests {
             payment_hash: &ADDR1_PAYMENT,
             stake_hash: &ADDR1_STAKE,
         });
+        let zero_chain_id = [0u8; 32];
+        let zero_script = [0u8; 28];
         let body = canonical_voucher_body_with_address(
+            ChainIdentity {
+                materios_chain_id: &zero_chain_id,
+                network_magic: 0,
+                aegis_policy_script_hash: &zero_script,
+                settlement_version: 0,
+            },
             &sp_core::H256::zero(),
             &sp_core::H256::zero(),
             &cbor,
@@ -388,7 +435,10 @@ mod property_tests {
             0,
             0,
         );
-        // 32 + 32 + 80 + 8 + 32 + 4 + 8 = 196
-        assert_eq!(body.len(), 196);
+        // 32 (chain_id) + 4 (network_magic) + 28 (script_hash) + 4 (settlement_version)
+        //   + 32 (claim_id) + 32 (policy_id) + 80 (beneficiary cbor)
+        //   + 8 (amount) + 32 (bfpr) + 4 (issued_block) + 8 (expiry)
+        // = 264
+        assert_eq!(body.len(), 264);
     }
 }

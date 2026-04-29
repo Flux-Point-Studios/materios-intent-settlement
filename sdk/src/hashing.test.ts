@@ -8,11 +8,17 @@ import {
   compactCompactLen,
   encodeIntentKind,
   intentId,
-  voucherDigest,
+  voucherDigestWithAddress,
   fairnessProofDigest,
   validateFairnessProof,
 } from "./hashing.js";
-import type { HexString, IntentKind, Voucher, BatchFairnessProof } from "./types.js";
+import type { HexString, IntentKind, BatchFairnessProof } from "./types.js";
+
+// #73: chain-identity test fixture pinned across SDK + pallet test suites.
+const TEST_CHAIN_ID = ("0x" + "73".repeat(32)) as HexString;
+const TEST_NETWORK_MAGIC = 1;
+const TEST_AEGIS_SCRIPT = ("0x" + "42".repeat(28)) as HexString;
+const TEST_SETTLEMENT_VERSION = 1;
 
 describe("domain hashing primitives", () => {
   it("domain tags are exactly 4 ASCII bytes", () => {
@@ -168,51 +174,97 @@ describe("intentId pre-image stability", () => {
   });
 });
 
-describe("voucherDigest", () => {
-  it("is 32 bytes and stable", () => {
-    const v: Voucher = {
-      claimId: ("0x" + "01".repeat(32)) as HexString,
-      policyId: ("0x" + "02".repeat(32)) as HexString,
-      beneficiaryCardanoAddr: new Uint8Array([0xde, 0xad]),
-      amountAda: 10_000_000n,
-      batchFairnessProofDigest: ("0x" + "03".repeat(32)) as HexString,
-      issuedBlock: 1234,
-      expirySlotCardano: 5_000_000n,
-      committeeSigs: [],
-    };
-    const d = voucherDigest(v);
+describe("voucherDigestWithAddress (#73 + #79)", () => {
+  // 80-byte stub CBOR — real Aiken-mirrored output is built via
+  // `encodeType0AddressCbor` (see parity.test.ts). For digest property tests
+  // any 80-byte buffer works.
+  const stubCbor = new Uint8Array(80);
+
+  const baseArgs = {
+    claimId: ("0x" + "01".repeat(32)) as HexString,
+    policyId: ("0x" + "02".repeat(32)) as HexString,
+    beneficiaryAddressCbor: stubCbor,
+    amountAda: 10_000_000n,
+    batchFairnessProofDigest: ("0x" + "03".repeat(32)) as HexString,
+    issuedBlock: 1234,
+    expirySlotCardano: 5_000_000n,
+    materiosChainId: TEST_CHAIN_ID,
+    networkMagic: TEST_NETWORK_MAGIC,
+    aegisPolicyV1ScriptHash: TEST_AEGIS_SCRIPT,
+    settlementVersion: TEST_SETTLEMENT_VERSION,
+  };
+
+  it("is 32 bytes hex (66 chars incl. 0x) and stable", () => {
+    const d = voucherDigestWithAddress(baseArgs);
     expect(d.length).toBe(66);
-    expect(voucherDigest(v)).toEqual(d);
+    expect(voucherDigestWithAddress(baseArgs)).toEqual(d);
   });
 
-  it("changes when beneficiary changes (prevents keeper redirection)", () => {
-    const base: Voucher = {
-      claimId: ("0x" + "01".repeat(32)) as HexString,
-      policyId: ("0x" + "02".repeat(32)) as HexString,
-      beneficiaryCardanoAddr: new Uint8Array([1, 2, 3]),
-      amountAda: 1n,
-      batchFairnessProofDigest: ("0x" + "03".repeat(32)) as HexString,
-      issuedBlock: 1,
-      expirySlotCardano: 1n,
-      committeeSigs: [],
-    };
-    const a = voucherDigest(base);
-    const b = voucherDigest({ ...base, beneficiaryCardanoAddr: new Uint8Array([9, 9, 9]) });
+  it("changes when beneficiary CBOR changes (prevents keeper redirection)", () => {
+    const a = voucherDigestWithAddress(baseArgs);
+    const otherCbor = new Uint8Array(80).fill(0x99);
+    const b = voucherDigestWithAddress({
+      ...baseArgs,
+      beneficiaryAddressCbor: otherCbor,
+    });
     expect(a).not.toEqual(b);
   });
 
-  it("rejects malformed input", () => {
-    const bad: Voucher = {
-      claimId: ("0x" + "01".repeat(16)) as HexString, // wrong length
-      policyId: ("0x" + "02".repeat(32)) as HexString,
-      beneficiaryCardanoAddr: new Uint8Array([]),
-      amountAda: 0n,
-      batchFairnessProofDigest: ("0x" + "03".repeat(32)) as HexString,
-      issuedBlock: 0,
-      expirySlotCardano: 0n,
-      committeeSigs: [],
-    };
-    expect(() => voucherDigest(bad)).toThrow();
+  it("#73: changes when materiosChainId changes (preprod vs mainnet)", () => {
+    const a = voucherDigestWithAddress(baseArgs);
+    const b = voucherDigestWithAddress({
+      ...baseArgs,
+      materiosChainId: ("0x" + "99".repeat(32)) as HexString,
+    });
+    expect(a).not.toEqual(b);
+  });
+
+  it("#73: changes when networkMagic changes (preprod=1 vs mainnet=764824073)", () => {
+    const a = voucherDigestWithAddress(baseArgs);
+    const b = voucherDigestWithAddress({ ...baseArgs, networkMagic: 764824073 });
+    expect(a).not.toEqual(b);
+  });
+
+  it("#73: changes when aegisPolicyV1ScriptHash changes (Aiken redeploy)", () => {
+    const a = voucherDigestWithAddress(baseArgs);
+    const b = voucherDigestWithAddress({
+      ...baseArgs,
+      aegisPolicyV1ScriptHash: ("0x" + "99".repeat(28)) as HexString,
+    });
+    expect(a).not.toEqual(b);
+  });
+
+  it("#73: changes when settlementVersion changes (semver bump)", () => {
+    const a = voucherDigestWithAddress(baseArgs);
+    const b = voucherDigestWithAddress({ ...baseArgs, settlementVersion: 2 });
+    expect(a).not.toEqual(b);
+  });
+
+  it("rejects malformed claimId", () => {
+    expect(() =>
+      voucherDigestWithAddress({
+        ...baseArgs,
+        claimId: ("0x" + "01".repeat(16)) as HexString,
+      }),
+    ).toThrow();
+  });
+
+  it("rejects malformed materiosChainId (not 32B)", () => {
+    expect(() =>
+      voucherDigestWithAddress({
+        ...baseArgs,
+        materiosChainId: ("0x" + "73".repeat(16)) as HexString,
+      }),
+    ).toThrow();
+  });
+
+  it("rejects malformed aegisPolicyV1ScriptHash (not 28B)", () => {
+    expect(() =>
+      voucherDigestWithAddress({
+        ...baseArgs,
+        aegisPolicyV1ScriptHash: ("0x" + "42".repeat(32)) as HexString, // 32 != 28
+      }),
+    ).toThrow();
   });
 });
 
