@@ -12,9 +12,9 @@ txs land, and believe the "it all works" claim without reading a line of code.
 
 A user on Materios submits an intent ("I want to buy a parametric-insurance policy"). The
 committee — 2-of-7 Materios validators holding dedicated ed25519 attestation keys —
-signs a voucher authorizing payout on Cardano preprod. A permissionless keeper picks up
-the vouchered batch from Materios, builds a Cardano tx that consumes pool-custody UTxOs
-and produces beneficiary payouts, and submits it. The Aiken validator (`aegis-policy-v1`)
+signs a voucher authorizing payout on Cardano preprod. A keeper (committee-operated in
+v0.1) picks up the vouchered batch from Materios, builds a Cardano tx that consumes
+pool-custody UTxOs and produces beneficiary payouts, and submits it. The Aiken validator (`aegis-policy-v1`)
 verifies M-of-N committee sigs over the Blake2b-256 domain-tagged pre-image and releases
 the funds. The keeper then calls `settle_claim` back on Materios, closing the loop. A
 parallel anchor worker writes the BatchFairnessProof digest to Cardano under metadata

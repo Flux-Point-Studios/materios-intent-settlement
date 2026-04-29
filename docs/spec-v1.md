@@ -21,7 +21,7 @@
 | **Committee** | The M-of-N set of Materios validator+attestor SS58 keys authorized to sign attestations. Currently 2-of-7, expansion to 5-of-11 in flight. |
 | **Intent** | A user's signed request ("I want coverage", "I want to claim", "refund my credit") stored in `pallet_intent_settlement::Intents`. |
 | **Voucher** | A committee-signed permission slip that authorizes the keeper to redeem one or more claims against Cardano pool UTxOs. |
-| **Keeper** | Permissionless off-chain actor. Polls Materios, builds Cardano txs, collects a fee. Anyone with ADA tx-building capacity can run one. |
+| **Keeper** | Off-chain relayer. Polls Materios, builds Cardano txs, collects a fee. **v0.1 trust model:** the keeper must hold a current committee key because `settle_claim` requires M-of-N committee threshold signatures, so the keeper role is in practice committee-operated. The Cardano-tx-builder portion of the role can be open to anyone, but the on-Materios settle-back step is committee-gated. A future release may split `settle_claim` into a permissionless `keeper_request_settle` + committee `attest_settle` to open the keeper role to non-committee operators (see §5.5 for the concrete plan). |
 | **Batch** | The set of intents a keeper bundles into one Cardano tx + its accompanying fairness proof. |
 | **MATRA** | Materios capital token, 6 decimals, bridges 1:1 to cMATRA on Cardano. Not used in Aegis v1 user flow (ADA-only). |
 | **MOTRA** | Non-transferable fee token, 15 decimals, auto-generated from MATRA holdings. All Materios extrinsics pay gas in MOTRA. |
@@ -709,13 +709,19 @@ keeper_fee_ada = min(
 )
 ```
 
-The validator verifies there's exactly one fee-output-to-any-address AND that its value ≤ `keeper_fee_ada`. Keepers are permissionless; there's no "registered keeper" storage — first to submit a valid tx wins the fee.
+The validator verifies there's exactly one fee-output-to-any-address AND that its value ≤ `keeper_fee_ada`. The Cardano-side fee-extraction has no whitelist — any address that produces a valid tx wins the fee on the Cardano leg.
 
 ### 5.5 Permissioning
 
-- Permissionless. Any entity with ADA for tx-building can run a keeper.
-- Committee doesn't know who the keeper is. No keeper whitelist on Materios OR Cardano.
-- Flux Point Studios operates a reference keeper (for liveness guarantee) but publishes the repo so third parties can spin up competing keepers. Competition drives fees down.
+**v0.1 reality (today):** the keeper role is **committee-operated**, not fully permissionless. To complete a settlement the keeper must call `settle_claim` on Materios with M-of-N committee threshold signatures, which means the operator must hold (or coordinate with) a current committee key. The Cardano-tx-building portion is open in principle (no whitelist on either chain), but the on-Materios settle-back step gates the role.
+
+- Today: Flux Point Studios operates the reference keeper as part of the committee. Repository is published so third parties can audit and contribute, but a non-committee operator cannot complete settlement end-to-end on v0.1.
+- Future release (planned, design pending): split `settle_claim(claim_id, cardano_tx_hash, signatures)` into two extrinsics:
+  - `keeper_request_settle(claim_id, cardano_tx_hash, voucher_id)` — signed by anyone, records that a Cardano payout has happened
+  - `committee_attest_settle(claim_id, signatures)` — committee M-of-N confirms the request matches a real Cardano payout, transitions to Settled
+  This split lets a non-committee keeper earn the Cardano-side fee, while keeping the on-Materios settlement gated by the committee. Tracked as task #81 (split + bond + slash) in the project security review; coupled to the on-chain Cardano-tx verification work in task #78.
+
+See `SECURITY.md` "Status" for the formal trust-model statement.
 
 ### 5.6 Failure modes + idempotency
 
