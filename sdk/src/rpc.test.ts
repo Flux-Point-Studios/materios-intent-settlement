@@ -90,7 +90,8 @@ describe("MateriosRpcClient", () => {
     const unsub = vi.fn();
     const ext = {
       hash: { toHex: () => "0x" + "ff".repeat(32) },
-      signAndSend: vi.fn().mockImplementation((_signer, cb) => {
+      // Task #77 changed signAndSend signature to (signer, {nonce}, cb).
+      signAndSend: vi.fn().mockImplementation((_signer, _opts, cb) => {
         // Simulate in-block callback
         setTimeout(
           () =>
@@ -108,11 +109,16 @@ describe("MateriosRpcClient", () => {
     };
     const api = {
       tx: { intentSettlement: { settleClaim: () => ext } },
+      rpc: {
+        system: {
+          accountNextIndex: vi.fn().mockResolvedValue({ toNumber: () => 7 }),
+        },
+      },
     };
     // @ts-expect-error
     client["api"] = api as any;
     // @ts-expect-error
-    client["signer"] = {} as any;
+    client["signer"] = { address: "5GrwvaEF" } as any;
     const res = await client.submitExtrinsic("intentSettlement", "settleClaim", [
       "0x" + "00".repeat(32),
       "0x" + "00".repeat(32),
@@ -120,6 +126,13 @@ describe("MateriosRpcClient", () => {
     ]);
     expect(res.txHash).toBe("0x" + "ff".repeat(32));
     expect(res.blockHash).toBe("0x" + "11".repeat(32));
+    // Task #77: nonce was passed explicitly to signAndSend.
+    expect(ext.signAndSend).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ nonce: 7 }),
+      expect.any(Function),
+    );
+    expect(api.rpc.system.accountNextIndex).toHaveBeenCalledWith("5GrwvaEF");
   });
 
   it("submitExtrinsic rejects on error result", async () => {
@@ -127,16 +140,23 @@ describe("MateriosRpcClient", () => {
     const unsub = vi.fn();
     const ext = {
       hash: { toHex: () => "0x" + "ff".repeat(32) },
-      signAndSend: vi.fn().mockImplementation((_signer, cb) => {
+      signAndSend: vi.fn().mockImplementation((_signer, _opts, cb) => {
         setTimeout(() => cb({ status: {}, isError: true }), 10);
         return Promise.resolve(unsub);
       }),
     };
-    const api = { tx: { intentSettlement: { settleClaim: () => ext } } };
+    const api = {
+      tx: { intentSettlement: { settleClaim: () => ext } },
+      rpc: {
+        system: {
+          accountNextIndex: vi.fn().mockResolvedValue({ toNumber: () => 0 }),
+        },
+      },
+    };
     // @ts-expect-error
     client["api"] = api as any;
     // @ts-expect-error
-    client["signer"] = {} as any;
+    client["signer"] = { address: "5GrwvaEF" } as any;
     await expect(
       client.submitExtrinsic("intentSettlement", "settleClaim", []),
     ).rejects.toThrow();
