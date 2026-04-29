@@ -125,6 +125,17 @@ pub fn mock_sig_for(member: u64) -> (CommitteePubkey, CommitteeSig) {
     (pk, sig)
 }
 
+/// Task #74 helper: produce a `CommitteeSig` that the `MockSigVerifier`
+/// accepts when paired with `mock_pubkey_of(&member)`. Used by every
+/// `attest_intent` test now that the per-call sig is runtime-verified
+/// against the canonical INTA pre-image.
+pub fn mock_attest_sig(member: u64) -> CommitteeSig {
+    let pk = mock_pubkey_of(&member);
+    let mut sig = [0u8; 64];
+    sig[0] = pk[0];
+    sig
+}
+
 /// Build a 2-of-3 signature envelope for `settle_claim` from members 1 and 2.
 pub fn mock_settle_sigs() -> Vec<(CommitteePubkey, CommitteeSig)> {
     vec![mock_sig_for(1), mock_sig_for(2)]
@@ -331,7 +342,7 @@ fn attest_intent_first_signer_keeps_pending() {
             RuntimeOrigin::signed(1),
             iid,
             mock_pubkey_of(&1),
-            [0u8; 64]
+            mock_attest_sig(1)
         ));
         let intent =
             pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
@@ -347,13 +358,13 @@ fn attest_intent_crosses_threshold_attests() {
             RuntimeOrigin::signed(1),
             iid,
             mock_pubkey_of(&1),
-            [0u8; 64]
+            mock_attest_sig(1)
         ));
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(2),
             iid,
             mock_pubkey_of(&2),
-            [0u8; 64]
+            mock_attest_sig(2)
         ));
         let intent =
             pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
@@ -373,7 +384,7 @@ fn attest_intent_rejects_non_member() {
                 RuntimeOrigin::signed(ALICE), // ALICE=100, not in {1,2,3}
                 iid,
                 mock_pubkey_of(&ALICE),
-                [0u8; 64]
+                mock_attest_sig(ALICE)
             ),
             pallet_intent_settlement::pallet::Error::<Test>::NotCommitteeMember
         );
@@ -381,32 +392,38 @@ fn attest_intent_rejects_non_member() {
 }
 
 #[test]
-fn attest_intent_duplicate_pubkey_is_noop() {
-    // Two members can no longer share a pubkey (Issue #4 binds pubkey to
-    // caller identity), so this test now exercises the dedup guard via the
-    // *same* member retrying: the bundle already has member 1's pubkey, the
-    // second call is ignored.
+fn attest_intent_duplicate_pubkey_is_hard_error() {
+    // Task #74 (sec-review): a duplicate pubkey is now a HARD error
+    // (`Error::DuplicatePubkey`) rather than a silent `Ok(())` no-op. Pre-fix
+    // a replay submission was absorbed by the pallet, leaving no on-chain
+    // signal that a member tried to double-sign. Now it fails the extrinsic
+    // so the failed-extrinsic counter and the operator's caller-rotation
+    // logic can see and react to replay attempts. Storage must remain at
+    // exactly 1 pending sig — atomic rollback via `with_storage_layer`.
     new_test_ext().execute_with(|| {
         let iid = submit_and_get_id(ALICE);
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(1),
             iid,
             mock_pubkey_of(&1),
-            [0u8; 64]
+            mock_attest_sig(1)
         ));
-        // Same member 1 retries — dedup by pubkey makes this a no-op.
-        assert_ok!(IntentSettlement::attest_intent(
-            RuntimeOrigin::signed(1),
-            iid,
-            mock_pubkey_of(&1),
-            [0u8; 64]
-        ));
+        // Same member 1 retries — duplicate pubkey is now rejected hard.
+        assert_noop!(
+            IntentSettlement::attest_intent(
+                RuntimeOrigin::signed(1),
+                iid,
+                mock_pubkey_of(&1),
+                mock_attest_sig(1)
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::DuplicatePubkey
+        );
         let intent =
             pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
         assert_eq!(intent.status, IntentStatus::Pending);
         let b =
             pallet_intent_settlement::pallet::PendingAttestations::<Test>::get(iid);
-        assert_eq!(b.len(), 1);
+        assert_eq!(b.len(), 1, "atomic rollback must keep bundle at 1 entry");
     });
 }
 
@@ -418,20 +435,20 @@ fn attest_intent_after_attested_is_idempotent() {
             RuntimeOrigin::signed(1),
             iid,
             mock_pubkey_of(&1),
-            [0u8; 64]
+            mock_attest_sig(1)
         ));
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(2),
             iid,
             mock_pubkey_of(&2),
-            [0u8; 64]
+            mock_attest_sig(2)
         ));
         // Third signer arrives late — pallet must treat as no-op.
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(3),
             iid,
             mock_pubkey_of(&3),
-            [0u8; 64]
+            mock_attest_sig(3)
         ));
         let intent =
             pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
@@ -449,13 +466,13 @@ fn attested_intent() -> IntentId {
         RuntimeOrigin::signed(1),
         iid,
         mock_pubkey_of(&1),
-        [0u8; 64]
+        mock_attest_sig(1)
     ));
     assert_ok!(IntentSettlement::attest_intent(
         RuntimeOrigin::signed(2),
         iid,
         mock_pubkey_of(&2),
-        [0u8; 64]
+        mock_attest_sig(2)
     ));
     iid
 }
@@ -672,13 +689,13 @@ fn request_voucher_rejects_duplicate_claim() {
             RuntimeOrigin::signed(1),
             iid2,
             mock_pubkey_of(&1),
-            [0u8; 64]
+            mock_attest_sig(1)
         ));
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(2),
             iid2,
             mock_pubkey_of(&2),
-            [0u8; 64]
+            mock_attest_sig(2)
         ));
         let bfpr2 = good_fairness_proof(iid2, 500_000);
         let voucher2 = good_voucher(claim_id, &bfpr2, 500_000);
@@ -1006,13 +1023,13 @@ fn runtime_api_get_pending_batches_since_block_filter_and_max_count() {
             RuntimeOrigin::signed(1),
             iid2,
             mock_pubkey_of(&1),
-            [0u8; 64]
+            mock_attest_sig(1)
         ));
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(2),
             iid2,
             mock_pubkey_of(&2),
-            [0u8; 64]
+            mock_attest_sig(2)
         ));
 
         // since_block = 3 filters out iid1 (block 1), keeps iid2 (block 5).
@@ -1069,7 +1086,7 @@ fn attest_intent_on_nonexistent_intent_errors() {
                 RuntimeOrigin::signed(1),
                 H256::from([0xAA; 32]),
                 mock_pubkey_of(&1),
-                [0u8; 64]
+                mock_attest_sig(1)
             ),
             pallet_intent_settlement::pallet::Error::<Test>::IntentNotFound
         );
@@ -1300,8 +1317,298 @@ fn test_attest_intent_accepts_matching_pubkey() {
             RuntimeOrigin::signed(1),
             iid,
             mock_pubkey_of(&1),
-            [0u8; 64]
+            mock_attest_sig(1)
         ));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Task #74 (sec-review) — runtime sig-verify on attest_intent
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_attest_intent_rejects_invalid_signature() {
+    // Pre-fix `attest_intent` accepted ANY (pubkey, sig) bundle and crossed
+    // threshold based on length alone — the comment claimed Cardano would
+    // verify later, but the chain transitioned state on UNVERIFIED bundles.
+    // Post-fix: every per-call sig must verify against
+    // `attest_intent_payload(intent_id)` via T::SigVerifier. The
+    // MockSigVerifier accepts iff `sig[0] == pubkey[0]`; a sig with the
+    // wrong marker is now rejected with `InvalidSignature` and no storage
+    // mutation occurs.
+    new_test_ext().execute_with(|| {
+        let iid = submit_and_get_id(ALICE);
+        let bad_sig = [0u8; 64]; // marker = 0, but pubkey[0] = 1 for member 1
+        assert_noop!(
+            IntentSettlement::attest_intent(
+                RuntimeOrigin::signed(1),
+                iid,
+                mock_pubkey_of(&1),
+                bad_sig
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::InvalidSignature
+        );
+        let bundle =
+            pallet_intent_settlement::pallet::PendingAttestations::<Test>::get(iid);
+        assert_eq!(
+            bundle.len(),
+            0,
+            "no storage mutation when sig fails verify"
+        );
+        let intent =
+            pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
+        assert_eq!(intent.status, IntentStatus::Pending);
+    });
+}
+
+#[test]
+fn test_attest_intent_payload_domain_separated_from_inta_other_tags() {
+    // Sanity: the INTA pre-image is deterministic and domain-separated from
+    // every other M-of-N pre-image. Pre-fix there was no INTA pre-image at
+    // all (attest_intent didn't sign anything); now there is, and a
+    // signature over INTA must NOT verify against any other tag.
+    let iid = sp_core::H256::from([0xAB; 32]);
+    let a = crate::attest_intent_payload(&iid);
+    let b = crate::attest_intent_payload(&iid);
+    assert_eq!(a, b, "deterministic");
+    let other = settle_claim_payload(&iid, &[0u8; 32], false);
+    assert_ne!(a, other, "INTA != STCL");
+    let other2 = credit_deposit_payload(&[0u8; 32], 0, iid.as_fixed_bytes());
+    assert_ne!(a, other2, "INTA != CRDP");
+}
+
+// ---------------------------------------------------------------------------
+// Task #75 (sec-review) — signatures Vec capped at MaxCommittee
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_credit_deposit_rejects_signatures_above_max_committee() {
+    // Pre-fix an attacker could submit a 1024-entry Vec and burn 1024
+    // sr25519 verifies in `ensure_threshold_signatures` before the
+    // BoundedVec storage truncate ever fired — trivial DoS once the chain
+    // is public. Post-fix the cap fires BEFORE any sig-verify. We test
+    // with MaxCommittee+1 entries.
+    new_test_ext().execute_with(|| {
+        // MaxCommittee = 32 in test runtime; build 33 sigs.
+        let mut sigs = Vec::with_capacity(33);
+        for _ in 0..33 {
+            sigs.push(mock_sig_for(1));
+        }
+        assert_noop!(
+            IntentSettlement::credit_deposit(
+                RuntimeOrigin::signed(1),
+                ALICE,
+                1_000,
+                [0xCA; 32],
+                sigs,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::TooManySignatures
+        );
+        // No state mutation.
+        assert_eq!(
+            pallet_intent_settlement::pallet::Credits::<Test>::get(ALICE),
+            0
+        );
+    });
+}
+
+#[test]
+fn test_settle_claim_rejects_signatures_above_max_committee() {
+    new_test_ext().execute_with(|| {
+        // Build a vouchered claim so we get past the existence check
+        // (though the cap fires earlier; this exercises the path more
+        // realistically).
+        let iid = attested_intent();
+        let claim_id = sp_core::H256::from([0x42; 32]);
+        let bfpr = good_fairness_proof(iid, 1_000_000);
+        let voucher = good_voucher(claim_id, &bfpr, 1_000_000);
+        assert_ok!(IntentSettlement::request_voucher(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            iid,
+            voucher,
+            bfpr,
+            mock_voucher_sigs()
+        ));
+        let mut sigs = Vec::with_capacity(33);
+        for _ in 0..33 {
+            sigs.push(mock_sig_for(1));
+        }
+        assert_noop!(
+            IntentSettlement::settle_claim(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                [0xFF; 32],
+                false,
+                sigs,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::TooManySignatures
+        );
+        // Claim still unsettled.
+        let claim =
+            pallet_intent_settlement::pallet::Claims::<Test>::get(claim_id).unwrap();
+        assert!(!claim.settled);
+    });
+}
+
+#[test]
+fn test_request_voucher_rejects_signatures_above_max_committee() {
+    new_test_ext().execute_with(|| {
+        let iid = attested_intent();
+        let claim_id = sp_core::H256::from([0x43; 32]);
+        let bfpr = good_fairness_proof(iid, 1_000_000);
+        let voucher = good_voucher(claim_id, &bfpr, 1_000_000);
+        let mut sigs = Vec::with_capacity(33);
+        for _ in 0..33 {
+            sigs.push(mock_sig_for(1));
+        }
+        assert_noop!(
+            IntentSettlement::request_voucher(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                iid,
+                voucher,
+                bfpr,
+                sigs,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::TooManySignatures
+        );
+        // Voucher not minted.
+        assert!(
+            !pallet_intent_settlement::pallet::Vouchers::<Test>::contains_key(claim_id)
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Task #82 (sec-review) — total_nav_ada decrement on settle
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_settle_claim_decrements_total_nav_ada() {
+    // Pre-fix `credit_deposit` grew `total_nav_ada` 1:1 on every deposit but
+    // NO settlement path EVER decremented it. NAV monotonically grew, so
+    // pool utilization (= outstanding / nav) drifted toward zero forever —
+    // the 75% cap effectively disabled itself after enough payouts.
+    // Post-fix: settling a claim drains `payout_amount` from NAV (capital
+    // really is gone — paid out on Cardano).
+    new_test_ext().execute_with(|| {
+        // Set up a vouchered claim with a known amount.
+        let iid = attested_intent();
+        let claim_id = sp_core::H256::from([0xAB; 32]);
+        let payout = 1_000_000u64;
+        let bfpr = good_fairness_proof(iid, payout);
+        let voucher = good_voucher(claim_id, &bfpr, payout);
+        assert_ok!(IntentSettlement::request_voucher(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            iid,
+            voucher,
+            bfpr,
+            mock_voucher_sigs()
+        ));
+        let nav_before =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .total_nav_ada;
+        let outstanding_before =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .outstanding_coverage_ada;
+        assert!(
+            nav_before >= payout,
+            "test setup: NAV must cover the payout"
+        );
+
+        assert_ok!(IntentSettlement::settle_claim(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            [0xCD; 32],
+            false,
+            mock_settle_sigs()
+        ));
+
+        let nav_after =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .total_nav_ada;
+        let outstanding_after =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .outstanding_coverage_ada;
+
+        assert_eq!(
+            nav_before.saturating_sub(nav_after),
+            payout,
+            "total_nav_ada must drop by exactly the payout amount"
+        );
+        assert_eq!(
+            outstanding_before.saturating_sub(outstanding_after),
+            payout,
+            "outstanding_coverage_ada must drop by exactly the payout amount"
+        );
+    });
+}
+
+#[test]
+fn test_settle_batch_atomic_decrements_total_nav_ada() {
+    // Same invariant as `test_settle_claim_decrements_total_nav_ada` but on
+    // the batch path. Total drop in NAV must equal sum of per-claim payout
+    // amounts.
+    new_test_ext().execute_with(|| {
+        // Use the existing `vouchered_claim` helper which sets up NAV +
+        // credits + a vouchered claim.
+        let (c1, _) = vouchered_claim(0xB1, 200_000);
+        let (c2, _) = vouchered_claim(0xB2, 300_000);
+        let (c3, _) = vouchered_claim(0xB3, 400_000);
+        let total_payout = 200_000 + 300_000 + 400_000u64;
+
+        let nav_before =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .total_nav_ada;
+        let entries: Vec<SettleBatchEntry> = vec![
+            SettleBatchEntry { claim_id: c1, cardano_tx_hash: [1u8; 32], settled_direct: false },
+            SettleBatchEntry { claim_id: c2, cardano_tx_hash: [2u8; 32], settled_direct: true },
+            SettleBatchEntry { claim_id: c3, cardano_tx_hash: [3u8; 32], settled_direct: false },
+        ];
+        let bv: BoundedVec<SettleBatchEntry, MaxSettleBatch> =
+            BoundedVec::try_from(entries.clone()).unwrap();
+        let _ = pallet_intent_settlement::settle_batch_atomic_payload(&entries);
+        let sigs = vec![mock_sig_for(1), mock_sig_for(2)];
+        assert_ok!(IntentSettlement::settle_batch_atomic(
+            RuntimeOrigin::signed(1),
+            bv,
+            sigs,
+        ));
+        let nav_after =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .total_nav_ada;
+        assert_eq!(
+            nav_before.saturating_sub(nav_after),
+            total_payout,
+            "settle_batch_atomic total_nav_ada drop must equal sum of payouts"
+        );
+    });
+}
+
+#[test]
+fn test_expire_policy_mirror_does_not_change_total_nav_ada() {
+    // Per Task #82's "simpler model": premium that was paid in (and grew NAV
+    // at credit_deposit time) belongs to the pool whether or not the policy
+    // was claimed against. Expiry without a settled claim leaves NAV alone
+    // — the capital stayed on the chain side.
+    new_test_ext().execute_with(|| {
+        let iid = submit_and_get_id(ALICE);
+        let nav_before =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .total_nav_ada;
+        assert_ok!(IntentSettlement::expire_policy_mirror(
+            RuntimeOrigin::signed(1),
+            iid,
+        ));
+        let nav_after =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .total_nav_ada;
+        assert_eq!(
+            nav_before, nav_after,
+            "expire_policy_mirror must not touch total_nav_ada"
+        );
     });
 }
 
@@ -1341,13 +1648,13 @@ fn test_outstanding_coverage_symmetric_accounting() {
             RuntimeOrigin::signed(1),
             iid0,
             mock_pubkey_of(&1),
-            [0u8; 64]
+            mock_attest_sig(1)
         ));
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(2),
             iid0,
             mock_pubkey_of(&2),
-            [0u8; 64]
+            mock_attest_sig(2)
         ));
 
         let claim_id = H256::from([0xCC; 32]);
@@ -1494,13 +1801,13 @@ fn test_pending_batches_index_is_maintained() {
             RuntimeOrigin::signed(1),
             iid1,
             mock_pubkey_of(&1),
-            [0u8; 64]
+            mock_attest_sig(1)
         ));
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(2),
             iid1,
             mock_pubkey_of(&2),
-            [0u8; 64]
+            mock_attest_sig(2)
         ));
         let claim_id = H256::from([0xAA; 32]);
         let bfpr = good_fairness_proof(iid1, 1_000);
@@ -1747,17 +2054,37 @@ fn test_multisig_invalid_signature_rejected() {
 #[test]
 fn test_set_min_signer_threshold_root_only() {
     new_test_ext().execute_with(|| {
+        // Non-root caller is rejected.
         assert_noop!(
-            IntentSettlement::set_min_signer_threshold(RuntimeOrigin::signed(1), 3),
+            IntentSettlement::set_min_signer_threshold(RuntimeOrigin::signed(1), 2),
             sp_runtime::DispatchError::BadOrigin
         );
+        // Root can set up to the committee threshold (=2 in MockCommittee).
         assert_ok!(IntentSettlement::set_min_signer_threshold(
             RuntimeOrigin::root(),
-            3
+            2
         ));
         assert_eq!(
             pallet_intent_settlement::pallet::MinSignerThreshold::<Test>::get(),
-            3
+            2
+        );
+    });
+}
+
+#[test]
+fn test_set_min_signer_threshold_above_committee_rejected() {
+    // Task #74 (sec-review): the local floor must not exceed the live
+    // committee threshold (=2 in MockCommittee). Setting it to 3 would
+    // brick every M-of-N extrinsic forever.
+    new_test_ext().execute_with(|| {
+        assert_noop!(
+            IntentSettlement::set_min_signer_threshold(RuntimeOrigin::root(), 3),
+            pallet_intent_settlement::pallet::Error::<Test>::ThresholdAboveCommittee
+        );
+        // Storage left at the seed value (2), not bumped to 3.
+        assert_eq!(
+            pallet_intent_settlement::pallet::MinSignerThreshold::<Test>::get(),
+            2
         );
     });
 }
@@ -1975,13 +2302,13 @@ fn vouchered_claim(claim_seed: u8, amount: u64) -> (ClaimId, IntentId) {
         RuntimeOrigin::signed(1),
         iid,
         mock_pubkey_of(&1),
-        [0u8; 64]
+        mock_attest_sig(1)
     ));
     assert_ok!(IntentSettlement::attest_intent(
         RuntimeOrigin::signed(2),
         iid,
         mock_pubkey_of(&2),
-        [0u8; 64]
+        mock_attest_sig(2)
     ));
     // Voucher.
     let claim_id = H256::from([claim_seed; 32]);
@@ -2656,10 +2983,10 @@ fn submit_n_attested(n: u32) -> Vec<IntentId> {
         ));
         // Attest 2-of-3.
         assert_ok!(IntentSettlement::attest_intent(
-            RuntimeOrigin::signed(1), iid, mock_pubkey_of(&1), [0u8; 64],
+            RuntimeOrigin::signed(1), iid, mock_pubkey_of(&1), mock_attest_sig(1),
         ));
         assert_ok!(IntentSettlement::attest_intent(
-            RuntimeOrigin::signed(2), iid, mock_pubkey_of(&2), [0u8; 64],
+            RuntimeOrigin::signed(2), iid, mock_pubkey_of(&2), mock_attest_sig(2),
         ));
         out.push(iid);
     }
@@ -2904,13 +3231,13 @@ fn attest_batch_already_attested_intents_idempotent_skip() {
                 RuntimeOrigin::signed(1),
                 *iid,
                 mock_pubkey_of(&1),
-                [0u8; 64],
+                mock_attest_sig(1),
             ));
             assert_ok!(IntentSettlement::attest_intent(
                 RuntimeOrigin::signed(2),
                 *iid,
                 mock_pubkey_of(&2),
-                [0u8; 64],
+                mock_attest_sig(2),
             ));
             let intent =
                 pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
@@ -3228,13 +3555,13 @@ fn attest_batch_backward_compat_legacy_attest_intent_still_works() {
             RuntimeOrigin::signed(1),
             iid,
             mock_pubkey_of(&1),
-            [0u8; 64],
+            mock_attest_sig(1),
         ));
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(2),
             iid,
             mock_pubkey_of(&2),
-            [0u8; 64],
+            mock_attest_sig(2),
         ));
         let intent =
             pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
@@ -4108,6 +4435,7 @@ mod max_submit_batch_boundary {
         pub const DefaultMinSignerThreshold: u32 = 2;
         pub const MaxSettleBatch: u32 = 256;
         pub const MaxAttestBatch: u32 = 256;
+        pub const MaxVoucherBatch: u32 = 256;
         /// The boundary we're probing — production MAX_SUBMIT_BATCH = 256.
         pub const MaxSubmitBatch: u32 = 256;
     }
@@ -4160,6 +4488,7 @@ mod max_submit_batch_boundary {
         type SigVerifier = MockSigVerifier;
         type MaxSettleBatch = MaxSettleBatch;
         type MaxAttestBatch = MaxAttestBatch;
+        type MaxVoucherBatch = MaxVoucherBatch;
         type MaxSubmitBatch = MaxSubmitBatch;
     }
 

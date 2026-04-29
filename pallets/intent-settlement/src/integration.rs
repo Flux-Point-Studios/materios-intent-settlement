@@ -126,6 +126,16 @@ fn sign_with(seed: &str, msg: &[u8]) -> (CommitteePubkey, CommitteeSig) {
     (pair.public().0, sig.0)
 }
 
+/// Task #74 helper: produce a real sr25519 signature over the canonical
+/// `attest_intent_payload(intent_id)` digest for the given dev-seed. Used
+/// by every `attest_intent` integration test now that the per-call
+/// signature is runtime-verified.
+fn sign_attest(seed: &str, intent_id: &IntentId) -> CommitteeSig {
+    let pair = sp_core::sr25519::Pair::from_string(seed, None).unwrap();
+    let payload = crate::attest_intent_payload(intent_id);
+    pair.sign(&payload).0
+}
+
 impl pallet_intent_settlement::pallet::Config for Testnet {
     type RuntimeEvent = RuntimeEvent;
     type MaxCommittee = MaxCommittee;
@@ -233,13 +243,13 @@ fn full_lifecycle_submit_attest_voucher_settle() {
             RuntimeOrigin::signed(alice.clone()),
             expected_id,
             alice_pk,
-            [0u8; 64]
+            sign_attest("//Alice", &expected_id)
         ));
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(bob.clone()),
             expected_id,
             bob_pk,
-            [0u8; 64]
+            sign_attest("//Bob", &expected_id)
         ));
         let intent =
             pallet_intent_settlement::pallet::Intents::<Testnet>::get(expected_id)
@@ -362,20 +372,20 @@ fn concurrent_attestation_first_bundle_wins() {
             RuntimeOrigin::signed(alice),
             iid,
             alice_pk,
-            [0; 64]
+            sign_attest("//Alice", &iid)
         ));
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(bob),
             iid,
             bob_pk,
-            [0; 64]
+            sign_attest("//Bob", &iid)
         ));
         // Third arrives late — must be a no-op (intent already Attested).
         assert_ok!(IntentSettlement::attest_intent(
             RuntimeOrigin::signed(charlie),
             iid,
             charlie_pk,
-            [0; 64]
+            sign_attest("//Charlie", &iid)
         ));
         let intent =
             pallet_intent_settlement::pallet::Intents::<Testnet>::get(iid).unwrap();
@@ -486,13 +496,13 @@ fn rv_setup_attested(
         RuntimeOrigin::signed(alice.clone()),
         intent_id,
         alice_pk,
-        [0u8; 64]
+        sign_attest("//Alice", &intent_id)
     ));
     assert_ok!(IntentSettlement::attest_intent(
         RuntimeOrigin::signed(bob.clone()),
         intent_id,
         bob_pk,
-        [0u8; 64]
+        sign_attest("//Bob", &intent_id)
     ));
 
     // 5. build voucher + bfpr + canonical request_voucher pre-image.
@@ -999,10 +1009,10 @@ fn task212_request_batch_vouchers_real_runtime_happy_path() {
                 *b
             };
             assert_ok!(IntentSettlement::attest_intent(
-                RuntimeOrigin::signed(alice.clone()), iid, alice_pk, [0u8; 64],
+                RuntimeOrigin::signed(alice.clone()), iid, alice_pk, sign_attest("//Alice", &iid),
             ));
             assert_ok!(IntentSettlement::attest_intent(
-                RuntimeOrigin::signed(bob.clone()), iid, bob_pk, [0u8; 64],
+                RuntimeOrigin::signed(bob.clone()), iid, bob_pk, sign_attest("//Bob", &iid),
             ));
         }
 
