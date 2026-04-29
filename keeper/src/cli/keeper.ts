@@ -14,6 +14,12 @@
  *                            sig collection is wave 2 W2.b follow-up.
  *   KEEPER_CARDANO_ADDR    — Cardano addr that receives keeper fee output
  *   POLICY_SCRIPT_CBOR     — compiled aegis-policy-v1 CBOR (hex)
+ *   AEGIS_POLICY_V1_SCRIPT_HASH — REQUIRED, 28-byte (56-hex) blake2b_224 hash of
+ *                            POLICY_SCRIPT_CBOR. Task #76a: keeper refuses to
+ *                            start if `blake2b_224(0x03 || cbor) != hash`.
+ *                            Operators MUST supply the deployed Aiken
+ *                            blueprint hash; mainnet must NEVER silently
+ *                            accept an unbound CBOR.
  *   NETWORK                — "preprod" | "mainnet" (mainnet requires ENABLE_MAINNET=1)
  *   KEEPER_STATE_PATH      — path to persisted state (default ./keeper-state.json)
  *   DRY_RUN                — "1" to skip actual Cardano submits
@@ -32,6 +38,12 @@ async function main(): Promise<void> {
   const keeperMnemonic = required("KEEPER_MNEMONIC");
   const keeperAddr = required("KEEPER_CARDANO_ADDR");
   const policyScriptCbor = required("POLICY_SCRIPT_CBOR") as `0x${string}`;
+  // Task #76a: AEGIS_POLICY_V1_SCRIPT_HASH is REQUIRED. The Keeper
+  // constructor cross-checks blake2b_224(0x03||cbor) against this value
+  // and refuses to start on mismatch — we surface a clear env-var error
+  // here too in case of typo (otherwise the constructor's
+  // PolicyScriptHashMismatchError is the only signal).
+  const aegisPolicyV1ScriptHash = required("AEGIS_POLICY_V1_SCRIPT_HASH") as `0x${string}`;
   const network = (process.env.NETWORK ?? "preprod") as "preprod" | "mainnet";
   const statePath = process.env.KEEPER_STATE_PATH ?? "./keeper-state.json";
   const dryRun = process.env.DRY_RUN === "1";
@@ -61,6 +73,7 @@ async function main(): Promise<void> {
       pollIntervalMs: 6000,
       maxBatchSize: 32,
       dryRun,
+      aegisPolicyV1ScriptHash,
     },
     {
       rpc,

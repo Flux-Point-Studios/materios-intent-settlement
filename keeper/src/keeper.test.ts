@@ -6,7 +6,7 @@
  * unmodified; we exercise its orchestration decisions.
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, beforeAll } from "vitest";
 import { Keeper } from "./keeper.js";
 import { KeeperStateStore } from "./state.js";
 import type { ICardanoProvider, SubmittedTx } from "./cardano.js";
@@ -16,11 +16,66 @@ import type {
   Voucher,
   BatchFairnessProof,
   HexString,
+  CommitteePubkey,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
-import { intentId as computeIntentId } from "@fluxpointstudios/materios-intent-settlement-sdk";
+import {
+  intentId as computeIntentId,
+  voucherDigest,
+  signPayload,
+} from "@fluxpointstudios/materios-intent-settlement-sdk";
+import { hexToU8a, u8aToHex } from "@polkadot/util";
+import { cryptoWaitReady } from "@polkadot/util-crypto";
+import { computePlutusV3ScriptHash } from "./script-hash.js";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+// Cryptographic primitives for sr25519 require WASM init (#76b voucher
+// sig verify path uses sr25519Verify under the hood).
+beforeAll(async () => {
+  await cryptoWaitReady();
+});
+
+// Placeholder POLICY_SCRIPT_CBOR used by every test. The real-time
+// computed hash is plumbed through `baseConfig.aegisPolicyV1ScriptHash` so
+// the keeper constructor's task #76a script-hash gate accepts it.
+const PLACEHOLDER_CBOR = ("0x" + "00".repeat(4)) as HexString;
+const PLACEHOLDER_HASH = computePlutusV3ScriptHash(PLACEHOLDER_CBOR);
+
+/**
+ * Build a Voucher whose `committeeSigs` are real sr25519 signatures over
+ * the canonical voucherDigest. The returned bundle pairs (alice pubkey,
+ * sig) so the test can register `alice` as a committee member and the
+ * sig-verify gate (#76b) will pass.
+ */
+function makeSignedVoucher(
+  id: HexString,
+  signers: string[] = ["//Alice"],
+  overrides: Partial<Voucher> = {},
+): { voucher: Voucher; pubkeys: CommitteePubkey[] } {
+  const base: Voucher = {
+    claimId: id,
+    policyId: ("0x" + "ee".repeat(32)) as HexString,
+    beneficiaryCardanoAddr: new TextEncoder().encode("addr_test1xyz"),
+    amountAda: 10_000_000n,
+    batchFairnessProofDigest: ("0x" + "dd".repeat(32)) as HexString,
+    issuedBlock: 110,
+    expirySlotCardano: 5_000_000n,
+    committeeSigs: [],
+    ...overrides,
+  };
+  const digestHex = voucherDigest(base);
+  const digestBytes = hexToU8a(digestHex);
+  const sigs: Array<{ pubkey: HexString; sig: HexString }> = [];
+  const pubkeys: CommitteePubkey[] = [];
+  for (const seed of signers) {
+    const { pubkey, sig } = signPayload(seed, digestBytes);
+    const pkHex = u8aToHex(pubkey) as HexString;
+    sigs.push({ pubkey: pkHex, sig: u8aToHex(sig) as HexString });
+    pubkeys.push(pkHex as CommitteePubkey);
+  }
+  return { voucher: { ...base, committeeSigs: sigs }, pubkeys };
+}
 
 function makeKind(nonce: number) {
   return {
@@ -88,6 +143,13 @@ function fakeRpc(overrides: Record<string, any> = {}) {
     getVoucher: vi.fn().mockResolvedValue(null),
     getLatestBlockNumber: vi.fn().mockResolvedValue(200),
     submitExtrinsic: vi.fn().mockResolvedValue({ txHash: "0x" + "aa".repeat(32), blockHash: null }),
+    // Default committee state used by Task #76b voucher-sig verification.
+    // Tests that need a specific membership snapshot override this.
+    getCommitteeState: vi.fn().mockResolvedValue({
+      members: [],
+      threshold: 1,
+      lastMirror: null,
+    }),
     ...overrides,
   };
 }
@@ -122,6 +184,9 @@ const baseConfig: KeeperConfig = {
   pollIntervalMs: 10,
   maxBatchSize: 32,
   dryRun: false,
+  // Task #76a: must be set so the keeper's startup script-hash check
+  // accepts PLACEHOLDER_CBOR.
+  aegisPolicyV1ScriptHash: PLACEHOLDER_HASH,
 };
 
 describe("Keeper.runOnce — happy path", () => {
@@ -133,7 +198,9 @@ describe("Keeper.runOnce — happy path", () => {
 
   it("observes → submits → confirms → settles an attested+vouchered batch", async () => {
     const batch = makeBatch(1);
-    const voucher = makeVoucher(batch.intentId as unknown as HexString);
+    const { voucher, pubkeys } = makeSignedVoucher(
+      batch.intentId as unknown as HexString,
+    );
     const rpc = fakeRpc({
       getPendingBatches: vi.fn().mockResolvedValue([batch]),
       getVoucher: vi.fn().mockResolvedValue(voucher),
@@ -146,8 +213,9 @@ describe("Keeper.runOnce — happy path", () => {
       cardano,
       state,
       keeperCardanoAddr: "addr_test1keeper",
-      policyScriptCbor: ("0x" + "00".repeat(4)) as HexString,
+      policyScriptCbor: PLACEHOLDER_CBOR,
       fetchFairnessProof: async () => makeValidBfpr(),
+      fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
       logger: () => {},
     });
 
@@ -201,7 +269,9 @@ describe("Keeper.runOnce — failure modes", () => {
 
   it("double-submit idempotency: already-settled claim is skipped", async () => {
     const batch = makeBatch(2);
-    const voucher = makeVoucher(batch.intentId as unknown as HexString);
+    const { voucher, pubkeys } = makeSignedVoucher(
+      batch.intentId as unknown as HexString,
+    );
     const rpc = fakeRpc({
       getPendingBatches: vi.fn().mockResolvedValue([batch]),
       getVoucher: vi.fn().mockResolvedValue(voucher),
@@ -217,8 +287,9 @@ describe("Keeper.runOnce — failure modes", () => {
       cardano,
       state,
       keeperCardanoAddr: "addr_test1keeper",
-      policyScriptCbor: ("0x" + "00".repeat(4)) as HexString,
+      policyScriptCbor: PLACEHOLDER_CBOR,
       fetchFairnessProof: async () => makeValidBfpr(),
+      fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
       logger: () => {},
     });
 
@@ -229,7 +300,9 @@ describe("Keeper.runOnce — failure modes", () => {
 
   it("orphan rollback: tx slot goes null → submission reset to observed", async () => {
     const batch = makeBatch(3);
-    const voucher = makeVoucher(batch.intentId as unknown as HexString);
+    const { voucher, pubkeys } = makeSignedVoucher(
+      batch.intentId as unknown as HexString,
+    );
     // After the rollback is detected, don't re-surface the batch on the next
     // poll (Materios would have marked it back to a non-attested state).
     const getPending = vi
@@ -254,8 +327,9 @@ describe("Keeper.runOnce — failure modes", () => {
       cardano,
       state,
       keeperCardanoAddr: "addr_test1keeper",
-      policyScriptCbor: ("0x" + "00".repeat(4)) as HexString,
+      policyScriptCbor: PLACEHOLDER_CBOR,
       fetchFairnessProof: async () => makeValidBfpr(),
+      fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
       logger: () => {},
     });
 
@@ -267,7 +341,9 @@ describe("Keeper.runOnce — failure modes", () => {
 
   it("fee-spike retry: transient submit failure → retried with bump", async () => {
     const batch = makeBatch(4);
-    const voucher = makeVoucher(batch.intentId as unknown as HexString);
+    const { voucher, pubkeys } = makeSignedVoucher(
+      batch.intentId as unknown as HexString,
+    );
     const rpc = fakeRpc({
       getPendingBatches: vi.fn().mockResolvedValue([batch]),
       getVoucher: vi.fn().mockResolvedValue(voucher),
@@ -285,8 +361,9 @@ describe("Keeper.runOnce — failure modes", () => {
       cardano,
       state,
       keeperCardanoAddr: "addr_test1keeper",
-      policyScriptCbor: ("0x" + "00".repeat(4)) as HexString,
+      policyScriptCbor: PLACEHOLDER_CBOR,
       fetchFairnessProof: async () => makeValidBfpr(),
+      fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
       logger: () => {},
     });
 
@@ -297,7 +374,9 @@ describe("Keeper.runOnce — failure modes", () => {
 
   it("fee-spike retry exhausted: gives up after maxAttempts", async () => {
     const batch = makeBatch(5);
-    const voucher = makeVoucher(batch.intentId as unknown as HexString);
+    const { voucher, pubkeys } = makeSignedVoucher(
+      batch.intentId as unknown as HexString,
+    );
     const rpc = fakeRpc({
       getPendingBatches: vi.fn().mockResolvedValue([batch]),
       getVoucher: vi.fn().mockResolvedValue(voucher),
@@ -313,8 +392,9 @@ describe("Keeper.runOnce — failure modes", () => {
         cardano,
         state,
         keeperCardanoAddr: "addr_test1keeper",
-        policyScriptCbor: ("0x" + "00".repeat(4)) as HexString,
+        policyScriptCbor: PLACEHOLDER_CBOR,
         fetchFairnessProof: async () => makeValidBfpr(),
+        fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
         logger: () => {},
       },
     );
@@ -327,7 +407,13 @@ describe("Keeper.runOnce — failure modes", () => {
 
   it("committee sig missing → no submit, committeeSigFailures++", async () => {
     const batch = makeBatch(6);
-    const voucher: Voucher = { ...makeVoucher(batch.intentId as unknown as HexString), committeeSigs: [] };
+    // Build a voucher with NO committee sigs to exercise the early-out
+    // committeeSigFailures counter (separate from the #76b cryptographic
+    // verify path tested elsewhere).
+    const { voucher: signed, pubkeys } = makeSignedVoucher(
+      batch.intentId as unknown as HexString,
+    );
+    const voucher: Voucher = { ...signed, committeeSigs: [] };
     const rpc = fakeRpc({
       getPendingBatches: vi.fn().mockResolvedValue([batch]),
       getVoucher: vi.fn().mockResolvedValue(voucher),
@@ -340,8 +426,9 @@ describe("Keeper.runOnce — failure modes", () => {
       cardano,
       state,
       keeperCardanoAddr: "addr_test1keeper",
-      policyScriptCbor: ("0x" + "00".repeat(4)) as HexString,
+      policyScriptCbor: PLACEHOLDER_CBOR,
       fetchFairnessProof: async () => makeValidBfpr(),
+      fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
       logger: () => {},
     });
 
@@ -352,7 +439,9 @@ describe("Keeper.runOnce — failure modes", () => {
 
   it("invalid fairness proof → refuse to submit", async () => {
     const batch = makeBatch(7);
-    const voucher = makeVoucher(batch.intentId as unknown as HexString);
+    const { voucher, pubkeys } = makeSignedVoucher(
+      batch.intentId as unknown as HexString,
+    );
     const rpc = fakeRpc({
       getPendingBatches: vi.fn().mockResolvedValue([batch]),
       getVoucher: vi.fn().mockResolvedValue(voucher),
@@ -366,8 +455,9 @@ describe("Keeper.runOnce — failure modes", () => {
       cardano,
       state,
       keeperCardanoAddr: "addr_test1keeper",
-      policyScriptCbor: ("0x" + "00".repeat(4)) as HexString,
+      policyScriptCbor: PLACEHOLDER_CBOR,
       fetchFairnessProof: async () => bad,
+      fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
       logger: () => {},
     });
 
@@ -379,7 +469,9 @@ describe("Keeper.runOnce — failure modes", () => {
 
   it("Cardano halt detected → keeper pauses (does not submit)", async () => {
     const batch = makeBatch(8);
-    const voucher = makeVoucher(batch.intentId as unknown as HexString);
+    const { voucher, pubkeys } = makeSignedVoucher(
+      batch.intentId as unknown as HexString,
+    );
     // Only surface the batch on the SECOND poll, by which time halt is live.
     const getPending = vi
       .fn()
@@ -402,8 +494,9 @@ describe("Keeper.runOnce — failure modes", () => {
       cardano,
       state,
       keeperCardanoAddr: "addr_test1keeper",
-      policyScriptCbor: ("0x" + "00".repeat(4)) as HexString,
+      policyScriptCbor: PLACEHOLDER_CBOR,
       fetchFairnessProof: async () => makeValidBfpr(),
+      fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
       clock: () => now,
       logger: () => {},
     });
@@ -420,7 +513,9 @@ describe("Keeper.runOnce — failure modes", () => {
 
   it("dry-run mode skips actual Cardano submit but records submission", async () => {
     const batch = makeBatch(9);
-    const voucher = makeVoucher(batch.intentId as unknown as HexString);
+    const { voucher, pubkeys } = makeSignedVoucher(
+      batch.intentId as unknown as HexString,
+    );
     const rpc = fakeRpc({
       getPendingBatches: vi.fn().mockResolvedValue([batch]),
       getVoucher: vi.fn().mockResolvedValue(voucher),
@@ -435,8 +530,9 @@ describe("Keeper.runOnce — failure modes", () => {
         cardano,
         state,
         keeperCardanoAddr: "addr_test1keeper",
-        policyScriptCbor: ("0x" + "00".repeat(4)) as HexString,
+        policyScriptCbor: PLACEHOLDER_CBOR,
         fetchFairnessProof: async () => makeValidBfpr(),
+        fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
         logger: () => {},
       },
     );
@@ -460,8 +556,11 @@ describe("Keeper.runOnce — failure modes", () => {
       cardano,
       state,
       keeperCardanoAddr: "addr_test1keeper",
-      policyScriptCbor: ("0x" + "00".repeat(4)) as HexString,
+      policyScriptCbor: PLACEHOLDER_CBOR,
       fetchFairnessProof: async () => makeValidBfpr(),
+      // No voucher means the gate isn't reached; provide a snapshot
+      // anyway so the keeper init path stays uniform.
+      fetchCommitteeSnapshot: async () => ({ members: [], threshold: 1 }),
       logger: () => {},
     });
 

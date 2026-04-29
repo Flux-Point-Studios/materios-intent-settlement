@@ -19,17 +19,27 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
-import { intentId as computeIntentId } from "@fluxpointstudios/materios-intent-settlement-sdk";
+import { hexToU8a, u8aToHex } from "@polkadot/util";
+import {
+  intentId as computeIntentId,
+  voucherDigest,
+  signPayload,
+} from "@fluxpointstudios/materios-intent-settlement-sdk";
 import type {
   BatchPayload,
   Voucher,
   HexString,
   IntentKind,
+  CommitteePubkey,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
 import { Keeper } from "../../src/keeper.js";
 import { KeeperStateStore } from "../../src/state.js";
 import { CommitteeDaemon } from "../../src/daemon/index.js";
 import type { ICardanoProvider } from "../../src/cardano.js";
+import { computePlutusV3ScriptHash } from "../../src/script-hash.js";
+
+const PLACEHOLDER_CBOR = ("0x" + "00".repeat(4)) as HexString;
+const PLACEHOLDER_HASH = computePlutusV3ScriptHash(PLACEHOLDER_CBOR);
 
 function fakeCardano(): ICardanoProvider {
   const slot = 1_000_000n;
@@ -54,7 +64,12 @@ function fakeCardano(): ICardanoProvider {
   };
 }
 
-function makeIntentAndBatch(): { batch: BatchPayload; voucher: Voucher; kind: IntentKind } {
+function makeIntentAndBatch(): {
+  batch: BatchPayload;
+  voucher: Voucher;
+  kind: IntentKind;
+  committeePubkey: CommitteePubkey;
+} {
   const submitter = ("0x" + "ab".repeat(32)) as HexString;
   const kind: IntentKind = {
     tag: "BuyPolicy",
@@ -80,7 +95,7 @@ function makeIntentAndBatch(): { batch: BatchPayload; voucher: Voucher; kind: In
       { pubkey: ("0x" + "11".repeat(32)) as HexString, sig: ("0x" + "22".repeat(64)) as HexString },
     ],
   };
-  const voucher: Voucher = {
+  const baseVoucher: Voucher = {
     claimId: id as unknown as HexString,
     policyId: ("0x" + "cd".repeat(32)) as HexString,
     beneficiaryCardanoAddr: new TextEncoder().encode("addr_test1xabc"),
@@ -88,11 +103,18 @@ function makeIntentAndBatch(): { batch: BatchPayload; voucher: Voucher; kind: In
     batchFairnessProofDigest: ("0x" + "dd".repeat(32)) as HexString,
     issuedBlock: 110,
     expirySlotCardano: 10_000_000n,
-    committeeSigs: [
-      { pubkey: ("0x" + "11".repeat(32)) as HexString, sig: ("0x" + "22".repeat(64)) as HexString },
-    ],
+    committeeSigs: [],
   };
-  return { batch, voucher, kind };
+  // Task #76b: real sr25519 sig over the canonical voucher digest. The
+  // committee snapshot below pins //Alice as the lone member.
+  const digest = hexToU8a(voucherDigest(baseVoucher));
+  const { pubkey, sig } = signPayload("//Alice", digest);
+  const pubkeyHex = u8aToHex(pubkey) as HexString;
+  const voucher: Voucher = {
+    ...baseVoucher,
+    committeeSigs: [{ pubkey: pubkeyHex, sig: u8aToHex(sig) as HexString }],
+  };
+  return { batch, voucher, kind, committeePubkey: pubkeyHex as CommitteePubkey };
 }
 
 describe("E2E happy path — intent → attest → batch → submit → settle", () => {
@@ -102,7 +124,7 @@ describe("E2E happy path — intent → attest → batch → submit → settle",
 
   it("drives the full pipeline with in-memory Materios mock + fake Cardano", async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "e2e-"));
-    const { batch, voucher } = makeIntentAndBatch();
+    const { batch, voucher, committeePubkey } = makeIntentAndBatch();
 
     // Mock Materios RPC: returns the batch + voucher the committee produced,
     // records settle_claim. Separate tracking for keeper vs daemon polls.
@@ -168,13 +190,15 @@ describe("E2E happy path — intent → attest → batch → submit → settle",
         pollIntervalMs: 1,
         maxBatchSize: 32,
         dryRun: false,
+        // Task #76a: bind the script-hash that matches PLACEHOLDER_CBOR.
+        aegisPolicyV1ScriptHash: PLACEHOLDER_HASH,
       },
       {
         rpc: keeperRpc as any,
         cardano,
         state,
         keeperCardanoAddr: "addr_test1xkeeper",
-        policyScriptCbor: ("0x" + "00".repeat(4)) as HexString,
+        policyScriptCbor: PLACEHOLDER_CBOR,
         fetchFairnessProof: async () => ({
           batchBlockRange: [90, 110],
           sortedIntentIds: [("0x" + "77".repeat(32)) as HexString],
@@ -182,6 +206,12 @@ describe("E2E happy path — intent → attest → batch → submit → settle",
           poolBalanceAda: 100_000_000n,
           proRataScaleBps: 5000,
           awardedAmountsAda: [1_000_000n],
+        }),
+        // Task #76b: provide a deterministic committee snapshot containing
+        // only the //Alice pubkey that signed the voucher.
+        fetchCommitteeSnapshot: async () => ({
+          members: [committeePubkey],
+          threshold: 1,
         }),
         logger: () => {},
       },

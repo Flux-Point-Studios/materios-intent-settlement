@@ -38,6 +38,9 @@ import {
   isSlotDriftError,
   SlotDriftExhaustedError,
 } from "./slot-retry.js";
+import { verifyPolicyScriptHash } from "./script-hash.js";
+import { verifyVoucherSigs } from "./voucher-sig-verify.js";
+import type { CommitteePubkey } from "@fluxpointstudios/materios-intent-settlement-sdk";
 
 export interface KeeperDeps {
   rpc: MateriosRpcClient;
@@ -51,6 +54,16 @@ export interface KeeperDeps {
   // caller can inject a resolver that fetches the full BFPR from Materios
   // storage (events pallet) or the events-indexer.
   fetchFairnessProof?: (voucher: Voucher) => Promise<BatchFairnessProof | null>;
+  /**
+   * Task #76b: optional override for the committee membership snapshot
+   * used during voucher-sig verification. When unset, the keeper queries
+   * `rpc.getCommitteeState()` once per `runOnce` and caches it. Tests
+   * can inject a static snapshot to keep them hermetic.
+   */
+  fetchCommitteeSnapshot?: () => Promise<{
+    members: readonly CommitteePubkey[];
+    threshold: number;
+  } | null>;
 }
 
 export interface KeeperMetrics {
@@ -60,6 +73,14 @@ export interface KeeperMetrics {
   batchesSettled: number;
   feeSpikeRetries: number;
   committeeSigFailures: number;
+  /**
+   * Task #76b: incremented every time a voucher's `(pubkey, sig)` bundle
+   * fails local sr25519 verification BEFORE the keeper pays Cardano fees.
+   * Distinct from `committeeSigFailures` (length/digest sanity checks); a
+   * voucher that passes the cheap sanity but fails crypto-verify lands
+   * here.
+   */
+  voucherSigVerifyFailures: number;
   orphanRollbacks: number;
   currentlyPaused: boolean;
 }
@@ -72,17 +93,37 @@ export class Keeper {
     batchesSettled: 0,
     feeSpikeRetries: 0,
     committeeSigFailures: 0,
+    voucherSigVerifyFailures: 0,
     orphanRollbacks: 0,
     currentlyPaused: false,
   };
 
   private halt: HaltState = initialHaltState();
   private stopSignal = false;
+  /**
+   * Cached committee snapshot for voucher-sig verification (Task #76b).
+   * Refreshed at the top of every `runOnce` so committee rotations are
+   * picked up within one poll interval.
+   */
+  private committeeSnapshot: {
+    members: readonly CommitteePubkey[];
+    threshold: number;
+  } | null = null;
 
   constructor(
     private readonly config: KeeperConfig,
     private readonly deps: KeeperDeps,
-  ) {}
+  ) {
+    // Task #76a: refuse to construct (and therefore refuse to start) if
+    // POLICY_SCRIPT_CBOR doesn't match the configured aegisPolicyV1ScriptHash.
+    // Operators on mainnet absolutely must not silently use a wrong
+    // validator binary; preprod enforces the same gate so misconfigs are
+    // caught in CI, not at fee-burn time.
+    //
+    // The check throws on mismatch / missing hash; the keeper CLI's
+    // `main().catch` surface logs it via sanitizeKeyringError and exits 1.
+    verifyPolicyScriptHash(deps.policyScriptCbor, config.aegisPolicyV1ScriptHash);
+  }
 
   log(level: "info" | "warn" | "error", msg: string, meta?: unknown): void {
     (this.deps.logger ?? defaultLogger)(level, msg, meta);
@@ -115,6 +156,12 @@ export class Keeper {
       return this.metrics;
     }
 
+    // (1.5) Task #76b: refresh the committee membership snapshot used by
+    // local voucher-sig verification. Cached for the duration of this tick
+    // so a single rotation mid-loop doesn't half-verify some vouchers
+    // against a stale snapshot.
+    await this.refreshCommitteeSnapshot();
+
     // (2) fetch pending batches
     const cursor = this.deps.state.snapshot.cursor;
     const batches = await this.deps.rpc.getPendingBatches(cursor, this.config.maxBatchSize).catch((err: unknown) => {
@@ -146,6 +193,35 @@ export class Keeper {
         this.log("error", "keeper runOnce errored", err);
       }
       await new Promise((r) => setTimeout(r, this.config.pollIntervalMs));
+    }
+  }
+
+  /**
+   * Task #76b: refresh the committee membership snapshot used for local
+   * voucher-sig verification. Called at the top of `runOnce` so a single
+   * snapshot is reused for every voucher in this tick.
+   *
+   * On RPC failure the cached snapshot is preserved (best-effort). On a
+   * fresh process where the first fetch fails, the cache stays null and
+   * `processBatch` will refuse to submit until a successful fetch lands.
+   */
+  private async refreshCommitteeSnapshot(): Promise<void> {
+    try {
+      if (this.deps.fetchCommitteeSnapshot) {
+        const snap = await this.deps.fetchCommitteeSnapshot();
+        if (snap) this.committeeSnapshot = snap;
+        return;
+      }
+      const state = await this.deps.rpc.getCommitteeState();
+      if (state && Array.isArray(state.members) && state.members.length > 0) {
+        this.committeeSnapshot = {
+          members: state.members,
+          threshold: state.threshold > 0 ? state.threshold : 1,
+        };
+      }
+    } catch (err) {
+      this.log("warn", "committee snapshot refresh failed", err);
+      // Keep prior cache; processBatch will skip submit if cache is null.
     }
   }
 
@@ -196,6 +272,45 @@ export class Keeper {
     const digest = voucherDigest(voucher);
     if (!digest || digest.length !== 66) {
       this.metrics.committeeSigFailures += 1;
+      return;
+    }
+
+    // Task #76b: sr25519-verify the (pubkey, sig) bundle against the live
+    // committee snapshot BEFORE paying Cardano fees. The pallet-side gate
+    // would catch a bad bundle on `settle_claim`, but by then we've already
+    // burned the Cardano submit fee. Pre-emptive local verify keeps a
+    // malicious / buggy committee daemon from making the keeper hemorrhage
+    // ADA.
+    //
+    // Stale-snapshot tolerance: we DON'T mark the submission as failed
+    // here — leave the sub in `observed` so a subsequent tick (with a
+    // refreshed snapshot) can retry. A genuinely-bad voucher will sit in
+    // `observed` until it expires (BFPR digest mismatch / ttl_block).
+    if (this.committeeSnapshot && this.committeeSnapshot.members.length > 0) {
+      const sigCheck = verifyVoucherSigs(voucher, {
+        committeeMembers: this.committeeSnapshot.members,
+        threshold: this.committeeSnapshot.threshold,
+      });
+      if (!sigCheck.ok) {
+        this.metrics.voucherSigVerifyFailures += 1;
+        this.log("warn", "voucher sig verify failed; skipping submit", {
+          claimId,
+          reason: sigCheck.reason,
+          detail: sigCheck.detail,
+          threshold: this.committeeSnapshot.threshold,
+          memberCount: this.committeeSnapshot.members.length,
+        });
+        return;
+      }
+    } else {
+      // Snapshot unavailable — refuse to submit. The pallet enforces a
+      // threshold sig bundle, so we'd waste fees if the vouchers don't
+      // ultimately satisfy it. Better to retry on the next tick once the
+      // RPC recovers.
+      this.metrics.voucherSigVerifyFailures += 1;
+      this.log("warn", "no committee snapshot available; skipping submit", {
+        claimId,
+      });
       return;
     }
 
