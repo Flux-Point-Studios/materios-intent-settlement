@@ -14,7 +14,6 @@ import {
   computeKeeperFeeLovelace,
   settleClaimPayload,
   validateFairnessProof,
-  voucherDigest,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
 import { u8aToHex } from "@polkadot/util";
 import type {
@@ -263,17 +262,19 @@ export class Keeper {
       return;
     }
 
-    // Sanity: recompute voucher digest and make sure it matches what committee signed.
-    // Any committee sig failure here is a hard stop — don't waste tx fees.
+    // Cheap pre-check: empty committeeSigs is a structural failure and
+    // means no point continuing to the full sr25519 verify below.
     if (voucher.committeeSigs.length === 0) {
       this.metrics.committeeSigFailures += 1;
       return;
     }
-    const digest = voucherDigest(voucher);
-    if (!digest || digest.length !== 66) {
-      this.metrics.committeeSigFailures += 1;
-      return;
-    }
+
+    // (Pre-#73 there was a separate `voucherDigest(voucher)` length-66 check
+    // here. That was a degenerate validation against the SCALE-encoded digest
+    // form which has been retired in favour of the chain-identity-bound CBOR
+    // form (`voucherDigestWithAddress`). The full sigs-against-snapshot
+    // verify below subsumes the structural check, so dropping it does not
+    // weaken the keeper's pre-flight.)
 
     // Task #76b: sr25519-verify the (pubkey, sig) bundle against the live
     // committee snapshot BEFORE paying Cardano fees. The pallet-side gate
