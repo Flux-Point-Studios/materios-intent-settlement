@@ -29,8 +29,8 @@
   },
   "testAccounts": {
     "submitter": {
-      "materiosSs58": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
-      "comment": "//Alice — dev chain account. Replace with real preprod faucet-funded account for production demo."
+      "materiosSs58": "${E2E_SUBMITTER_SS58:-5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY}",
+      "comment": "Defaults to //Alice public key (dev chain account) when E2E_SUBMITTER_SS58 unset. Override via env-var with a real preprod faucet-funded account for production demo runs."
     }
   },
   "committee": {

@@ -3,12 +3,12 @@
 **Status:** LOCKED spec, build-ready. Wave 2 TDD teams (A/B/C) code against this document.
 **Date:** 2026-04-20
 **Author agent:** `materios-wave-1-spec-2026-04-20`
-**Predecessor:** `/home/deci/materios-intent-settlement-decisions.md` (6 product decisions + repo strategy locked by Nathaniel)
+**Predecessor:** `materios-intent-settlement-decisions-v1.md` (6 product decisions + repo strategy locked by Flux Point Studios; internal archive)
 **Scope:** single source of truth for type layout, extrinsic surface, validator redeemers, keeper protocol, and cross-layer conventions.
 
 > **Repo target matrix.** `pallet_intent_settlement` + `pallet_committee_governance` + keeper service + TS/Rust SDK land in a NEW repo `Flux-Point-Studios/materios-intent-settlement` (to be created by Wave 2 Team A as first PR). The Aiken validator library `aegis-aiken-v1` plus the Aegis dApp frontend land in the existing PRIVATE repo `Flux-Point-Studios/aegis-parametric-insurance-dev`. No code in either repo today — this spec predates both.
 
-> **Live-state reminder.** Materios preprod v5 genesis `0xbc0531cb311281565036fb397a376f0e0fa37005589655f97a7924b2729a164c`; committee 4 validators + 3 attestors, threshold 2; cardano-mainnet-anchor wallet + `materios-anchor-worker` already in production for label-8746 checkpoints (`/home/deci/materios-anchor-worker/index.mjs`). Do not duplicate that infra — reuse it.
+> **Live-state reminder.** Materios preprod v5 genesis `0xbc0531cb311281565036fb397a376f0e0fa37005589655f97a7924b2729a164c`; committee 4 validators + 3 attestors, threshold 2; cardano-mainnet-anchor wallet + the `materios-anchor-worker` service are already in production for label-8746 checkpoints. Do not duplicate that infra — reuse it.
 
 ---
 
@@ -459,7 +459,7 @@ pub enum Event<T: Config> {
 Every time `execute_rotation` completes:
 
 1. The pallet emits an on-chain "new committee set digest" event.
-2. The existing `materios-anchor-worker` (already running against label 8746 at `/home/deci/materios-anchor-worker/index.mjs`) picks up the event via its routine block-scan and constructs a Cardano metadata payload following the `materios-anchor-v2` schema with an extra field:
+2. The existing `materios-anchor-worker` service (already running against label 8746 in production) picks up the event via its routine block-scan and constructs a Cardano metadata payload following the `materios-anchor-v2` schema with an extra field:
 
 ```json
 {
@@ -807,7 +807,7 @@ Feed rotation requires validator redeploy (new `AegisPolicyParams`); during tran
 
 ### 6.6 Anchor-worker reuse clause
 
-`materios-anchor-worker` at `/home/deci/materios-anchor-worker/index.mjs` is ALREADY in production signing to Cardano mainnet under label 8746 via the `cardano-mainnet-anchor.mnemonic` wallet. For Aegis v1:
+The `materios-anchor-worker` service is ALREADY in production signing to Cardano mainnet under label 8746 via the `cardano-mainnet-anchor` wallet. For Aegis v1:
 
 - Target Cardano **preprod** initially (not mainnet) — preprod wallet: `cardano-preprod-anchor.mnemonic` (to be provisioned by ops; 500 tADA from preprod faucet should suffice for 6 months of batch anchoring).
 - Extend anchor-worker's request body schema to accept an optional `ext` field carrying `committee_set_digest` / `fairness_proof_digest`. Additive, backward-compatible.
@@ -900,7 +900,7 @@ These are items the spec makes a default choice on but flags for review:
 - Wave 2 kickoff is gated on: (a) this document approved by Nathaniel, (b) the two repos created (`materios-intent-settlement` + feature branch on `aegis-parametric-insurance-dev`), (c) Charli3 feed policy_ids resolved (Open Item #1).
 - Related memory files (background context, non-authoritative): `project_materios_architecture.md`, `project_spo_crossvalidation.md`, `project_v5_chain.md`, `project_v5_1_tokenomics.md`, `project_cardano_l1_metadata_labels.md`, `feedback_cardano_explorer.md`, `feedback_materios_mempool_ops.md`, `feedback_iog_idp_none_panic.md`, `reference_multisig_sudo.md`, `reference_orynq_mcp.md`, `project_midnight_poc_findings.md`, `project_materios_intent_settlement_dapp.md`.
 - Live infrastructure to reuse (do NOT duplicate):
-  - `/home/deci/materios-anchor-worker/index.mjs` — label-8746 anchor worker (Gemtek native Node). Extend, don't replace.
+  - `materios-anchor-worker` — label-8746 anchor worker (native Node service in the operator's deployment). Extend, don't replace.
   - `operator-kit@cdc35c2` cert-daemon — swap payload type, reuse signing/retry/blob-upload machinery.
   - Saturnswap.io Ogmios/Kupo endpoints for Cardano preprod and mainnet.
   - `wss://materios.fluxpointstudios.com/preprod-rpc` — Materios RPC.
