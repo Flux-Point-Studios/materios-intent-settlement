@@ -10,16 +10,26 @@
  * the Cardano submit fee for it.
  *
  * This module provides a pure function `verifyVoucherSigs` that consumes
- * a Voucher + the committee membership snapshot and returns whether the
- * voucher is safe to submit. It does NOT mutate state — the caller decides
- * how to react (skip, log, increment a metric).
+ * a Voucher + the committee membership snapshot + the chain-identity
+ * tuple (#73) and returns whether the voucher is safe to submit. It does
+ * NOT mutate state — the caller decides how to react (skip, log,
+ * increment a metric).
+ *
+ * # Digest derivation
+ *
+ * The canonical voucher digest is `voucherDigestWithAddress` — the
+ * chain-identity-bound CBOR form that the deployed Aiken validator
+ * reconstructs (#79). The legacy SCALE `voucherDigest` was deleted; this
+ * helper now computes the digest internally so callers can never
+ * accidentally pass the wrong variant.
  */
 
 import { hexToU8a } from "@polkadot/util";
 import { sr25519Verify } from "@polkadot/util-crypto";
 import {
-  voucherDigest,
   voucherDigestWithAddress,
+  encodeType0AddressCbor,
+  splitType0AddressBytes,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
 import type {
   CommitteePubkey,
@@ -42,6 +52,22 @@ export type VoucherSigVerifyResult =
       detail?: string;
     };
 
+/**
+ * #73: chain-identity tuple bound into the canonical voucher digest. All
+ * four fields MUST match what the pallet (and the deployed Aiken
+ * validator) compute, otherwise local verify and chain verify diverge.
+ */
+export interface ChainIdentity {
+  /** 32-byte Materios genesis hash, hex-prefixed. */
+  materiosChainId: HexString;
+  /** Cardano protocol magic — 1 for preprod, 764824073 for mainnet. */
+  networkMagic: number;
+  /** 28-byte deployed `aegis_policy_v1` blake2b_224 hash, hex-prefixed. */
+  aegisPolicyV1ScriptHash: HexString;
+  /** Settlement-protocol semver (u32). */
+  settlementVersion: number;
+}
+
 export interface VerifyVoucherSigsOptions {
   /**
    * Live committee membership snapshot from chain state. Each entry is a
@@ -55,12 +81,41 @@ export interface VerifyVoucherSigsOptions {
    */
   threshold: number;
   /**
-   * Optional alternative digest function. When the voucher will be verified
-   * against the Aiken validator on Cardano (which uses
-   * `voucherDigestWithAddress` with CBOR beneficiary), pass that variant.
-   * Default: SCALE-style `voucherDigest` (matches the pallet's compute path).
+   * #73 chain-identity tuple bound into the canonical digest. Production
+   * keepers fill these from `KeeperConfig`; tests pin a fixture tuple
+   * matching the pallet integration constants (`0x73*32` chain id,
+   * `0x42*28` script hash, networkMagic=1, settlementVersion=1).
    */
-  digestFn?: (voucher: Voucher) => HexString;
+  chainIdentity: ChainIdentity;
+}
+
+/**
+ * Compute the canonical voucher digest the committee should have signed.
+ * Mirrors what the pallet computes runtime-side and what the deployed
+ * Aiken validator reconstructs from datum + redeemer. The voucher's
+ * `beneficiaryCardanoAddr` MUST be a 57-byte CIP-0019 type-0 address
+ * (header || payment_hash(28) || stake_hash(28)) — anything else throws
+ * here and the caller maps it to a `digest_mismatch` result.
+ */
+function computeVoucherDigestForVerify(
+  voucher: Voucher,
+  chainIdentity: ChainIdentity,
+): HexString {
+  const hashes = splitType0AddressBytes(voucher.beneficiaryCardanoAddr);
+  const cbor = encodeType0AddressCbor(hashes);
+  return voucherDigestWithAddress({
+    claimId: voucher.claimId,
+    policyId: voucher.policyId,
+    beneficiaryAddressCbor: cbor,
+    amountAda: voucher.amountAda,
+    batchFairnessProofDigest: voucher.batchFairnessProofDigest,
+    issuedBlock: voucher.issuedBlock,
+    expirySlotCardano: voucher.expirySlotCardano,
+    materiosChainId: chainIdentity.materiosChainId,
+    networkMagic: chainIdentity.networkMagic,
+    aegisPolicyV1ScriptHash: chainIdentity.aegisPolicyV1ScriptHash,
+    settlementVersion: chainIdentity.settlementVersion,
+  });
 }
 
 /**
@@ -90,10 +145,9 @@ export function verifyVoucherSigs(
   }
 
   // Compute the canonical digest the committee should have signed.
-  const digestFn = opts.digestFn ?? voucherDigest;
   let digestHex: HexString;
   try {
-    digestHex = digestFn(voucher);
+    digestHex = computeVoucherDigestForVerify(voucher, opts.chainIdentity);
   } catch (err) {
     return {
       ok: false,
@@ -209,4 +263,4 @@ export function verifyVoucherSigs(
   return { ok: true, verifiedCount: validCount, threshold: opts.threshold };
 }
 
-export { voucherDigest, voucherDigestWithAddress };
+export { voucherDigestWithAddress };

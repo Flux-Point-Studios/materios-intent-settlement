@@ -20,6 +20,13 @@
  *                            Operators MUST supply the deployed Aiken
  *                            blueprint hash; mainnet must NEVER silently
  *                            accept an unbound CBOR.
+ *   MATERIOS_CHAIN_ID      — #73: 32-byte (66-hex incl. 0x) Materios genesis hash.
+ *                            Optional; defaults to chain.getBlockHash(0) at
+ *                            startup. Pinning explicitly avoids a wrong-chain
+ *                            misconfig surviving an RPC swap.
+ *   NETWORK_MAGIC          — Cardano protocol magic; defaults from NETWORK
+ *                            (preprod=1, mainnet=764824073).
+ *   SETTLEMENT_VERSION     — #73 settlement-protocol semver u32. Default 1.
  *   NETWORK                — "preprod" | "mainnet" (mainnet requires ENABLE_MAINNET=1)
  *   KEEPER_STATE_PATH      — path to persisted state (default ./keeper-state.json)
  *   DRY_RUN                — "1" to skip actual Cardano submits
@@ -48,8 +55,32 @@ async function main(): Promise<void> {
   const statePath = process.env.KEEPER_STATE_PATH ?? "./keeper-state.json";
   const dryRun = process.env.DRY_RUN === "1";
 
+  // #73 chain-identity defaults. Operators can override any of these via
+  // env var; without overrides we resolve `materiosChainId` from the
+  // genesis block hash (queried below after rpc.connect()) and pick
+  // sensible Cardano-network-specific defaults for the rest.
+  const settlementVersion = process.env.SETTLEMENT_VERSION
+    ? Number.parseInt(process.env.SETTLEMENT_VERSION, 10)
+    : 1;
+  const networkMagic = process.env.NETWORK_MAGIC
+    ? Number.parseInt(process.env.NETWORK_MAGIC, 10)
+    : network === "mainnet"
+      ? 764824073
+      : 1;
+
   const rpc = new MateriosRpcClient({ rpcUrl: materiosRpcUrl, signerUri: keeperMnemonic });
   await rpc.connect();
+
+  // Resolve `materiosChainId`: prefer env (pinned in deployment config),
+  // fall back to genesis block hash. Querying the chain at startup is
+  // more reliable than a user-typed hex string surviving redeploys, but
+  // either source ends up baked into every committee-signed digest.
+  let materiosChainId = (process.env.MATERIOS_CHAIN_ID ?? "") as `0x${string}`;
+  if (!materiosChainId || !materiosChainId.startsWith("0x")) {
+    const api = rpc.getApi();
+    const genesisHash = await api.rpc.chain.getBlockHash(0);
+    materiosChainId = genesisHash.toHex() as `0x${string}`;
+  }
 
   const cardano = await createMeshCardanoProvider({
     network,
@@ -74,6 +105,9 @@ async function main(): Promise<void> {
       maxBatchSize: 32,
       dryRun,
       aegisPolicyV1ScriptHash,
+      materiosChainId,
+      networkMagic,
+      settlementVersion,
     },
     {
       rpc,

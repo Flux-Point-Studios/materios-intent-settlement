@@ -20,7 +20,9 @@ import type {
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
 import {
   intentId as computeIntentId,
-  voucherDigest,
+  voucherDigestWithAddress,
+  encodeType0AddressCbor,
+  splitType0AddressBytes,
   signPayload,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
 import { hexToU8a, u8aToHex } from "@polkadot/util";
@@ -42,11 +44,33 @@ beforeAll(async () => {
 const PLACEHOLDER_CBOR = ("0x" + "00".repeat(4)) as HexString;
 const PLACEHOLDER_HASH = computePlutusV3ScriptHash(PLACEHOLDER_CBOR);
 
+// #73 + #79: pinned chain-identity tuple. Pallet uses `0x42*28` for its
+// in-runtime parity tests, but the keeper's #76a startup gate enforces
+// `aegisPolicyV1ScriptHash == blake2b_224(0x03||CBOR)`, so we pin to
+// the actual hash of the placeholder CBOR. `signedBy` and the keeper
+// `verifyVoucherSigs` both use this same constant, so digests match.
+const TEST_CHAIN_ID: HexString = ("0x" + "73".repeat(32)) as HexString;
+const TEST_AEGIS_SCRIPT_HASH: HexString = PLACEHOLDER_HASH;
+const TEST_NETWORK_MAGIC = 1;
+const TEST_SETTLEMENT_VERSION = 1;
+
+/**
+ * #79: build a 57-byte CIP-0019 type-0 address. The chain-identity-bound
+ * `voucherDigestWithAddress` derivation requires a real type-0 layout so
+ * `splitType0AddressBytes` doesn't reject the input.
+ */
+function type0Address(fill: number): Uint8Array {
+  const out = new Uint8Array(57);
+  out[0] = 0x01;
+  for (let i = 1; i < 57; i++) out[i] = fill & 0xff;
+  return out;
+}
+
 /**
  * Build a Voucher whose `committeeSigs` are real sr25519 signatures over
- * the canonical voucherDigest. The returned bundle pairs (alice pubkey,
- * sig) so the test can register `alice` as a committee member and the
- * sig-verify gate (#76b) will pass.
+ * the canonical voucherDigestWithAddress. The returned bundle pairs
+ * (alice pubkey, sig) so the test can register `alice` as a committee
+ * member and the sig-verify gate (#76b) will pass.
  */
 function makeSignedVoucher(
   id: HexString,
@@ -56,7 +80,7 @@ function makeSignedVoucher(
   const base: Voucher = {
     claimId: id,
     policyId: ("0x" + "ee".repeat(32)) as HexString,
-    beneficiaryCardanoAddr: new TextEncoder().encode("addr_test1xyz"),
+    beneficiaryCardanoAddr: type0Address(0xab),
     amountAda: 10_000_000n,
     batchFairnessProofDigest: ("0x" + "dd".repeat(32)) as HexString,
     issuedBlock: 110,
@@ -64,7 +88,21 @@ function makeSignedVoucher(
     committeeSigs: [],
     ...overrides,
   };
-  const digestHex = voucherDigest(base);
+  const hashes = splitType0AddressBytes(base.beneficiaryCardanoAddr);
+  const cbor = encodeType0AddressCbor(hashes);
+  const digestHex = voucherDigestWithAddress({
+    claimId: base.claimId,
+    policyId: base.policyId,
+    beneficiaryAddressCbor: cbor,
+    amountAda: base.amountAda,
+    batchFairnessProofDigest: base.batchFairnessProofDigest,
+    issuedBlock: base.issuedBlock,
+    expirySlotCardano: base.expirySlotCardano,
+    materiosChainId: TEST_CHAIN_ID,
+    networkMagic: TEST_NETWORK_MAGIC,
+    aegisPolicyV1ScriptHash: TEST_AEGIS_SCRIPT_HASH,
+    settlementVersion: TEST_SETTLEMENT_VERSION,
+  });
   const digestBytes = hexToU8a(digestHex);
   const sigs: Array<{ pubkey: HexString; sig: HexString }> = [];
   const pubkeys: CommitteePubkey[] = [];
@@ -187,6 +225,12 @@ const baseConfig: KeeperConfig = {
   // Task #76a: must be set so the keeper's startup script-hash check
   // accepts PLACEHOLDER_CBOR.
   aegisPolicyV1ScriptHash: PLACEHOLDER_HASH,
+  // #73: pinned chain-identity tuple matching the pallet integration
+  // runtime. `makeSignedVoucher` signs digests bound to these constants
+  // so the keeper's #76b verify-before-submit gate accepts.
+  materiosChainId: TEST_CHAIN_ID,
+  networkMagic: TEST_NETWORK_MAGIC,
+  settlementVersion: TEST_SETTLEMENT_VERSION,
 };
 
 describe("Keeper.runOnce — happy path", () => {
