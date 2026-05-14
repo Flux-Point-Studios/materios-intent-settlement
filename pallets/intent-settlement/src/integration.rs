@@ -209,6 +209,18 @@ impl pallet_intent_settlement::pallet::Config for Testnet {
     type NetworkMagic = TestNetworkMagic;
     type AegisPolicyV1ScriptHash = TestAegisPolicyV1ScriptHash;
     type SettlementVersion = TestSettlementVersion;
+    #[cfg(feature = "runtime-benchmarks")]
+    type BenchmarkHelper = IntegrationBenchmarkHelper;
+    type WeightInfo = ();
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+pub struct IntegrationBenchmarkHelper;
+#[cfg(feature = "runtime-benchmarks")]
+impl pallet_intent_settlement::BenchmarkHelper<sp_runtime::AccountId32>
+    for IntegrationBenchmarkHelper
+{
+    fn whitelist_as_committee(_who: &sp_runtime::AccountId32) {}
 }
 
 fn user_account() -> sp_runtime::AccountId32 {
