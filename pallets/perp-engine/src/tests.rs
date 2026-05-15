@@ -1,45 +1,47 @@
-//! Unit tests for `pallet-perp-engine` v0 scaffolding (task #259, PR-A).
+//! Unit tests for `pallet-perp-engine` v0 (task #259).
 //!
-//! Scaffold-only contract: the tests in this file verify the pallet
-//! compiles, the call surface is exposed via the constructed runtime,
-//! genesis state is empty, default constants are pinned to design-memo
-//! §9.1 values, and error variants are distinct. Real behaviour tests
-//! land in PR-B alongside the dispatch impl bodies.
+//! PR-A scaffold landed 5 surface-only tests; PR-B adds the impl-body
+//! coverage. This file ships both: the original PR-A tests plus
+//! ~18 new behaviour tests for `open_position`, `close_position`,
+//! `deposit_margin`, `withdraw_margin`, and `adjust_leverage` per the
+//! impl contract in design memo §3 + §6.1.
 //!
-//! Five tests:
-//! 1. [`it_compiles`] — type-system smoke test: every public type from
-//!    `types::*` constructs from raw fields under the test runtime.
-//! 2. [`genesis_state_empty`] — `Markets`, `Positions`, `MarginAccounts`,
-//!    `MarkPriceCacheMap`, `CumulativeFundingIndex`,
-//!    `PremiumIndexSamples`, `LastSettledFundingEpoch`,
-//!    `ReservedKeeperBonds`, `BadDebtAccumulated` are all empty / zero
-//!    at genesis. Pins the storage schema against accidental
-//!    `GenesisConfig`-bearing pre-population.
-//! 3. [`call_surface_exposed`] — all 8 extrinsic stubs are callable
-//!    through the runtime dispatcher and return `Ok(())`. Pins the
-//!    signed/root origin gates per design memo §3.x.
-//! 4. [`default_constants_pinned`] — `MaxLeverageBps`, `MinLeverageBps`,
-//!    `FreshnessLimitBlocks`, `MaxMarkBasisBps`, `KeeperBondMinimum`,
-//!    `MaxMarkets`, `MaxFundingSamplesPerEpoch` match the design-memo
-//!    §9.1 risk-parameter table.
-//! 5. [`error_variants_distinct`] — at least 9 error variants
-//!    (`MarketNotFound`, `MarketPaused`, `LeverageOutOfBounds`,
-//!    `InsufficientMargin`, `PositionNotFound`, `MaxSlippageExceeded`,
-//!    `BadLiquidationAttempt`, `OracleUnavailable`, `EpochAlreadySettled`)
-//!    Debug-print to distinct names — pins the on-fail UX so callers
-//!    can pattern-match every failure mode.
+//! ## Mock oracle
+//!
+//! The mock `PriceOracle` reads from `MockOraclePrices` /
+//! `MockOracleFresh` thread-local-backed storage maps so each test can
+//! configure prices independently per feed_id. Use the helpers
+//! `set_oracle_price` / `set_oracle_fresh` at the top of each test
+//! that depends on a specific oracle state.
+//!
+//! ## Markets
+//!
+//! Tests register markets via direct storage writes (`Markets::insert`).
+//! `governance_set_market` impl is reserved for PR-D so we bypass it
+//! here — same shape as `pallet-oracle`'s `tests.rs` does for
+//! `register_attestor` pre-coverage.
+//!
+//! ## Counts
+//!
+//! - 5 PR-A tests (kept intact, with `call_surface_exposed` adjusted
+//!   for the new impl bodies that need a market registered).
+//! - 18 new PR-B behaviour tests covering opens, closes, deposits,
+//!   withdrawals, leverage adjusts, and the math-overflow guard.
 
 #![cfg(test)]
 
 use crate as pallet_perp_engine;
+use crate::math;
 use crate::pallet::{Error, PriceOracle};
 use crate::types::*;
 use frame_support::{
-    assert_ok, construct_runtime, derive_impl, parameter_types,
+    assert_noop, assert_ok, construct_runtime, derive_impl, parameter_types,
     traits::ConstU128,
     PalletId,
 };
 use sp_runtime::{traits::IdentityLookup, BuildStorage};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Mock runtime
@@ -103,23 +105,81 @@ parameter_types! {
     /// PalletId for the pot account. Matches the pattern used elsewhere
     /// in the workspace ("mat/" prefix per `feedback_chain_reset_runbook`).
     pub const TestPerpPalletId: PalletId = PalletId(*b"mat/pep0");
+    /// Withdraw dwell time in blocks (24h at 6s = 14_400). Tests
+    /// drive `System::set_block_number(now + dwell + 1)` to clear it.
+    pub const TestWithdrawDwellBlocks: u32 = 14_400;
 }
 
-/// Mock price oracle: returns `Some(1_000_000_000_000_000_000)` (1.0 at
-/// 1e18 scale) for any feed_id, always fresh, age 0. Real adapter
-/// wiring to `pallet-oracle::Pallet` lands in PR-D (runtime
-/// integration) — out of scope for the scaffold.
+/// MATRA/USD feed id for the test fixture. Production: the canonical
+/// Aegis-published feed handle.
+fn matra_usd_feed_id() -> OracleFeedId {
+    OracleFeedId::try_from(b"MATRA/USD".to_vec())
+        .expect("9 bytes < MAX_MARKET_ID_LEN=16")
+}
+
+parameter_types! {
+    pub TestMatraUsdFeedId: OracleFeedId = matra_usd_feed_id();
+}
+
+thread_local! {
+    /// Per-feed price (1e18-scaled).
+    static MOCK_ORACLE_PRICES: RefCell<HashMap<Vec<u8>, u128>> =
+        RefCell::new(HashMap::new());
+    /// Per-feed freshness flag.
+    static MOCK_ORACLE_FRESH: RefCell<HashMap<Vec<u8>, bool>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Mock price oracle backed by thread-local storage. Tests can pause
+/// or repoint a feed via `set_oracle_price` / `set_oracle_fresh`.
+/// Default: every feed returns `$1.00` 1e18-scaled and is fresh.
 pub struct MockPriceOracle;
 impl PriceOracle for MockPriceOracle {
-    fn latest_price_e18(_feed_id: &OracleFeedId) -> Option<u128> {
-        Some(1_000_000_000_000_000_000u128)
+    fn latest_price_e18(feed_id: &OracleFeedId) -> Option<u128> {
+        let key = feed_id.to_vec();
+        MOCK_ORACLE_PRICES.with(|m| m.borrow().get(&key).copied())
     }
     fn price_age_blocks(_feed_id: &OracleFeedId) -> u32 {
         0
     }
-    fn is_fresh(_feed_id: &OracleFeedId) -> bool {
-        true
+    fn is_fresh(feed_id: &OracleFeedId) -> bool {
+        let key = feed_id.to_vec();
+        MOCK_ORACLE_FRESH.with(|m| m.borrow().get(&key).copied().unwrap_or(false))
     }
+}
+
+/// Wipes the mock oracle and configures `feed_id → price_e18` + fresh.
+pub fn set_oracle_price(feed_id: &OracleFeedId, price_e18: u128) {
+    let key = feed_id.to_vec();
+    MOCK_ORACLE_PRICES.with(|m| {
+        m.borrow_mut().insert(key.clone(), price_e18);
+    });
+    MOCK_ORACLE_FRESH.with(|m| {
+        m.borrow_mut().insert(key, true);
+    });
+}
+
+/// Sets a feed's freshness flag. Pricing must already be set via
+/// `set_oracle_price`; this only flips `is_fresh`.
+pub fn set_oracle_fresh(feed_id: &OracleFeedId, fresh: bool) {
+    let key = feed_id.to_vec();
+    MOCK_ORACLE_FRESH.with(|m| {
+        m.borrow_mut().insert(key, fresh);
+    });
+}
+
+/// Removes the price entry — `latest_price_e18` returns `None`.
+/// Reserved for PR-C liquidate tests that need to drop the oracle
+/// mid-flight. Public so the future-PR tests can use it.
+#[allow(dead_code)]
+pub fn clear_oracle_price(feed_id: &OracleFeedId) {
+    let key = feed_id.to_vec();
+    MOCK_ORACLE_PRICES.with(|m| {
+        m.borrow_mut().remove(&key);
+    });
+    MOCK_ORACLE_FRESH.with(|m| {
+        m.borrow_mut().remove(&key);
+    });
 }
 
 impl pallet_perp_engine::Config for Test {
@@ -137,6 +197,8 @@ impl pallet_perp_engine::Config for Test {
     type MaxMarkBasisBps = TestMaxMarkBasisBps;
     type BadDebtCircuitBreakerThresholdE18 = TestBadDebtCircuitBreakerThresholdE18;
     type BadDebtWindowBlocks = TestBadDebtWindowBlocks;
+    type MatraUsdFeedId = TestMatraUsdFeedId;
+    type WithdrawDwellBlocks = TestWithdrawDwellBlocks;
 }
 
 pub fn new_test_ext() -> sp_io::TestExternalities {
@@ -144,7 +206,20 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
         .build_storage()
         .expect("frame_system genesis builds");
     let mut ext = sp_io::TestExternalities::new(t);
-    ext.execute_with(|| System::set_block_number(1));
+    ext.execute_with(|| {
+        // Reset mock-oracle storage between tests (thread-local
+        // would otherwise persist).
+        MOCK_ORACLE_PRICES.with(|m| m.borrow_mut().clear());
+        MOCK_ORACLE_FRESH.with(|m| m.borrow_mut().clear());
+        System::set_block_number(1);
+        // Default MATRA/USD = $1.00. Most tests treat MOTRA == USD
+        // 1:1 so the conversion arithmetic doesn't dominate test
+        // assertions; one test below pegs it differently to prove
+        // the conversion math.
+        set_oracle_price(&matra_usd_feed_id(), 1_000_000_000_000_000_000u128);
+        // Default ADA/USD = $1.00 — same logic.
+        set_oracle_price(&ada_usd_feed_id(), 1_000_000_000_000_000_000u128);
+    });
     ext
 }
 
@@ -185,8 +260,49 @@ fn default_ada_perp_market_config() -> MarketConfig {
     }
 }
 
+/// Inserts a fresh ADA-PERP market into storage. Tests bypass
+/// `governance_set_market` (reserved for PR-D) and write directly.
+fn register_default_market() {
+    pallet_perp_engine::pallet::Markets::<Test>::insert(
+        &ada_perp_market_id(),
+        default_ada_perp_market_config(),
+    );
+}
+
+/// Inserts a market that's paused (for the paused-rejection test).
+fn register_paused_market() {
+    let mut cfg = default_ada_perp_market_config();
+    cfg.paused = true;
+    pallet_perp_engine::pallet::Markets::<Test>::insert(&ada_perp_market_id(), cfg);
+}
+
+/// Credit `who` with raw MOTRA on the Balances pallet so they can
+/// `deposit_margin`. (Tests that mutate `MarginAccount.free_e18`
+/// directly skip Balances and write through the margin map.)
+fn credit_motra(who: u64, amount: u128) {
+    pallet_balances::Pallet::<Test>::force_set_balance(
+        RuntimeOrigin::root(),
+        who,
+        amount,
+    )
+    .expect("force_set_balance succeeds");
+}
+
+/// Helper: directly seed `MarginAccount.free_e18` without going through
+/// `deposit_margin`. Used by tests that want to skip the MOTRA leg
+/// for clarity.
+fn seed_free_margin(who: u64, free_e18: u128) {
+    pallet_perp_engine::pallet::MarginAccounts::<Test>::insert(
+        who,
+        MarginAccount {
+            free_e18,
+            last_deposit_block: 0,
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------
-// Tests
+// PR-A surface tests (kept)
 // ---------------------------------------------------------------------------
 
 /// Smoke test — every public type from `types::*` constructs end-to-end
@@ -269,15 +385,13 @@ fn genesis_state_empty() {
         // No positions.
         assert!(pallet_perp_engine::pallet::Positions::<Test>::iter().next().is_none());
 
-        // No margin accounts. (ValueQuery returns default for missing
-        // keys, but iter() must be empty.)
+        // No margin accounts.
         assert!(pallet_perp_engine::pallet::MarginAccounts::<Test>::iter().next().is_none());
 
         // No mark-price cache rows.
         assert!(pallet_perp_engine::pallet::MarkPriceCacheMap::<Test>::iter().next().is_none());
 
-        // Cumulative funding index is empty (i128 ValueQuery returns 0
-        // for missing keys; iter() must yield no rows).
+        // Cumulative funding index is empty.
         assert!(pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::iter().next().is_none());
 
         // No premium-index samples.
@@ -286,9 +400,7 @@ fn genesis_state_empty() {
         // No funding-epoch settle-progress rows.
         assert!(pallet_perp_engine::pallet::LastSettledFundingEpoch::<Test>::iter().next().is_none());
 
-        // No in-flight keeper-bond reservations. This is also the v0 §4.6
-        // try_state invariant pinned here at genesis (PR-B adds the
-        // hook).
+        // No in-flight keeper-bond reservations.
         assert!(pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::iter().next().is_none());
 
         // No bad debt accrued.
@@ -296,75 +408,39 @@ fn genesis_state_empty() {
     });
 }
 
-/// Every one of the 8 extrinsic stubs is callable via the dispatcher
-/// and returns `Ok(())`. Origin gates (`ensure_signed` x7,
-/// `ensure_root` x1) are exercised.
+/// Surface check: stubs for `liquidate` / `settle_funding` /
+/// `governance_set_market` still return `Ok(())` (PR-B preserves them
+/// per the user's instruction). The dispatcher origin gates are
+/// still exercised.
 ///
-/// Per the design memo §3 each extrinsic has a fixed signature; this
-/// test pins that signature shape at the runtime-dispatch level.
+/// `open_position`, `close_position`, `deposit_margin`, `withdraw_margin`,
+/// `adjust_leverage` have full impls now and are tested below — this
+/// test only verifies the three stub extrinsics are still callable.
 #[test]
-fn call_surface_exposed() {
+fn call_surface_exposed_stubs_only() {
     new_test_ext().execute_with(|| {
         let market_id = ada_perp_market_id();
         let signer = 1u64;
 
-        // (1) open_position — signed.
-        assert_ok!(PerpEngine::open_position(
-            RuntimeOrigin::signed(signer),
-            market_id.clone(),
-            PerpDirection::Long,
-            100_000_000u128,   // 1.0
-            1_000u32,           // 10× leverage
-            50u32,              // 0.5% slippage
-            0u128,              // no margin top-up
-        ));
-
-        // (2) close_position — signed.
-        assert_ok!(PerpEngine::close_position(
-            RuntimeOrigin::signed(signer),
-            market_id.clone(),
-            0u128,              // 0 = close all
-            50u32,
-        ));
-
-        // (3) deposit_margin — signed.
-        assert_ok!(PerpEngine::deposit_margin(
-            RuntimeOrigin::signed(signer),
-            1_000u128,
-        ));
-
-        // (4) withdraw_margin — signed.
-        assert_ok!(PerpEngine::withdraw_margin(
-            RuntimeOrigin::signed(signer),
-            1_000_000_000_000_000_000u128, // 1.0 pMATRA-USD
-        ));
-
-        // (5) liquidate — signed (permissionless).
+        // (5) liquidate — stub, returns Ok.
         assert_ok!(PerpEngine::liquidate(
             RuntimeOrigin::signed(signer),
-            2u64,               // target
+            2u64,
             market_id.clone(),
-            100u128,            // keeper bond
+            100u128,
         ));
 
-        // (6) settle_funding — signed (permissionless).
+        // (6) settle_funding — stub, returns Ok.
         assert_ok!(PerpEngine::settle_funding(
             RuntimeOrigin::signed(signer),
             market_id.clone(),
             1u32,
         ));
 
-        // (7) adjust_leverage — signed.
-        assert_ok!(PerpEngine::adjust_leverage(
-            RuntimeOrigin::signed(signer),
-            market_id.clone(),
-            500u32,             // 5×
-        ));
-
-        // (8) governance_set_market — root only (sudo / 2-of-3 multisig).
+        // (8) governance_set_market — stub, root-gated.
         assert_ok!(PerpEngine::governance_set_market(
             RuntimeOrigin::root(),
-            market_id.clone(),
+            market_id,
             default_ada_perp_market_config(),
         ));
     });
@@ -415,16 +491,16 @@ fn default_constants_pinned() {
         [0x73u8; 32],
         "chain-id fixture matches pallet-intent-settlement / pallet-oracle"
     );
+    assert_eq!(
+        <Test as pallet_perp_engine::Config>::WithdrawDwellBlocks::get(),
+        14_400,
+        "design memo §3.4 + §9.1: 24h dwell at 6s blocks"
+    );
 }
 
-/// All 9 design-memo-required error variants Debug-print to distinct
+/// All 10 design-memo-required error variants Debug-print to distinct
 /// names. Pins the on-fail UX: callers (SDKs, indexers, dashboards)
 /// must be able to pattern-match every failure mode without ambiguity.
-///
-/// Per the user's scaffolding contract: at minimum `MarketNotFound`,
-/// `MarketPaused`, `LeverageOutOfBounds`, `InsufficientMargin`,
-/// `PositionNotFound`, `MaxSlippageExceeded`, `BadLiquidationAttempt`,
-/// `OracleUnavailable`, `EpochAlreadySettled`.
 #[test]
 fn error_variants_distinct() {
     let market_not_found: Error<Test> = Error::MarketNotFound;
@@ -436,6 +512,8 @@ fn error_variants_distinct() {
     let bad_liq: Error<Test> = Error::BadLiquidationAttempt;
     let oracle_down: Error<Test> = Error::OracleUnavailable;
     let epoch_done: Error<Test> = Error::EpochAlreadySettled;
+    let arith: Error<Test> = Error::ArithmeticOverflow;
+    let dwell: Error<Test> = Error::WithdrawDwellNotElapsed;
 
     let variants = [
         format!("{:?}", market_not_found),
@@ -447,9 +525,10 @@ fn error_variants_distinct() {
         format!("{:?}", bad_liq),
         format!("{:?}", oracle_down),
         format!("{:?}", epoch_done),
+        format!("{:?}", arith),
+        format!("{:?}", dwell),
     ];
 
-    // Every Debug-printed variant must be distinct from every other.
     for (i, a) in variants.iter().enumerate() {
         for (j, b) in variants.iter().enumerate() {
             if i != j {
@@ -463,7 +542,6 @@ fn error_variants_distinct() {
         }
     }
 
-    // Sanity-check each variant name appears in its own Debug string.
     assert!(variants[0].contains("MarketNotFound"));
     assert!(variants[1].contains("MarketPaused"));
     assert!(variants[2].contains("LeverageOutOfBounds"));
@@ -473,4 +551,649 @@ fn error_variants_distinct() {
     assert!(variants[6].contains("BadLiquidationAttempt"));
     assert!(variants[7].contains("OracleUnavailable"));
     assert!(variants[8].contains("EpochAlreadySettled"));
+    assert!(variants[9].contains("ArithmeticOverflow"));
+    assert!(variants[10].contains("WithdrawDwellNotElapsed"));
+}
+
+// ---------------------------------------------------------------------------
+// PR-B behaviour tests: open_position (5)
+// ---------------------------------------------------------------------------
+
+/// Happy path: a funded MarginAccount opens a 1× ADA-PERP at $1.00.
+/// Notional = 1e18 (= $1), initial margin at 1× = $1, so seed
+/// free_e18 = $1 and verify everything ends up in `locked_margin_e18`.
+#[test]
+fn open_position_happy_path() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        // Seed 1.0 pMATRA-USD free (so 1× open consumes exactly that).
+        seed_free_margin(signer, 1_000_000_000_000_000_000u128);
+
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,   // 1.0 contract
+            100u32,            // 1× leverage (100 bps)
+            50u32,             // 0.5% slippage
+            0u128,             // no margin top-up
+        ));
+
+        // Position is recorded with correct sign + locked margin.
+        let pos = pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &signer,
+        )
+        .expect("position exists");
+        assert_eq!(pos.size_e8, 100_000_000); // long sign
+        assert_eq!(pos.entry_mark_e18, 1_000_000_000_000_000_000u128);
+        assert_eq!(pos.locked_margin_e18, 1_000_000_000_000_000_000u128);
+
+        // Free balance is now zero — all locked.
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(acct.free_e18, 0);
+    });
+}
+
+/// Insufficient margin: open requires more pMATRA-USD than the
+/// MarginAccount holds. Reject before mutating state.
+#[test]
+fn open_position_rejects_insufficient_margin() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        // Only seed $0.50 free — but 1× open at $1 needs $1.
+        seed_free_margin(signer, 500_000_000_000_000_000u128);
+
+        assert_noop!(
+            PerpEngine::open_position(
+                RuntimeOrigin::signed(signer),
+                ada_perp_market_id(),
+                PerpDirection::Long,
+                100_000_000u128,
+                100u32,
+                50u32,
+                0u128,
+            ),
+            Error::<Test>::InsufficientMargin
+        );
+
+        // No position written.
+        assert!(pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &signer,
+        )
+        .is_none());
+    });
+}
+
+/// Leverage above the market cap is rejected. ADA-PERP defaults to
+/// 10× = 1000 bps; we try 15× = 1500 bps.
+#[test]
+fn open_position_rejects_leverage_above_max() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        seed_free_margin(signer, 1_000_000_000_000_000_000u128);
+
+        assert_noop!(
+            PerpEngine::open_position(
+                RuntimeOrigin::signed(signer),
+                ada_perp_market_id(),
+                PerpDirection::Long,
+                100_000_000u128,
+                1_500u32,           // 15× — over market cap (10×)
+                50u32,
+                0u128,
+            ),
+            Error::<Test>::LeverageOutOfBounds
+        );
+    });
+}
+
+/// Paused market: opens reject with `MarketPaused`.
+#[test]
+fn open_position_rejects_paused_market() {
+    new_test_ext().execute_with(|| {
+        register_paused_market();
+        let signer = 1u64;
+        seed_free_margin(signer, 1_000_000_000_000_000_000u128);
+
+        assert_noop!(
+            PerpEngine::open_position(
+                RuntimeOrigin::signed(signer),
+                ada_perp_market_id(),
+                PerpDirection::Long,
+                100_000_000u128,
+                100u32,
+                50u32,
+                0u128,
+            ),
+            Error::<Test>::MarketPaused
+        );
+    });
+}
+
+/// Stale oracle: opens reject with `OracleUnavailable`.
+#[test]
+fn open_position_rejects_oracle_unavailable() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        seed_free_margin(signer, 1_000_000_000_000_000_000u128);
+        // Mark the ADA/USD feed stale.
+        set_oracle_fresh(&ada_usd_feed_id(), false);
+
+        assert_noop!(
+            PerpEngine::open_position(
+                RuntimeOrigin::signed(signer),
+                ada_perp_market_id(),
+                PerpDirection::Long,
+                100_000_000u128,
+                100u32,
+                50u32,
+                0u128,
+            ),
+            Error::<Test>::OracleUnavailable
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// PR-B behaviour tests: close_position (5)
+// ---------------------------------------------------------------------------
+
+/// Long win: open at $1.00, close at $1.10 → +$0.10 PnL.
+#[test]
+fn close_position_full_realizes_pnl_long_win() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        seed_free_margin(signer, 1_000_000_000_000_000_000u128);
+
+        // Open at $1.00.
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            100u32,
+            50u32,
+            0u128,
+        ));
+
+        // Bump oracle to $1.10.
+        set_oracle_price(&ada_usd_feed_id(), 1_100_000_000_000_000_000u128);
+
+        // Close all.
+        assert_ok!(PerpEngine::close_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            0u128,
+            50u32,
+        ));
+
+        // Position gone.
+        assert!(pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &signer,
+        )
+        .is_none());
+
+        // Free balance: returned $1 locked + $0.10 PnL = $1.10.
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(acct.free_e18, 1_100_000_000_000_000_000u128);
+    });
+}
+
+/// Long loss: open at $1.00, close at $0.90 → -$0.10 PnL.
+#[test]
+fn close_position_full_realizes_pnl_long_loss() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        seed_free_margin(signer, 1_000_000_000_000_000_000u128);
+
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            100u32,
+            50u32,
+            0u128,
+        ));
+
+        set_oracle_price(&ada_usd_feed_id(), 900_000_000_000_000_000u128);
+
+        assert_ok!(PerpEngine::close_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            0u128,
+            50u32,
+        ));
+
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        // $1 locked released + (-$0.10) realised = $0.90.
+        assert_eq!(acct.free_e18, 900_000_000_000_000_000u128);
+    });
+}
+
+/// Short win: open SHORT at $1.00, close at $0.90 → +$0.10 PnL.
+#[test]
+fn close_position_full_realizes_pnl_short_win() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        seed_free_margin(signer, 1_000_000_000_000_000_000u128);
+
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Short,
+            100_000_000u128,
+            100u32,
+            50u32,
+            0u128,
+        ));
+
+        // Confirm short sign in storage.
+        let pos = pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &signer,
+        )
+        .unwrap();
+        assert!(pos.size_e8 < 0);
+
+        // Mark drops 10% — short wins.
+        set_oracle_price(&ada_usd_feed_id(), 900_000_000_000_000_000u128);
+
+        assert_ok!(PerpEngine::close_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            0u128,
+            50u32,
+        ));
+
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(acct.free_e18, 1_100_000_000_000_000_000u128);
+    });
+}
+
+/// Partial close keeps the residual position open with proportionally
+/// reduced locked margin. 1.0 long, close 0.5 → 0.5 long remains.
+#[test]
+fn close_position_partial_keeps_position() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        seed_free_margin(signer, 1_000_000_000_000_000_000u128);
+
+        // Open 1.0 long at $1, 1× leverage → $1 locked margin.
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            100u32,
+            50u32,
+            0u128,
+        ));
+
+        // Close 0.5 at the same mark — no PnL, half margin released.
+        assert_ok!(PerpEngine::close_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            50_000_000u128, // 0.5
+            50u32,
+        ));
+
+        let pos = pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &signer,
+        )
+        .expect("residual long remains");
+        assert_eq!(pos.size_e8, 50_000_000); // 0.5 long
+        assert_eq!(pos.locked_margin_e18, 500_000_000_000_000_000u128); // $0.50 locked
+
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(acct.free_e18, 500_000_000_000_000_000u128); // $0.50 free
+    });
+}
+
+/// Funding delta is applied on close. Open at funding-index = 0,
+/// bump `CumulativeFundingIndex` to a positive value, close → the
+/// long position pays funding (margin reduced).
+#[test]
+fn close_position_applies_funding_delta() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        seed_free_margin(signer, 2_000_000_000_000_000_000u128);
+
+        // Open 1.0 long at $1, 1× leverage → $1 locked.
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            100u32,
+            50u32,
+            0u128,
+        ));
+
+        // Bump CumulativeFundingIndex by +1e16 (= small funding rate).
+        // funding_owed = 1.0 * 1e16 / 1e8 = 1e8 → in 1e18 scale that's...
+        // wait, the compute_funding_delta returns idx*signed_size/1e8.
+        // idx = 1e16, size = 1e8, so result = 1e16 * 1e8 / 1e8 = 1e16.
+        // That's $0.01 in 1e18 scale.
+        pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::insert(
+            &ada_perp_market_id(),
+            10_000_000_000_000_000i128,
+        );
+
+        // Close all at same mark.
+        assert_ok!(PerpEngine::close_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            0u128,
+            50u32,
+        ));
+
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        // Start: $1 seeded + $1 locked = $2 (re-released at close
+        // because $1 was locked + $1 stayed free). After close:
+        // free becomes $1 (originally) + $1 (released) - $0.01
+        // (funding paid by long) = $1.99 in 1e18 scale.
+        assert_eq!(acct.free_e18, 1_990_000_000_000_000_000u128);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// PR-B behaviour tests: deposit_margin (1)
+// ---------------------------------------------------------------------------
+
+/// Deposit transfers MOTRA → pot, increments `free_e18` at the live
+/// MATRA/USD rate, and updates `last_deposit_block`.
+#[test]
+fn deposit_margin_increments_free() {
+    new_test_ext().execute_with(|| {
+        let signer = 1u64;
+        credit_motra(signer, 10_000u128);
+        // MATRA/USD = $1 (the default), so deposit_motra * 1e18 = pMATRA-USD
+        // 10_000 * 1e18 = 1e22.
+
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(signer),
+            5_000u128,
+        ));
+
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(acct.free_e18, 5_000u128 * 1_000_000_000_000_000_000u128);
+        assert_eq!(acct.last_deposit_block, 1); // tests start at block 1
+
+        // Pot account received the MOTRA.
+        let pot = pallet_perp_engine::pallet::Pallet::<Test>::pot_account();
+        let pot_balance = pallet_balances::Pallet::<Test>::free_balance(&pot);
+        assert_eq!(pot_balance, 5_000u128);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// PR-B behaviour tests: withdraw_margin (3)
+// ---------------------------------------------------------------------------
+
+/// Deposit, advance past the dwell time, withdraw — happy path.
+#[test]
+fn withdraw_margin_happy_path_after_dwell() {
+    new_test_ext().execute_with(|| {
+        let signer = 1u64;
+        credit_motra(signer, 10_000u128);
+
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(signer),
+            5_000u128,
+        ));
+
+        // Advance past the dwell time.
+        let dwell = <Test as pallet_perp_engine::Config>::WithdrawDwellBlocks::get();
+        System::set_block_number((dwell as u64) + 2);
+
+        // Withdraw 1_000 pMATRA-USD (= 1e3 * 1e18 scale).
+        let withdraw_e18 = 1_000u128 * 1_000_000_000_000_000_000u128;
+        assert_ok!(PerpEngine::withdraw_margin(
+            RuntimeOrigin::signed(signer),
+            withdraw_e18,
+        ));
+
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(acct.free_e18, 4_000u128 * 1_000_000_000_000_000_000u128);
+
+        // MOTRA returned to user.
+        let bal = pallet_balances::Pallet::<Test>::free_balance(&signer);
+        assert_eq!(bal, 5_000u128 + 1_000u128);
+    });
+}
+
+/// Withdraw within the dwell window — rejected.
+#[test]
+fn withdraw_margin_rejects_during_dwell() {
+    new_test_ext().execute_with(|| {
+        let signer = 1u64;
+        credit_motra(signer, 10_000u128);
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(signer),
+            5_000u128,
+        ));
+
+        // Same block — dwell not elapsed.
+        let withdraw_e18 = 1_000u128 * 1_000_000_000_000_000_000u128;
+        assert_noop!(
+            PerpEngine::withdraw_margin(
+                RuntimeOrigin::signed(signer),
+                withdraw_e18,
+            ),
+            Error::<Test>::WithdrawDwellNotElapsed
+        );
+    });
+}
+
+/// Withdraw that would take the account below its sum-of-locked-margins
+/// floor is rejected with `InsufficientMargin`.
+#[test]
+fn withdraw_margin_rejects_below_initial_margin() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        credit_motra(signer, 10_000u128);
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(signer),
+            5_000u128,
+        ));
+
+        // Advance past dwell.
+        let dwell = <Test as pallet_perp_engine::Config>::WithdrawDwellBlocks::get();
+        System::set_block_number((dwell as u64) + 2);
+
+        // Open a position that locks $1 (1.0 contract at $1, 1×).
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            100u32,
+            50u32,
+            0u128,
+        ));
+
+        // Free margin after open: ($5000 - $1) * 1e18.
+        // Locked margin: $1 * 1e18.
+        // Withdraw must respect post_free >= total_locked = $1 * 1e18.
+        // So max withdraw = ($5000 - $1 - $1) * 1e18 = $4998 * 1e18.
+        // Try $4999 * 1e18 — should fail.
+        let withdraw_e18 = 4_999u128 * 1_000_000_000_000_000_000u128;
+        assert_noop!(
+            PerpEngine::withdraw_margin(
+                RuntimeOrigin::signed(signer),
+                withdraw_e18,
+            ),
+            Error::<Test>::InsufficientMargin
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// PR-B behaviour tests: adjust_leverage (3)
+// ---------------------------------------------------------------------------
+
+/// Levering UP (smaller margin lock) releases margin back to free.
+/// Open at 1× (locks $1), bump to 2× → locked drops to $0.50,
+/// free gains $0.50.
+#[test]
+fn adjust_leverage_levers_up_unlocks_margin() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        seed_free_margin(signer, 1_000_000_000_000_000_000u128);
+
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            100u32,            // 1×
+            50u32,
+            0u128,
+        ));
+
+        // Lever up to 2× — locked = $1 / 2 = $0.50.
+        assert_ok!(PerpEngine::adjust_leverage(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            200u32, // 2×
+        ));
+
+        let pos = pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &signer,
+        )
+        .unwrap();
+        assert_eq!(pos.leverage_bps, 200);
+        assert_eq!(pos.locked_margin_e18, 500_000_000_000_000_000u128);
+
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(acct.free_e18, 500_000_000_000_000_000u128);
+    });
+}
+
+/// Levering DOWN (larger margin lock) requires free margin. Open
+/// at 2×, try to lever down to 1× — needs $0.50 from free.
+#[test]
+fn adjust_leverage_levers_down_requires_free_margin() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        // Seed $0.50 only — enough for a 2× open ($0.50 locked) but
+        // NOT enough to lever down to 1× (which needs another $0.50
+        // in free).
+        seed_free_margin(signer, 500_000_000_000_000_000u128);
+
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            200u32, // 2×
+            50u32,
+            0u128,
+        ));
+
+        // After open: free = 0, locked = $0.50.
+        // Levering down to 1× needs locked = $1 → delta = +$0.50.
+        // Free has $0 → InsufficientMargin.
+        assert_noop!(
+            PerpEngine::adjust_leverage(
+                RuntimeOrigin::signed(signer),
+                ada_perp_market_id(),
+                100u32, // 1×
+            ),
+            Error::<Test>::InsufficientMargin
+        );
+    });
+}
+
+/// Adjusting above the market cap is rejected.
+#[test]
+fn adjust_leverage_rejects_above_max() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        seed_free_margin(signer, 1_000_000_000_000_000_000u128);
+
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            100u32,
+            50u32,
+            0u128,
+        ));
+
+        // ADA-PERP default max_leverage = 1000 bps (10×); try 1500.
+        assert_noop!(
+            PerpEngine::adjust_leverage(
+                RuntimeOrigin::signed(signer),
+                ada_perp_market_id(),
+                1_500u32,
+            ),
+            Error::<Test>::LeverageOutOfBounds
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// PR-B math tests: overflow guard
+// ---------------------------------------------------------------------------
+
+/// `compute_notional` surfaces `MathOverflow` rather than silently
+/// saturating. The pallet maps this to `Error::ArithmeticOverflow`.
+#[test]
+fn math_compute_notional_overflow_protected() {
+    // Direct math::compute_notional check first.
+    let r = math::compute_notional(u128::MAX, 2);
+    assert!(r.is_err());
+
+    // And the pallet-side error mapping.
+    new_test_ext().execute_with(|| {
+        // Manufacture a market with size cap at u128::MAX to defeat
+        // the size-bound gate and reach the math.
+        let mut cfg = default_ada_perp_market_config();
+        cfg.max_position_size_e8 = u128::MAX;
+        cfg.min_position_size_e8 = 0;
+        pallet_perp_engine::pallet::Markets::<Test>::insert(
+            &ada_perp_market_id(),
+            cfg,
+        );
+        // Repoint oracle to an extreme price so size * price overflows.
+        set_oracle_price(&ada_usd_feed_id(), u128::MAX);
+
+        let signer = 1u64;
+        seed_free_margin(signer, u128::MAX);
+
+        // Caller asks for size=u128::MAX → notional check overflows.
+        assert_noop!(
+            PerpEngine::open_position(
+                RuntimeOrigin::signed(signer),
+                ada_perp_market_id(),
+                PerpDirection::Long,
+                u128::MAX,
+                100u32,
+                50u32,
+                0u128,
+            ),
+            Error::<Test>::ArithmeticOverflow
+        );
+    });
 }

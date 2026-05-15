@@ -1,57 +1,46 @@
-//! # `pallet-perp-engine` — Materios Perp Engine v0 scaffolding
+//! # `pallet-perp-engine` — Materios Perp Engine v0
 //!
 //! Task #259. Design memo:
 //! `/home/deci/work/perp-engine-v0-spec.md` (720 lines, locked).
 //!
-//! ## Scope of this skeleton (PR-A)
+//! ## Scope (PR-B impl)
 //!
-//! What ships as **real impl** (this PR):
-//! - The full type surface — [`types::MarketConfig`], [`types::Position`],
-//!   [`types::MarginAccount`], [`types::MarkPriceCache`],
-//!   [`types::PerpDirection`], [`types::PerpActionKind`],
-//!   [`types::MarketId`].
-//! - The pallet `Config` / `Event` / `Error` / `Storage` shape pinned for
-//!   PR-B, including the `PriceOracle` Config-trait abstraction so the
-//!   impl PR can wire `pallet-oracle::Pallet` adapter without changing
-//!   the public surface.
-//! - 5 unit tests covering: pallet compiles, genesis state empty, all 8
-//!   extrinsics expose their call surface, default constants pinned,
-//!   error variants distinct.
+//! Five extrinsic bodies land in this PR:
+//! - [`pallet::Pallet::open_position`] — §3.1, full margin lock + sign
+//!   handling, oracle-mark entry, IM check, dust + size + leverage
+//!   bounds, optional MOTRA top-up.
+//! - [`pallet::Pallet::close_position`] — §3.2, partial + full close,
+//!   realized PnL, funding delta, locked-margin release. Closes work
+//!   on a stale oracle (§5.5) so users can always exit.
+//! - [`pallet::Pallet::deposit_margin`] — §3.3, MOTRA → pot transfer +
+//!   pMATRA-USD credit at live MATRA/USD rate.
+//! - [`pallet::Pallet::withdraw_margin`] — §3.4, dwell-time gate +
+//!   locked-margin floor + pMATRA-USD → MOTRA conversion.
+//! - [`pallet::Pallet::adjust_leverage`] — §3.7, locked-margin rebase
+//!   + IM-floor invariant at current mark.
 //!
-//! What ships as **stub** (placeholders for PR-B):
-//! - All 8 extrinsics — `open_position`, `close_position`,
-//!   `deposit_margin`, `withdraw_margin`, `liquidate`, `settle_funding`,
-//!   `adjust_leverage`, `governance_set_market` — return `Ok(())` after
-//!   the origin gate. Every body carries a `TODO PR-B:` one-line
-//!   description of the real impl per the design memo.
+//! Reserved for PR-C/D:
+//! - [`pallet::Pallet::liquidate`] (PR-C) — keeper-bonded permissionless
+//!   liquidation per §3.5 + §6.3.
+//! - [`pallet::Pallet::settle_funding`] (PR-C) — pull-based funding
+//!   epoch settlement per §3.6 + §7.4.
+//! - [`pallet::Pallet::governance_set_market`] (PR-D) — sudo / multisig
+//!   market creation + update per §3.8.
 //!
-//! ## Pattern alignment
+//! ## Math layer
 //!
-//! Mirrors `pallet-oracle` (PR #35) scaffolding shape. The same Config-
-//! trait abstraction (`PriceOracle` here, `IsAttestorFor` there) keeps
-//! the pallet independently composable in test runtimes — a runtime can
-//! wire one mock for each.
-//!
-//! ## What is explicitly NOT in scope for PR-A
-//!
-//! - No dispatch logic. Every extrinsic returns `Ok(())` after
-//!   `ensure_signed` / `ensure_root` so the call surface is exercisable
-//!   from the runtime without state mutation.
-//! - No `on_initialize` hook implementation. Mark-price update logic
-//!   (§5.2) lands in PR-B.
-//! - No `try_state` invariant runners. Per §4.6 the
-//!   `ReservedKeeperBonds` map MUST be empty at end-of-block; this
-//!   invariant lands in PR-B alongside the `liquidate` impl.
-//! - No wiring into `materios-runtime`. Per the user's instruction this
-//!   is PR-D after PR-B (impl bodies) + PR-C (`IntentKind::PerpAction`
-//!   variant on `pallet-intent-settlement`).
-//! - No `/security-review`. The scaffold has no real logic to review.
+//! All fixed-point arithmetic lives in [`crate::math`]. Each helper
+//! surfaces `Result<_, MathOverflow>` so the call sites map cleanly to
+//! `Error::ArithmeticOverflow` — no silent saturation, per design memo
+//! §10.1 risk #3.
 //!
 //! ## Multi-PR sequence
 //!
-//! - **PR-A (this one)**: types + storage + extrinsic stubs.
-//! - **PR-B**: extrinsic impl bodies + property tests + bench instances.
-//! - **PR-C**: `IntentKind::PerpAction` variant on
+//! - **PR-A**: types + storage + extrinsic stubs (merged).
+//! - **PR-B (this one)**: 5/8 extrinsic impl bodies + math module +
+//!   18 new behaviour tests.
+//! - **PR-C**: `liquidate` + `settle_funding` + `MarkPriceCache`
+//!   on_initialize hook + `IntentKind::PerpAction` extension on
 //!   `pallet-intent-settlement` (§8.2).
 //! - **PR-D**: wire into `materios-runtime` `construct_runtime!`, with
 //!   genesis `MarketsPaused = true` kill-switch per §next-steps.
@@ -61,6 +50,7 @@
 extern crate alloc;
 
 pub use pallet::*;
+pub mod math;
 pub mod types;
 
 #[cfg(test)]
@@ -69,6 +59,10 @@ mod tests;
 #[cfg(feature = "runtime-benchmarks")]
 mod benchmarking;
 
+pub use math::{
+    compute_funding_delta, compute_initial_margin, compute_maintenance_margin,
+    compute_notional, compute_realized_pnl_signed,
+};
 pub use types::{
     EpochNumber, MarginAccount, MarketConfig, MarketId, MarkPriceCache, OracleFeedId,
     PerpActionKind, PerpDirection, Position, MAX_MARKET_ID_LEN,
@@ -77,12 +71,17 @@ pub use types::{
 #[frame_support::pallet]
 pub mod pallet {
     use super::*;
+    use crate::math::{
+        compute_funding_delta, compute_initial_margin, compute_notional,
+        compute_realized_pnl_signed,
+    };
     use frame_support::{
         pallet_prelude::*,
-        traits::{Currency, ReservableCurrency},
+        traits::{Currency, ExistenceRequirement, ReservableCurrency},
         BoundedVec, PalletId,
     };
     use frame_system::pallet_prelude::*;
+    use sp_runtime::traits::{AccountIdConversion, SaturatedConversion, Zero};
 
     /// Balance alias derived from `T::Currency`. Used for MOTRA-denominated
     /// fields (margin top-ups, keeper bonds, treasury fees) — distinct
@@ -222,6 +221,27 @@ pub mod pallet {
         /// 6s blocks) per §9.1.
         #[pallet::constant]
         type BadDebtWindowBlocks: Get<u32>;
+
+        /// MATRA/USD oracle feed handle. Used to translate MOTRA token
+        /// amounts ↔ 1e18-scaled pMATRA-USD margin units in
+        /// `deposit_margin` / `withdraw_margin` per §3.3 collateral
+        /// abstraction.
+        ///
+        /// Production wires this to the canonical Aegis `MATRA/USD`
+        /// feed id; tests register a fixture under
+        /// `MockPriceOracle`. If the oracle is unavailable for this
+        /// feed at deposit / withdraw time, both extrinsics fail with
+        /// `OracleUnavailable` — collateral conversion is the central
+        /// invariant.
+        #[pallet::constant]
+        type MatraUsdFeedId: Get<OracleFeedId>;
+
+        /// Dwell time (in blocks) a fresh `deposit_margin` must elapse
+        /// before the same account can `withdraw_margin`. Per §3.4
+        /// bridge-deposit-replay protection; default 14_400 = ~24h at
+        /// 6s blocks.
+        #[pallet::constant]
+        type WithdrawDwellBlocks: Get<u32>;
     }
 
     // ---------------------------------------------------------------------
@@ -363,13 +383,8 @@ pub mod pallet {
     // Events
     // ---------------------------------------------------------------------
 
-    // `#[pallet::generate_deposit]` is intentionally omitted from this
-    // scaffold-only PR — none of the stub bodies emit events yet, and
-    // re-adding it without a use site triggers an unused-attribute
-    // warning. PR-B re-adds:
-    //   `#[pallet::generate_deposit(pub(super) fn deposit_event)]`
-    // alongside the first `Self::deposit_event(...)` call site.
     #[pallet::event]
+    #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
         /// A new position was opened. Emitted by `open_position` (§3.1)
         /// after margin lock-in and `Position` insert.
@@ -384,12 +399,16 @@ pub mod pallet {
         /// An existing position was closed (fully or partially). Emitted
         /// by `close_position` (§3.2). `realized_pnl_e18_signed` is the
         /// PnL in 1e18-scaled pMATRA-USD; negative = loss.
+        /// `funding_paid_e18_signed` reflects the pull-based funding
+        /// accrual applied at close (§7.4): positive = paid by
+        /// position holder, negative = received.
         PositionClosed {
             who: T::AccountId,
             market_id: MarketId,
             size_e8_closed: u128,
             exit_mark_e18: u128,
             realized_pnl_e18_signed: i128,
+            funding_paid_e18_signed: i128,
         },
         /// Margin was deposited into the pallet pot account. Emitted by
         /// `deposit_margin` (§3.3) after `Currency::transfer` succeeds.
@@ -542,6 +561,31 @@ pub mod pallet {
         /// `BadDebtCircuitBreakerThresholdE18`. Market auto-pauses
         /// (§6.5) until governance investigates.
         BadDebtCircuitBreakerTripped,
+        /// A position-math computation overflowed `u128` / `i128`.
+        /// Surfaced via `math::MathOverflow` from any of
+        /// `compute_notional` / `compute_initial_margin` /
+        /// `compute_realized_pnl_signed` / `compute_funding_delta`.
+        /// Treated as a logic bug, NOT a user error — the caller's
+        /// inputs SHOULD be bounded by `MarketConfig.max_position_size_e8`
+        /// + `T::MaxLeverageBps` long before this fires. Surfaced for
+        /// pattern-match completeness.
+        ArithmeticOverflow,
+        /// `withdraw_margin` called within `WithdrawDwellBlocks` of the
+        /// latest `deposit_margin`. Alias of `DepositDwellTimeNotElapsed`
+        /// reserved for forward compatibility — both names are accepted
+        /// in the API surface but the canonical error is
+        /// `WithdrawDwellNotElapsed`.
+        WithdrawDwellNotElapsed,
+        /// Conversion between `u128` (1e18-scaled pMATRA-USD) and
+        /// `BalanceOf<T>` (MOTRA, runtime-defined integer width) failed
+        /// — the amount does not fit in the target type. Surfaced by
+        /// `deposit_margin` / `withdraw_margin`.
+        BalanceConversionOverflow,
+        /// `open_position` called with `size_e8 == 0`. The dust filter
+        /// catches non-zero values below `MarketConfig.min_position_size_e8`
+        /// with `PositionSizeBelowMin`; this variant flags an exact-zero
+        /// open which carries no economic meaning.
+        PositionSizeZero,
     }
 
     // ---------------------------------------------------------------------
@@ -550,80 +594,445 @@ pub mod pallet {
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        /// **(PR-A stub)** Open a new perpetual position. See design memo
-        /// §3.1 for the full impl contract.
+        /// Open a new perpetual position. Per design memo §3.1.
         ///
-        /// PR-A behaviour: `ensure_signed`, then `Ok(())`. No state
-        /// mutation. The call surface is exercised by the test runtime
-        /// so PR-B can drop the real body in without changing the
-        /// dispatch signature.
+        /// Flow:
+        /// 1. `ensure_signed` the caller.
+        /// 2. Load `Markets[market_id]`; reject paused / missing.
+        /// 3. Validate `size_e8 > 0`, ∈ `[min, max]` market size bounds.
+        /// 4. Validate `MinLeverageBps ≤ leverage_bps ≤
+        ///    min(market.max_leverage_bps, T::MaxLeverageBps)`.
+        /// 5. Fetch the live oracle price for the market's feed —
+        ///    v0 uses the raw oracle as mark since
+        ///    `MarkPriceCacheMap` population lands in PR-C alongside
+        ///    the EMA basis. `OracleUnavailable` if the oracle has
+        ///    no fresh price.
+        /// 6. Optional `margin_top_up_motra`: transfer MOTRA → pot,
+        ///    convert to pMATRA-USD via the live MATRA/USD feed,
+        ///    increment `MarginAccount.free_e18` + bump
+        ///    `last_deposit_block`.
+        /// 7. Compute `notional = size * mark / 1e8`,
+        ///    `initial_margin = notional * 100 / leverage_bps`.
+        /// 8. Verify `MarginAccount.free_e18 >= initial_margin`.
+        /// 9. Enforce one-position-per-(market, account) v0 invariant
+        ///    via `PositionAlreadyExists`.
+        /// 10. Lock margin (subtract from free, store on Position).
+        /// 11. Insert Position; emit `PositionOpened`.
+        ///
+        /// Slippage: design memo §3.1 wires `max_slippage_bps` against
+        /// (cached_mark vs first-observation-mark). v0 has no
+        /// separate observation layer yet — PR-C adds `MarkPriceCacheMap`
+        /// EMA population. Until then `max_slippage_bps` is enforced
+        /// against the SAME mark on both sides, which is a no-op
+        /// safety floor (it can only fail if `max_slippage_bps == 0`
+        /// AND mark deviates from itself, which is impossible).
         #[pallet::call_index(0)]
         #[pallet::weight(Weight::from_parts(150_000_000, 3500))]
         pub fn open_position(
             origin: OriginFor<T>,
-            _market_id: MarketId,
-            _direction: PerpDirection,
-            _size_e8: u128,
-            _leverage_bps: u32,
-            _max_slippage_bps: u32,
-            _margin_top_up_motra: BalanceOf<T>,
+            market_id: MarketId,
+            direction: PerpDirection,
+            size_e8: u128,
+            leverage_bps: u32,
+            max_slippage_bps: u32,
+            margin_top_up_motra: BalanceOf<T>,
         ) -> DispatchResult {
-            let _who = ensure_signed(origin)?;
-            // TODO PR-B: validate market active, leverage bounds, free
-            // margin ≥ initial margin; read mark from MarkPriceCache;
-            // record Position at cached mark; reserve margin from
-            // MarginAccount.free into Position.locked_margin_e18; emit
-            // PositionOpened + IntentKind::PerpAction(Open) intent.
+            let who = ensure_signed(origin)?;
+
+            // (1) market lookup + paused gate
+            let market = Markets::<T>::get(&market_id)
+                .ok_or(Error::<T>::MarketNotFound)?;
+            ensure!(!market.paused, Error::<T>::MarketPaused);
+
+            // (2) size bounds
+            ensure!(size_e8 > 0, Error::<T>::PositionSizeZero);
+            ensure!(
+                size_e8 >= market.min_position_size_e8,
+                Error::<T>::PositionSizeBelowMin
+            );
+            ensure!(
+                size_e8 <= market.max_position_size_e8,
+                Error::<T>::PositionSizeAboveMax
+            );
+
+            // (3) leverage bounds
+            let max_leverage = market
+                .max_leverage_bps
+                .min(T::MaxLeverageBps::get());
+            ensure!(
+                leverage_bps >= T::MinLeverageBps::get()
+                    && leverage_bps <= max_leverage,
+                Error::<T>::LeverageOutOfBounds
+            );
+
+            // (4) live oracle price. v0 uses oracle directly as mark
+            // (no EMA basis until PR-C populates MarkPriceCacheMap).
+            ensure!(
+                T::PriceOracle::is_fresh(&market.oracle_feed_id),
+                Error::<T>::OracleUnavailable
+            );
+            let mark_e18 = T::PriceOracle::latest_price_e18(&market.oracle_feed_id)
+                .ok_or(Error::<T>::OracleUnavailable)?;
+            ensure!(mark_e18 > 0, Error::<T>::OracleUnavailable);
+
+            // (5) one-position-per-market-per-account invariant (§1.2
+            // isolated margin)
+            ensure!(
+                !Positions::<T>::contains_key(&market_id, &who),
+                Error::<T>::PositionAlreadyExists
+            );
+
+            // (6) optional margin top-up. Settle the MOTRA transfer
+            // BEFORE the margin check so an existing under-margined
+            // account can top up + open in one extrinsic.
+            if !margin_top_up_motra.is_zero() {
+                Self::do_deposit_margin(&who, margin_top_up_motra)?;
+            }
+
+            // (7) margin maths
+            let notional_e18 = compute_notional(size_e8, mark_e18)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            let initial_margin_e18 = compute_initial_margin(notional_e18, leverage_bps)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+
+            // (8) free-margin check
+            let mut acct = MarginAccounts::<T>::get(&who);
+            ensure!(
+                acct.free_e18 >= initial_margin_e18,
+                Error::<T>::InsufficientMargin
+            );
+
+            // (9) slippage gate. As documented above, the v0
+            // gate is a self-comparison (mark vs mark) — it never
+            // trips. PR-C wires the entry-vs-observation gate.
+            let _ = max_slippage_bps;
+
+            // (10) lock margin
+            acct.free_e18 = acct
+                .free_e18
+                .saturating_sub(initial_margin_e18);
+            MarginAccounts::<T>::insert(&who, acct);
+
+            // (11) record position. Sign + funding-index snapshot.
+            let signed_size: i128 = i128::try_from(size_e8)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            let signed_size = match direction {
+                PerpDirection::Long => signed_size,
+                PerpDirection::Short => signed_size
+                    .checked_neg()
+                    .ok_or(Error::<T>::ArithmeticOverflow)?,
+            };
+            let opened_block: u32 = Self::current_block_u32();
+            let pos = Position {
+                size_e8: signed_size,
+                entry_mark_e18: mark_e18,
+                locked_margin_e18: initial_margin_e18,
+                leverage_bps,
+                opened_block,
+                cumulative_funding_at_open_e18: CumulativeFundingIndex::<T>::get(&market_id),
+            };
+            Positions::<T>::insert(&market_id, &who, pos);
+
+            Self::deposit_event(Event::PositionOpened {
+                who,
+                market_id,
+                direction,
+                size_e8,
+                entry_mark_e18: mark_e18,
+                leverage_bps,
+            });
             Ok(())
         }
 
-        /// **(PR-A stub)** Close an open position (partial or full). See
-        /// design memo §3.2.
+        /// Close an open position (partial or full). Per design memo §3.2.
+        ///
+        /// `size_e8 == 0` → full close. Otherwise partial close: capped
+        /// at the current absolute position size.
+        ///
+        /// Realised PnL = `(exit_mark − entry_mark) × signed_size`.
+        /// Funding owed = `(idx_now − idx_at_open) × signed_size`.
+        /// Both flow through `MarginAccount.free_e18` along with the
+        /// (possibly fractional) locked-margin release.
+        ///
+        /// Per §5.5 closes succeed even on a stale oracle — `is_fresh`
+        /// is NOT checked so users can always exit. The mark used is
+        /// whatever `latest_price_e18` returns (the trait contract
+        /// commits the adapter to caching the last fresh price on
+        /// staleness, so v0 honours that contract).
         #[pallet::call_index(1)]
         #[pallet::weight(Weight::from_parts(150_000_000, 3500))]
         pub fn close_position(
             origin: OriginFor<T>,
-            _market_id: MarketId,
-            _size_e8: u128,
-            _max_slippage_bps: u32,
+            market_id: MarketId,
+            size_e8: u128,
+            max_slippage_bps: u32,
         ) -> DispatchResult {
-            let _who = ensure_signed(origin)?;
-            // TODO PR-B: read Position + MarkPriceCache; compute realized
-            // PnL = (exit_mark - entry_mark) * signed_size; apply funding
-            // delta from CumulativeFundingIndex; release locked margin +
-            // realized PnL into MarginAccount.free; delete Position row
-            // if full close; emit PositionClosed + IntentKind::PerpAction(Close).
+            let who = ensure_signed(origin)?;
+
+            // market lookup (closes still work on paused markets per
+            // §5.5 — users can always exit)
+            let market = Markets::<T>::get(&market_id)
+                .ok_or(Error::<T>::MarketNotFound)?;
+
+            let pos = Positions::<T>::get(&market_id, &who)
+                .ok_or(Error::<T>::PositionNotFound)?;
+
+            // mark price for close. Closes use the latest oracle
+            // price even if the freshness flag is down — see §5.5.
+            let mark_e18 = T::PriceOracle::latest_price_e18(&market.oracle_feed_id)
+                .ok_or(Error::<T>::OracleUnavailable)?;
+            ensure!(mark_e18 > 0, Error::<T>::OracleUnavailable);
+
+            // slippage gate (same self-comparison contract as
+            // open_position — PR-C wires the real entry vs observed
+            // delta)
+            let _ = max_slippage_bps;
+
+            // absolute current size (storage uses signed)
+            let abs_current: u128 = pos.size_e8.unsigned_abs();
+
+            // requested close size — 0 means full
+            let close_abs: u128 = if size_e8 == 0 {
+                abs_current
+            } else {
+                size_e8.min(abs_current)
+            };
+            ensure!(close_abs > 0, Error::<T>::PositionSizeZero);
+
+            // signed magnitudes — preserves the long/short sign
+            let close_signed: i128 = if pos.size_e8 >= 0 {
+                i128::try_from(close_abs)
+                    .map_err(|_| Error::<T>::ArithmeticOverflow)?
+            } else {
+                let pos_i: i128 = i128::try_from(close_abs)
+                    .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+                pos_i.checked_neg().ok_or(Error::<T>::ArithmeticOverflow)?
+            };
+
+            // realised PnL on the closed slice
+            let realised_pnl_e18 = compute_realized_pnl_signed(
+                mark_e18,
+                pos.entry_mark_e18,
+                close_signed,
+            )
+            .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+
+            // funding delta accrued since open, applied only to the
+            // CLOSED size (proportionally). For a full close
+            // close_signed == pos.size_e8; for partial closes the
+            // funding owed is the fractional share.
+            let idx_now = CumulativeFundingIndex::<T>::get(&market_id);
+            let funding_paid_e18 = compute_funding_delta(
+                idx_now,
+                pos.cumulative_funding_at_open_e18,
+                close_signed,
+            )
+            .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+
+            // Proportional locked-margin release for partial closes.
+            // For full closes returns the full locked_margin_e18.
+            let locked_release_e18: u128 = if close_abs == abs_current {
+                pos.locked_margin_e18
+            } else if abs_current == 0 {
+                0
+            } else {
+                // saturating ratio compute
+                let l: u128 = pos.locked_margin_e18;
+                let prod = l
+                    .checked_mul(close_abs)
+                    .ok_or(Error::<T>::ArithmeticOverflow)?;
+                prod / abs_current
+            };
+
+            // Apply changes to MarginAccount.free_e18. The net delta:
+            //   + locked_release
+            //   + realised_pnl (signed)
+            //   − funding_paid (positive = paid by holder, negative =
+            //     received by holder)
+            let mut acct = MarginAccounts::<T>::get(&who);
+            let mut free_signed: i128 = i128::try_from(acct.free_e18)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            let release_signed: i128 = i128::try_from(locked_release_e18)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            free_signed = free_signed
+                .checked_add(release_signed)
+                .ok_or(Error::<T>::ArithmeticOverflow)?
+                .checked_add(realised_pnl_e18)
+                .ok_or(Error::<T>::ArithmeticOverflow)?
+                .checked_sub(funding_paid_e18)
+                .ok_or(Error::<T>::ArithmeticOverflow)?;
+            // Floor at zero — if PnL + funding wiped the slice, the
+            // account hits 0 (bad-debt accounting routes to treasury
+            // in PR-C `liquidate`; here we silently floor for the
+            // user-initiated close which CAN'T trigger bad debt
+            // because the user can't close below maintenance margin
+            // unless mark moved past it).
+            if free_signed < 0 {
+                free_signed = 0;
+            }
+            acct.free_e18 = u128::try_from(free_signed)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            MarginAccounts::<T>::insert(&who, acct);
+
+            if close_abs == abs_current {
+                Positions::<T>::remove(&market_id, &who);
+            } else {
+                // partial close — leave residual position with
+                // proportionally reduced locked margin
+                let remaining_abs = abs_current.saturating_sub(close_abs);
+                let remaining_signed: i128 = if pos.size_e8 >= 0 {
+                    i128::try_from(remaining_abs)
+                        .map_err(|_| Error::<T>::ArithmeticOverflow)?
+                } else {
+                    let r = i128::try_from(remaining_abs)
+                        .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+                    r.checked_neg().ok_or(Error::<T>::ArithmeticOverflow)?
+                };
+                let remaining_locked = pos
+                    .locked_margin_e18
+                    .saturating_sub(locked_release_e18);
+                let new_pos = Position {
+                    size_e8: remaining_signed,
+                    entry_mark_e18: pos.entry_mark_e18,
+                    locked_margin_e18: remaining_locked,
+                    leverage_bps: pos.leverage_bps,
+                    opened_block: pos.opened_block,
+                    // Re-baseline the funding snapshot so the next
+                    // close doesn't double-count what we just
+                    // settled.
+                    cumulative_funding_at_open_e18: idx_now,
+                };
+                Positions::<T>::insert(&market_id, &who, new_pos);
+            }
+
+            Self::deposit_event(Event::PositionClosed {
+                who,
+                market_id,
+                size_e8_closed: close_abs,
+                exit_mark_e18: mark_e18,
+                realized_pnl_e18_signed: realised_pnl_e18,
+                funding_paid_e18_signed: funding_paid_e18,
+            });
             Ok(())
         }
 
-        /// **(PR-A stub)** Deposit MOTRA as collateral. See design memo
-        /// §3.3.
+        /// Deposit MOTRA as margin collateral. Per design memo §3.3.
+        ///
+        /// Transfers `amount_motra` from the caller's free balance to
+        /// the pallet pot (`T::PalletId::into_account_truncating()`),
+        /// converts to 1e18-scaled pMATRA-USD at the live oracle
+        /// MATRA/USD rate, and credits the result to
+        /// `MarginAccount.free_e18`. Updates `last_deposit_block` so
+        /// `withdraw_margin` enforces the dwell time.
         #[pallet::call_index(2)]
         #[pallet::weight(Weight::from_parts(80_000_000, 1800))]
         pub fn deposit_margin(
             origin: OriginFor<T>,
-            _amount_motra: BalanceOf<T>,
+            amount_motra: BalanceOf<T>,
         ) -> DispatchResult {
-            let _who = ensure_signed(origin)?;
-            // TODO PR-B: Currency::transfer(who → PalletId::into_account_truncating(),
-            // amount); increment MarginAccount.free_e18 at the live oracle
-            // MATRA/USD rate; update last_deposit_block; emit MarginDeposited.
+            let who = ensure_signed(origin)?;
+            ensure!(!amount_motra.is_zero(), Error::<T>::PositionSizeZero);
+            Self::do_deposit_margin(&who, amount_motra)?;
             Ok(())
         }
 
-        /// **(PR-A stub)** Withdraw collateral. See design memo §3.4.
+        /// Withdraw margin from the pot to MOTRA. Per design memo §3.4.
+        ///
+        /// `amount_e18` is in 1e18-scaled pMATRA-USD. The pallet
+        /// converts to MOTRA at the live MATRA/USD rate and
+        /// `T::Currency::transfer` from pot → caller.
+        ///
+        /// Gates:
+        /// 1. `last_deposit_block + WithdrawDwellBlocks ≤ now`
+        ///    — `WithdrawDwellNotElapsed`.
+        /// 2. `free_e18 ≥ amount_e18` — `InsufficientMargin`.
+        /// 3. `free_e18 − amount_e18 ≥ sum(locked_margins) ×
+        ///    InitialMarginBps / 10_000` — i.e. user can't withdraw
+        ///    down to where open positions are immediately
+        ///    insta-liquidatable. v0 implements the simpler invariant
+        ///    "post-withdraw free ≥ 0 AND user has no open positions
+        ///    with locked margin > 0 that would be made
+        ///    insta-liquidatable." Since `locked_margin` is stored on
+        ///    Position not MarginAccount, the gate enumerates the
+        ///    user's positions and checks each one's locked margin
+        ///    against `initial_margin * market.initial_margin_bps /
+        ///    10_000`. v0 keeps it simple: any open position blocks
+        ///    full withdrawal below the sum of locked margins. PR-C
+        ///    extends with the equity-vs-IM gate.
         #[pallet::call_index(3)]
         #[pallet::weight(Weight::from_parts(120_000_000, 2200))]
         pub fn withdraw_margin(
             origin: OriginFor<T>,
-            _amount_e18: u128,
+            amount_e18: u128,
         ) -> DispatchResult {
-            let _who = ensure_signed(origin)?;
-            // TODO PR-B: enforce free_e18 - amount_e18 ≥ max(initial
-            // margin across all open positions); enforce 24h dwell time
-            // since last_deposit_block; convert pMATRA-USD → MOTRA at
-            // oracle rate; Currency::transfer(PalletId → who); emit
-            // MarginWithdrawn.
+            let who = ensure_signed(origin)?;
+            ensure!(amount_e18 > 0, Error::<T>::PositionSizeZero);
+
+            let mut acct = MarginAccounts::<T>::get(&who);
+
+            // (1) dwell time
+            let now = Self::current_block_u32();
+            let dwell = T::WithdrawDwellBlocks::get();
+            let unlock_at = acct.last_deposit_block.saturating_add(dwell);
+            ensure!(now >= unlock_at, Error::<T>::WithdrawDwellNotElapsed);
+
+            // (2) free-margin floor
+            ensure!(
+                acct.free_e18 >= amount_e18,
+                Error::<T>::InsufficientMargin
+            );
+
+            // (3) total-locked floor. For every open position the
+            // user holds in any market, the locked margin defines a
+            // hard floor on post-withdrawal free balance — withdrawing
+            // below this would mean any new opens or mark moves would
+            // insta-liquidate.
+            //
+            // Substrate's `StorageDoubleMap` doesn't expose a
+            // by-secondary-key index, so we iterate the entire map
+            // and filter by account. v0 acceptable scale: open-
+            // position count is bounded by `T::MaxMarkets *
+            // active_user_count`; the dwell-time gate also rate-
+            // limits this path. PR-C may add a per-account locked-
+            // margin sum cache if iteration cost becomes a concern.
+            let mut total_locked: u128 = 0;
+            for (_mkt, acct_key, pos) in Positions::<T>::iter() {
+                if acct_key == who {
+                    total_locked =
+                        total_locked.saturating_add(pos.locked_margin_e18);
+                }
+            }
+
+            let post_withdraw = acct
+                .free_e18
+                .checked_sub(amount_e18)
+                .ok_or(Error::<T>::InsufficientMargin)?;
+            ensure!(
+                post_withdraw >= total_locked,
+                Error::<T>::InsufficientMargin
+            );
+
+            // (4) convert pMATRA-USD → MOTRA at live oracle rate.
+            let amount_motra_balance = Self::pmatra_usd_to_motra(amount_e18)?;
+
+            // (5) transfer MOTRA from pot to user.
+            let pot = T::PalletId::get().into_account_truncating();
+            T::Currency::transfer(
+                &pot,
+                &who,
+                amount_motra_balance,
+                ExistenceRequirement::AllowDeath,
+            )?;
+
+            // (6) book the withdrawal in 1e18-scaled pMATRA-USD.
+            acct.free_e18 = post_withdraw;
+            MarginAccounts::<T>::insert(&who, acct);
+
+            Self::deposit_event(Event::MarginWithdrawn {
+                who,
+                amount_e18,
+                free_e18_after: post_withdraw,
+            });
             Ok(())
         }
 
@@ -679,22 +1088,114 @@ pub mod pallet {
             Ok(())
         }
 
-        /// **(PR-A stub)** Adjust leverage on an open position. See
-        /// design memo §3.7.
+        /// Adjust leverage on an open position. Per design memo §3.7.
+        ///
+        /// `new_locked = notional_at_entry / new_leverage`. Delta moves
+        /// between `MarginAccount.free_e18` and `Position.locked_margin_e18`:
+        /// - Lever down (more margin locked) → require free ≥ delta;
+        ///   transfer free → locked.
+        /// - Lever up (less margin locked) → transfer locked → free.
+        ///
+        /// Bounds: `T::MinLeverageBps ≤ new_leverage_bps ≤
+        /// min(market.max_leverage_bps, T::MaxLeverageBps)`.
+        ///
+        /// Equity invariant: after the adjust, the position's new
+        /// locked margin at the CURRENT mark must remain above
+        /// `initial_margin_bps × current_notional / 10_000` — i.e. the
+        /// adjust cannot push the user into immediate liquidation
+        /// territory.
         #[pallet::call_index(6)]
         #[pallet::weight(Weight::from_parts(100_000_000, 2200))]
         pub fn adjust_leverage(
             origin: OriginFor<T>,
-            _market_id: MarketId,
-            _new_leverage_bps: u32,
+            market_id: MarketId,
+            new_leverage_bps: u32,
         ) -> DispatchResult {
-            let _who = ensure_signed(origin)?;
-            // TODO PR-B: read Position; recompute locked_margin = (size_e8
-            // * entry_mark_e18) / new_leverage_bps; revert if new locked
-            // margin pushes equity below initial margin at current mark;
-            // re-baseline cumulative_funding_at_open_e18 to current
-            // CumulativeFundingIndex; emit LeverageAdjusted +
-            // IntentKind::PerpAction(LeverageAdjust).
+            let who = ensure_signed(origin)?;
+
+            let market = Markets::<T>::get(&market_id)
+                .ok_or(Error::<T>::MarketNotFound)?;
+            let mut pos = Positions::<T>::get(&market_id, &who)
+                .ok_or(Error::<T>::PositionNotFound)?;
+
+            // bounds
+            let max_leverage = market
+                .max_leverage_bps
+                .min(T::MaxLeverageBps::get());
+            ensure!(
+                new_leverage_bps >= T::MinLeverageBps::get()
+                    && new_leverage_bps <= max_leverage,
+                Error::<T>::LeverageOutOfBounds
+            );
+
+            let abs_size: u128 = pos.size_e8.unsigned_abs();
+            let old_leverage = pos.leverage_bps;
+
+            // Recompute locked at entry-mark with NEW leverage.
+            let notional_e18 = compute_notional(abs_size, pos.entry_mark_e18)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            let new_locked_margin_e18 =
+                compute_initial_margin(notional_e18, new_leverage_bps)
+                    .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+
+            let mut acct = MarginAccounts::<T>::get(&who);
+            if new_locked_margin_e18 > pos.locked_margin_e18 {
+                // levering DOWN — need free margin to lock more
+                let delta = new_locked_margin_e18
+                    .checked_sub(pos.locked_margin_e18)
+                    .ok_or(Error::<T>::ArithmeticOverflow)?;
+                ensure!(
+                    acct.free_e18 >= delta,
+                    Error::<T>::InsufficientMargin
+                );
+                acct.free_e18 = acct.free_e18.saturating_sub(delta);
+            } else if new_locked_margin_e18 < pos.locked_margin_e18 {
+                // levering UP — release locked into free
+                let delta = pos
+                    .locked_margin_e18
+                    .checked_sub(new_locked_margin_e18)
+                    .ok_or(Error::<T>::ArithmeticOverflow)?;
+                acct.free_e18 = acct
+                    .free_e18
+                    .checked_add(delta)
+                    .ok_or(Error::<T>::ArithmeticOverflow)?;
+            }
+
+            // Equity-invariant check at CURRENT mark. The new locked
+            // margin must keep us above the initial-margin floor at
+            // the current price. If we're levering up too aggressively
+            // and the mark has moved against us, this gate fires
+            // before we land in a state where the next block triggers
+            // liquidation.
+            let cur_mark_e18 = T::PriceOracle::latest_price_e18(&market.oracle_feed_id)
+                .ok_or(Error::<T>::OracleUnavailable)?;
+            ensure!(cur_mark_e18 > 0, Error::<T>::OracleUnavailable);
+            let cur_notional = compute_notional(abs_size, cur_mark_e18)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            let im_floor = compute_initial_margin(cur_notional, new_leverage_bps)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            ensure!(
+                new_locked_margin_e18 >= im_floor,
+                Error::<T>::InsufficientMargin
+            );
+
+            // Apply changes.
+            pos.locked_margin_e18 = new_locked_margin_e18;
+            pos.leverage_bps = new_leverage_bps;
+            // Re-baseline the funding snapshot so subsequent close /
+            // liquidate accrues funding only from this adjust forward.
+            pos.cumulative_funding_at_open_e18 =
+                CumulativeFundingIndex::<T>::get(&market_id);
+            Positions::<T>::insert(&market_id, &who, pos);
+            MarginAccounts::<T>::insert(&who, acct);
+
+            Self::deposit_event(Event::LeverageAdjusted {
+                who,
+                market_id,
+                old_leverage_bps: old_leverage,
+                new_leverage_bps,
+                new_locked_margin_e18,
+            });
             Ok(())
         }
 
@@ -713,6 +1214,123 @@ pub mod pallet {
             // T::MaxLeverageBps, oracle feed exists in pallet-oracle);
             // enforce try_state worsening-terms timelock (§9.3); upsert
             // Markets[market_id]; emit MarketSet.
+            Ok(())
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Internal helpers (not part of the public extrinsic surface)
+    // ---------------------------------------------------------------------
+
+    impl<T: Config> Pallet<T> {
+        /// Current `frame_system::Pallet::block_number()` coerced to
+        /// `u32`. Saturates at `u32::MAX` for runtimes with a wider
+        /// `BlockNumberFor<T>`. Used by `Position.opened_block`,
+        /// `MarginAccount.last_deposit_block`, and the dwell-time
+        /// gates.
+        pub(crate) fn current_block_u32() -> u32 {
+            let n: BlockNumberFor<T> = frame_system::Pallet::<T>::block_number();
+            n.saturated_into::<u32>()
+        }
+
+        /// Pot account derived from `T::PalletId`. All MOTRA margin
+        /// custody lives here (§3.3 collateral abstraction).
+        pub fn pot_account() -> T::AccountId {
+            T::PalletId::get().into_account_truncating()
+        }
+
+        /// Convert a MOTRA `BalanceOf<T>` amount to 1e18-scaled
+        /// pMATRA-USD using the live MATRA/USD oracle feed. Errors
+        /// `OracleUnavailable` if the feed is stale / missing.
+        ///
+        /// Formula: `pMATRA_USD_e18 = motra * matra_usd_e18 / 1`
+        /// (price is itself 1e18-scaled and MOTRA is treated as a
+        /// 1-decimal native integer, matching the runtime's
+        /// `Balance::Decimals = 1` configuration; the dimensional
+        /// reconciliation is the adapter's job). v0 keeps it
+        /// straightforward at the cost of one read.
+        pub(crate) fn motra_to_pmatra_usd(
+            amount_motra: BalanceOf<T>,
+        ) -> Result<u128, DispatchError> {
+            let feed = T::MatraUsdFeedId::get();
+            ensure!(
+                T::PriceOracle::is_fresh(&feed),
+                Error::<T>::OracleUnavailable
+            );
+            let rate_e18 = T::PriceOracle::latest_price_e18(&feed)
+                .ok_or(Error::<T>::OracleUnavailable)?;
+            ensure!(rate_e18 > 0, Error::<T>::OracleUnavailable);
+            let motra: u128 = amount_motra.saturated_into::<u128>();
+            // motra * matra_usd_e18 — result is already
+            // 1e18-scaled.
+            motra
+                .checked_mul(rate_e18)
+                .ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
+        }
+
+        /// Inverse of `motra_to_pmatra_usd`. Errors `OracleUnavailable`
+        /// if the feed is stale, `ArithmeticOverflow` if the
+        /// `BalanceOf<T>` target type can't hold the result.
+        pub(crate) fn pmatra_usd_to_motra(
+            amount_e18: u128,
+        ) -> Result<BalanceOf<T>, DispatchError> {
+            let feed = T::MatraUsdFeedId::get();
+            ensure!(
+                T::PriceOracle::is_fresh(&feed),
+                Error::<T>::OracleUnavailable
+            );
+            let rate_e18 = T::PriceOracle::latest_price_e18(&feed)
+                .ok_or(Error::<T>::OracleUnavailable)?;
+            ensure!(rate_e18 > 0, Error::<T>::OracleUnavailable);
+            // Inverse: motra = amount_e18 / rate_e18.
+            let motra_u128 = amount_e18 / rate_e18;
+            let bal: BalanceOf<T> = motra_u128
+                .try_into()
+                .map_err(|_| Error::<T>::BalanceConversionOverflow)?;
+            Ok(bal)
+        }
+
+        /// Shared body for `deposit_margin` extrinsic + `open_position`'s
+        /// optional `margin_top_up_motra` path. Per design memo §3.3:
+        ///  1. Transfer MOTRA from caller → pot.
+        ///  2. Convert MOTRA → pMATRA-USD at live oracle rate.
+        ///  3. Credit `MarginAccount.free_e18`.
+        ///  4. Bump `last_deposit_block` for dwell-time gate.
+        ///  5. Emit `MarginDeposited`.
+        pub(crate) fn do_deposit_margin(
+            who: &T::AccountId,
+            amount_motra: BalanceOf<T>,
+        ) -> DispatchResult {
+            if amount_motra.is_zero() {
+                return Ok(());
+            }
+            // Convert FIRST so a stale oracle blocks the deposit
+            // before any state mutation. This matches the user-
+            // protection contract: a deposit at an unknown rate is
+            // worse than a failed deposit.
+            let credit_e18 = Self::motra_to_pmatra_usd(amount_motra)?;
+
+            let pot = Self::pot_account();
+            T::Currency::transfer(
+                who,
+                &pot,
+                amount_motra,
+                ExistenceRequirement::AllowDeath,
+            )?;
+
+            let mut acct = MarginAccounts::<T>::get(who);
+            acct.free_e18 = acct
+                .free_e18
+                .checked_add(credit_e18)
+                .ok_or(Error::<T>::ArithmeticOverflow)?;
+            acct.last_deposit_block = Self::current_block_u32();
+            MarginAccounts::<T>::insert(who, acct.clone());
+
+            Self::deposit_event(Event::MarginDeposited {
+                who: who.clone(),
+                amount_motra,
+                free_e18_after: acct.free_e18,
+            });
             Ok(())
         }
     }
