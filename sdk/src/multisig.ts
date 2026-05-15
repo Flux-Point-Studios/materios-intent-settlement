@@ -37,8 +37,47 @@ import { encodeIntentKind, u32LE, u64LE } from "./hashing.js";
 
 /** `b"CRDP"` — 4-byte ASCII domain tag for credit_deposit payloads. */
 export const TAG_CRDP: Uint8Array = new Uint8Array([0x43, 0x52, 0x44, 0x50]);
-/** `b"STCL"` — 4-byte ASCII domain tag for settle_claim payloads. */
+/**
+ * `b"STCL"` — 4-byte ASCII domain tag for the legacy settle_claim payload.
+ *
+ * @deprecated Task #266 (mis-sec P0): the legacy `settle_claim` extrinsic
+ * is retired at `STCA_CUTOVER_BLOCK = upgrade_block + 50`. New code MUST
+ * use `TAG_STCA` + `settleClaimAttestedPayload` so committee sigs commit
+ * to the FAT Cardano observation (cardano_tx + slot + depth + beneficiary
+ * + amount + voucher_digest + mainchain_genesis_hash) rather than a
+ * vacuous hash.
+ */
 export const TAG_STCL: Uint8Array = new Uint8Array([0x53, 0x54, 0x43, 0x4c]);
+/**
+ * `b"STCA"` — 4-byte ASCII domain tag for the **attested** settle_claim
+ * payload (Task #266, mis-sec P0). The new split-extrinsic pipeline
+ * (`request_settle` + `attest_settle`) signs over a 209-byte body that
+ * commits to seven verifiable Cardano facts:
+ *   - cardano_tx_hash
+ *   - settled_direct flag
+ *   - beneficiary_addr_hash (28-byte payment-key hash from the voucher)
+ *   - amount_lovelace (from the voucher)
+ *   - observed_at_depth (>= MinFinalityDepth)
+ *   - observed_slot (Cardano slot of the settling tx)
+ *   - mainchain_genesis_hash (pins preprod vs mainnet)
+ *
+ * Plus the chain-state-derived `voucher_digest` so a colluding M cannot
+ * reuse one legitimate Cardano payment to close multiple Materios claims
+ * (attack A5 in design memo §1.2).
+ *
+ * Domain-separated from `STCL` so a stale STCL bundle cannot replay onto
+ * the new STCA path.
+ */
+export const TAG_STCA: Uint8Array = new Uint8Array([0x53, 0x54, 0x43, 0x41]);
+/**
+ * `b"BSTA"` — 4-byte ASCII domain tag for the **batch** attested-settle
+ * payload (Task #266, mis-sec P0). The committee signs ONE digest over
+ * N STCA-shaped per-entry bodies for `attest_batch_settle`. Mirrors the
+ * spec-207 batching win for the new path. Domain-separated from `STBA`
+ * (the legacy `settle_batch_atomic` tag) so pre-fix batch sigs cannot
+ * replay onto the attested-batch path.
+ */
+export const TAG_BSTA: Uint8Array = new Uint8Array([0x42, 0x53, 0x54, 0x41]);
 /**
  * `b"RVCH"` — 4-byte ASCII domain tag for `request_voucher` payloads
  * (Task #174). Closes the M-of-N gap on the voucher-mint stage of the
@@ -89,6 +128,14 @@ function require32(bytes: Uint8Array, field: string): void {
  *                   || cardano_tx_hash (32B) || settled_direct (1B)`
  *
  * @returns 32-byte blake2_256 digest that committee members must sign.
+ *
+ * @deprecated Task #266 (mis-sec P0): the legacy `settle_claim` extrinsic
+ * is retired at `STCA_CUTOVER_BLOCK = upgrade_block + 50`. New code MUST
+ * use `settleClaimAttestedPayload` which commits each signature to the
+ * FAT Cardano observation (cardano_tx + slot + depth + beneficiary +
+ * amount + voucher_digest + mainchain_genesis_hash). The vacuous-hash
+ * design here let any colluding M close a claim against a non-existent
+ * Cardano payment (attack A1 in the design memo).
  */
 export function settleClaimPayload(args: {
   /** #73: 32-byte Materios genesis hash. */
@@ -113,6 +160,194 @@ export function settleClaimPayload(args: {
   const digest = blake2AsU8a(u8aConcat(TAG_STCL, body), 256);
   // Safety net: `blake2AsU8a(…, 256)` is documented to return 32B. Guard
   // against a future breaking change in @polkadot/util-crypto.
+  if (digest.length !== 32) {
+    throw new Error(`blake2_256 digest length != 32 (got ${digest.length})`);
+  }
+  return digest;
+}
+
+function require28(bytes: Uint8Array, field: string): void {
+  if (bytes.length !== 28) {
+    throw new Error(`${field}: expected 28 bytes, got ${bytes.length}`);
+  }
+}
+
+/**
+ * Byte-identical to Rust `settle_claim_attested_payload(...)` (Task #266,
+ * mis-sec P0).
+ *
+ * Pre-image (209 bytes):
+ *
+ *     b"STCA"                                 (4B  domain tag)
+ *  || materios_chain_id                       (32B chain identity, #73)
+ *  || claim_id                                (32B)
+ *  || voucher_digest                          (32B chain-state-derived)
+ *  || cardano_tx_hash                         (32B)
+ *  || settled_direct                          (1B  0x00 / 0x01)
+ *  || beneficiary_addr_hash                   (28B 28-byte payment-key hash)
+ *  || amount_lovelace                         (8B  LE u64)
+ *  || observed_at_depth                       (4B  LE u32)
+ *  || observed_slot                           (8B  LE u64)
+ *  || mainchain_genesis_hash                  (32B preprod vs mainnet pin)
+ *
+ * Total body length = 209 bytes (4 blake2 blocks). The legacy STCL body
+ * was 97 bytes (2 blocks); this digest costs one extra blake2 round per
+ * signer (~300 ns) for the safety win of binding each committee
+ * signature to a falsifiable Cardano-record fact.
+ *
+ * `voucherDigest` here is the chain-state-derived value the pallet looks
+ * up from `Vouchers[claim_id]` at `attest_settle` time — compute via the
+ * SDK's `voucherDigestWithAddress` helper using the SAME chain-identity
+ * inputs the runtime uses (otherwise the digest diverges and
+ * `InvalidSignature` fires on-chain).
+ *
+ * @returns 32-byte blake2_256 digest that committee members must sign.
+ */
+export function settleClaimAttestedPayload(args: {
+  /** #73: 32-byte Materios genesis hash. */
+  materiosChainId: HexString;
+  /** 32-byte claim id (H256), hex-prefixed. */
+  claimId: HexString;
+  /**
+   * 32-byte canonical voucher digest from on-chain `Vouchers[claim_id]`.
+   * Compute via `voucherDigestWithAddress` with the same chain-identity
+   * inputs the runtime uses, or hand back the value the chain exposes
+   * via the runtime API.
+   */
+  voucherDigest: HexString;
+  /** 32-byte Cardano transaction hash claimed to have settled this claim. */
+  cardanoTxHash: HexString;
+  /** Whether this is the 10-minute direct-path fallback (true) vs the keeper-batch path (false). */
+  settledDirect: boolean;
+  /**
+   * 28-byte payment-key hash, lifted from positions [1..29] of the CIP-0019
+   * type-0 address in the on-chain voucher.
+   */
+  beneficiaryAddrHash: HexString;
+  /** Lovelace amount paid by the settling Cardano tx. Must equal `claim.amount_ada`. */
+  amountLovelace: bigint;
+  /** Cardano depth at which the attestor observed the tx. Must be >= MinFinalityDepth. */
+  observedAtDepth: number;
+  /** Cardano slot of the settling tx. */
+  observedSlot: bigint;
+  /** 32-byte Cardano genesis hash (preprod vs mainnet pin). */
+  mainchainGenesisHash: HexString;
+}): Uint8Array {
+  const chainId = hexToU8a(args.materiosChainId);
+  const claimId = hexToU8a(args.claimId);
+  const voucherDigest = hexToU8a(args.voucherDigest);
+  const cardanoTxHash = hexToU8a(args.cardanoTxHash);
+  const beneficiary = hexToU8a(args.beneficiaryAddrHash);
+  const mcGenesis = hexToU8a(args.mainchainGenesisHash);
+  require32(chainId, "materiosChainId");
+  require32(claimId, "claimId");
+  require32(voucherDigest, "voucherDigest");
+  require32(cardanoTxHash, "cardanoTxHash");
+  require28(beneficiary, "beneficiaryAddrHash");
+  require32(mcGenesis, "mainchainGenesisHash");
+  const body = u8aConcat(
+    chainId,
+    claimId,
+    voucherDigest,
+    cardanoTxHash,
+    new Uint8Array([args.settledDirect ? 1 : 0]),
+    beneficiary,
+    u64LE(args.amountLovelace),
+    u32LE(args.observedAtDepth),
+    u64LE(args.observedSlot),
+    mcGenesis,
+  );
+  // Sanity: body must be exactly 209 bytes per the locked design memo §3.2.
+  // 32+32+32+32+1+28+8+4+8+32 = 209.
+  if (body.length !== 209) {
+    throw new Error(
+      `STCA body length must be 209 bytes (got ${body.length}); see design memo §3.2`,
+    );
+  }
+  const digest = blake2AsU8a(u8aConcat(TAG_STCA, body), 256);
+  if (digest.length !== 32) {
+    throw new Error(`blake2_256 digest length != 32 (got ${digest.length})`);
+  }
+  return digest;
+}
+
+/**
+ * Per-entry view of an `attest_batch_settle` payload's body. The pallet
+ * reconstructs the same struct from chain state at attest time; the SDK
+ * helper here exists so keepers can pre-compute the batch digest before
+ * gathering committee sigs.
+ */
+export interface BatchAttestSettleEntry {
+  /** 32-byte claim id, hex-prefixed. */
+  claimId: HexString;
+  /** 32-byte canonical voucher digest. */
+  voucherDigest: HexString;
+  /** 32-byte Cardano tx hash. */
+  cardanoTxHash: HexString;
+  /** Direct-path flag (10-minute fallback vs keeper-batch). */
+  settledDirect: boolean;
+  /** 28-byte payment-key hash from the voucher's CIP-0019 type-0 address. */
+  beneficiaryAddrHash: HexString;
+  /** Lovelace amount paid by the settling Cardano tx. */
+  amountLovelace: bigint;
+  /** Cardano observation depth (>= MinFinalityDepth). */
+  observedAtDepth: number;
+  /** Cardano slot of the settling tx. */
+  observedSlot: bigint;
+  /** 32-byte Cardano genesis hash. */
+  mainchainGenesisHash: HexString;
+}
+
+/**
+ * Byte-identical to Rust `attest_batch_settle_payload(entries)` (Task #266,
+ * mis-sec P0).
+ *
+ * Pre-image:
+ *
+ *     b"BSTA"
+ *  || materios_chain_id (32B)
+ *  || u32_le(N)
+ *  || N x (claim_id (32B) || voucher_digest (32B) || cardano_tx_hash (32B)
+ *          || settled_direct (1B) || beneficiary_addr_hash (28B)
+ *          || amount_lovelace (LE u64, 8B) || observed_at_depth (LE u32, 4B)
+ *          || observed_slot (LE u64, 8B) || mainchain_genesis_hash (32B))
+ *
+ * Each per-entry body is identical in shape to the single-call STCA body.
+ * Flat byte stream — NOT SCALE-encoded — so the digest is independent of
+ * substrate-interface BoundedVec wrapping quirks.
+ */
+export function attestBatchSettlePayload(args: {
+  materiosChainId: HexString;
+  entries: BatchAttestSettleEntry[];
+}): Uint8Array {
+  const chainId = hexToU8a(args.materiosChainId);
+  require32(chainId, "materiosChainId");
+  const n = args.entries.length;
+  const parts: Uint8Array[] = [TAG_BSTA, chainId, u32LE(n)];
+  for (const e of args.entries) {
+    const cid = hexToU8a(e.claimId);
+    const vd = hexToU8a(e.voucherDigest);
+    const tx = hexToU8a(e.cardanoTxHash);
+    const ben = hexToU8a(e.beneficiaryAddrHash);
+    const mc = hexToU8a(e.mainchainGenesisHash);
+    require32(cid, "entries[].claimId");
+    require32(vd, "entries[].voucherDigest");
+    require32(tx, "entries[].cardanoTxHash");
+    require28(ben, "entries[].beneficiaryAddrHash");
+    require32(mc, "entries[].mainchainGenesisHash");
+    parts.push(
+      cid,
+      vd,
+      tx,
+      new Uint8Array([e.settledDirect ? 1 : 0]),
+      ben,
+      u64LE(e.amountLovelace),
+      u32LE(e.observedAtDepth),
+      u64LE(e.observedSlot),
+      mc,
+    );
+  }
+  const digest = blake2AsU8a(u8aConcat(...parts), 256);
   if (digest.length !== 32) {
     throw new Error(`blake2_256 digest length != 32 (got ${digest.length})`);
   }

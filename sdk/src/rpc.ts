@@ -327,6 +327,19 @@ export interface SettleClaimArgs {
   settledDirect: boolean;
 }
 
+/**
+ * Wrapper around the legacy `intentSettlement.settleClaim` extrinsic.
+ *
+ * @deprecated Task #266 (mis-sec P0): the legacy `settle_claim` path is
+ * retired at `STCA_CUTOVER_BLOCK = upgrade_block + 50` and post-cutover
+ * the runtime rejects with `Error::DeprecatedExtrinsic`. New code MUST
+ * call `intentSettlement.requestSettle` + `intentSettlement.attestSettle`
+ * (see the keeper's `submitAttestedSettle` reference) so each committee
+ * signature commits to a falsifiable Cardano-record fact.
+ *
+ * This helper is retained for the 50-block grace window and for tooling
+ * that needs to drive both paths during rollout.
+ */
 export async function submitSettleClaim(
   client: MateriosRpcClient,
   args: SettleClaimArgs,

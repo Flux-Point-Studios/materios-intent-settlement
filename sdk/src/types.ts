@@ -157,6 +157,23 @@ export interface KeeperConfig {
   networkMagic: number;
   aegisPolicyV1ScriptHash: HexString;
   settlementVersion: number;
+  /**
+   * Task #266 (mis-sec P0): 32-byte Cardano-network genesis hash (preprod
+   * vs mainnet pin). Bound into every `SettlementEvidence` and into the
+   * STCA canonical pre-image so a preprod attestor's sig cannot settle a
+   * mainnet claim. Production keepers should fetch this from Ogmios /
+   * Kupo at startup; tests pin a fixture.
+   */
+  mainchainGenesisHash: HexString;
+  /**
+   * Task #266 (mis-sec P0): pallet's minimum-finality-depth floor in
+   * Cardano blocks. The keeper refuses to call `request_settle` while
+   * `(current_slot - tx_slot) / 20 < minFinalityDepth` (Cardano averages
+   * ~20s per block). Matches the runtime's `Config::MinFinalityDepth`
+   * constant — the cert-daemon's own per-slot k=2160 rule is enforced
+   * separately. Defaults to 15 in production.
+   */
+  minFinalityDepth: number;
 }
 
 /** Committee daemon config. */

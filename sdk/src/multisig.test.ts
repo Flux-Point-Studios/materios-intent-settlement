@@ -3,6 +3,8 @@ import { cryptoWaitReady, sr25519Verify } from "@polkadot/util-crypto";
 import { hexToU8a, u8aToHex } from "@polkadot/util";
 import {
   settleClaimPayload,
+  settleClaimAttestedPayload,
+  attestBatchSettlePayload,
   creditDepositPayload,
   requestVoucherPayload,
   attestBatchIntentsPayload,
@@ -12,6 +14,8 @@ import {
   buildSigBundle,
   TAG_CRDP,
   TAG_STCL,
+  TAG_STCA,
+  TAG_BSTA,
   TAG_RVCH,
   TAG_ABIN,
   TAG_RVBN,
@@ -38,6 +42,14 @@ describe("multisig domain tags", () => {
 
   it("TAG_STCL is ASCII `STCL`", () => {
     expect(Array.from(TAG_STCL)).toEqual([0x53, 0x54, 0x43, 0x4c]);
+  });
+
+  it("TAG_STCA is ASCII `STCA` (Task #266)", () => {
+    expect(Array.from(TAG_STCA)).toEqual([0x53, 0x54, 0x43, 0x41]);
+  });
+
+  it("TAG_BSTA is ASCII `BSTA` (Task #266)", () => {
+    expect(Array.from(TAG_BSTA)).toEqual([0x42, 0x53, 0x54, 0x41]);
   });
 
   it("TAG_RVCH is ASCII `RVCH` (Task #174)", () => {
@@ -883,5 +895,244 @@ describe("submitBatchIntentsPayload — Rust parity (Task #210)", () => {
       ],
     });
     expect(u8aToHex(empty)).not.toBe(u8aToHex(one));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task #266 (mis-sec P0) — STCA payload parity tests.
+//
+// `settleClaimAttestedPayload` MUST byte-match the Rust pallet's
+// `settle_claim_attested_payload(...)` helper. Inputs + expected hex below
+// are pinned against `tests.rs::FIXTURE_STCA_F_FALSE_HEX` /
+// `FIXTURE_STCA_F_TRUE_HEX`. Drift on either side breaks the M-of-N gate
+// on `attest_settle` — keepers signing one digest, pallet verifying
+// another.
+// ---------------------------------------------------------------------------
+
+describe("settleClaimAttestedPayload — Rust parity (Task #266)", () => {
+  // Inputs pinned across SDK + pallet fixture F. Mainchain genesis hash is
+  // the same 32×0x65 fixture the pallet's test runtime ships.
+  const FIXTURE_CLAIM_ID = ("0x" + "07".repeat(32)) as HexString;
+  const FIXTURE_VOUCHER_DIGEST = ("0x" + "22".repeat(32)) as HexString;
+  const FIXTURE_TX_HASH = ("0x" + "33".repeat(32)) as HexString;
+  const FIXTURE_BENEFICIARY = ("0x" + "44".repeat(28)) as HexString;
+  const FIXTURE_MC_GENESIS = ("0x" + "65".repeat(32)) as HexString;
+  const FIXTURE_AMOUNT = 1_500_000n;
+  const FIXTURE_DEPTH = 15;
+  const FIXTURE_SLOT = 12_345_678n;
+
+  it("matches Rust fixture F (settled_direct=false)", () => {
+    const digest = settleClaimAttestedPayload({
+      materiosChainId: TEST_CHAIN_ID,
+      claimId: FIXTURE_CLAIM_ID,
+      voucherDigest: FIXTURE_VOUCHER_DIGEST,
+      cardanoTxHash: FIXTURE_TX_HASH,
+      settledDirect: false,
+      beneficiaryAddrHash: FIXTURE_BENEFICIARY,
+      amountLovelace: FIXTURE_AMOUNT,
+      observedAtDepth: FIXTURE_DEPTH,
+      observedSlot: FIXTURE_SLOT,
+      mainchainGenesisHash: FIXTURE_MC_GENESIS,
+    });
+    expect(u8aToHex(digest)).toBe(
+      "0xf1a2568c52249ffed44a12a9615703b43a6e0c4baf5b447bbc81194673c7efc8",
+    );
+  });
+
+  it("matches Rust fixture F (settled_direct=true)", () => {
+    const digest = settleClaimAttestedPayload({
+      materiosChainId: TEST_CHAIN_ID,
+      claimId: FIXTURE_CLAIM_ID,
+      voucherDigest: FIXTURE_VOUCHER_DIGEST,
+      cardanoTxHash: FIXTURE_TX_HASH,
+      settledDirect: true,
+      beneficiaryAddrHash: FIXTURE_BENEFICIARY,
+      amountLovelace: FIXTURE_AMOUNT,
+      observedAtDepth: FIXTURE_DEPTH,
+      observedSlot: FIXTURE_SLOT,
+      mainchainGenesisHash: FIXTURE_MC_GENESIS,
+    });
+    expect(u8aToHex(digest)).toBe(
+      "0xc3fd35f32c4ccb94504cd95df98508855e6f0b89536602ca56e472864478cab8",
+    );
+  });
+
+  it("body length is exactly 209 bytes (design memo §3.2)", () => {
+    // Indirectly verified by the helper's internal sanity check: if the
+    // body ever drifts off 209 bytes the helper throws before hashing.
+    // We exercise the path here to pin the contract in CI.
+    expect(() =>
+      settleClaimAttestedPayload({
+        materiosChainId: TEST_CHAIN_ID,
+        claimId: FIXTURE_CLAIM_ID,
+        voucherDigest: FIXTURE_VOUCHER_DIGEST,
+        cardanoTxHash: FIXTURE_TX_HASH,
+        settledDirect: false,
+        beneficiaryAddrHash: FIXTURE_BENEFICIARY,
+        amountLovelace: FIXTURE_AMOUNT,
+        observedAtDepth: FIXTURE_DEPTH,
+        observedSlot: FIXTURE_SLOT,
+        mainchainGenesisHash: FIXTURE_MC_GENESIS,
+      }),
+    ).not.toThrow();
+  });
+
+  it("STCA digest is domain-separated from legacy STCL even with identical claim/tx", () => {
+    const stcl = settleClaimPayload({
+      materiosChainId: TEST_CHAIN_ID,
+      claimId: FIXTURE_CLAIM_ID,
+      cardanoTxHash: FIXTURE_TX_HASH,
+      settledDirect: false,
+    });
+    const stca = settleClaimAttestedPayload({
+      materiosChainId: TEST_CHAIN_ID,
+      claimId: FIXTURE_CLAIM_ID,
+      voucherDigest: FIXTURE_VOUCHER_DIGEST,
+      cardanoTxHash: FIXTURE_TX_HASH,
+      settledDirect: false,
+      beneficiaryAddrHash: FIXTURE_BENEFICIARY,
+      amountLovelace: FIXTURE_AMOUNT,
+      observedAtDepth: FIXTURE_DEPTH,
+      observedSlot: FIXTURE_SLOT,
+      mainchainGenesisHash: FIXTURE_MC_GENESIS,
+    });
+    expect(u8aToHex(stcl)).not.toBe(u8aToHex(stca));
+  });
+
+  it("voucher_digest is load-bearing in the STCA digest", () => {
+    const v_a = ("0x" + "22".repeat(32)) as HexString;
+    const v_b = ("0x" + "88".repeat(32)) as HexString;
+    const make = (vd: HexString) =>
+      settleClaimAttestedPayload({
+        materiosChainId: TEST_CHAIN_ID,
+        claimId: FIXTURE_CLAIM_ID,
+        voucherDigest: vd,
+        cardanoTxHash: FIXTURE_TX_HASH,
+        settledDirect: false,
+        beneficiaryAddrHash: FIXTURE_BENEFICIARY,
+        amountLovelace: FIXTURE_AMOUNT,
+        observedAtDepth: FIXTURE_DEPTH,
+        observedSlot: FIXTURE_SLOT,
+        mainchainGenesisHash: FIXTURE_MC_GENESIS,
+      });
+    // Attack A5 defense: two claims with otherwise identical evidence but
+    // different voucher_digest values MUST produce different digests.
+    expect(u8aToHex(make(v_a))).not.toBe(u8aToHex(make(v_b)));
+  });
+
+  it("rejects wrong-length inputs", () => {
+    const goodArgs = {
+      materiosChainId: TEST_CHAIN_ID,
+      claimId: FIXTURE_CLAIM_ID,
+      voucherDigest: FIXTURE_VOUCHER_DIGEST,
+      cardanoTxHash: FIXTURE_TX_HASH,
+      settledDirect: false,
+      beneficiaryAddrHash: FIXTURE_BENEFICIARY,
+      amountLovelace: FIXTURE_AMOUNT,
+      observedAtDepth: FIXTURE_DEPTH,
+      observedSlot: FIXTURE_SLOT,
+      mainchainGenesisHash: FIXTURE_MC_GENESIS,
+    };
+    // 30-byte beneficiary hash — must throw.
+    expect(() =>
+      settleClaimAttestedPayload({
+        ...goodArgs,
+        beneficiaryAddrHash: ("0x" + "44".repeat(30)) as HexString,
+      }),
+    ).toThrow(/28 bytes/);
+    // 31-byte mainchain genesis — must throw.
+    expect(() =>
+      settleClaimAttestedPayload({
+        ...goodArgs,
+        mainchainGenesisHash: ("0x" + "65".repeat(31)) as HexString,
+      }),
+    ).toThrow(/32 bytes/);
+  });
+
+  it("legacy settleClaimPayload still works under @deprecated", () => {
+    // Backward-compat: the legacy helper remains callable so cert-daemons
+    // mid-rollout can sign STCL bundles while the runtime is pre-cutover.
+    // Post-cutover the runtime rejects with DeprecatedExtrinsic; SDK
+    // bundling is unchanged.
+    const digest = settleClaimPayload({
+      materiosChainId: TEST_CHAIN_ID,
+      claimId: FIXTURE_CLAIM_ID,
+      cardanoTxHash: FIXTURE_TX_HASH,
+      settledDirect: false,
+    });
+    expect(digest.length).toBe(32);
+  });
+});
+
+describe("attestBatchSettlePayload — basic shape (Task #266)", () => {
+  it("returns 32-byte digest for empty entries", () => {
+    const d = attestBatchSettlePayload({
+      materiosChainId: TEST_CHAIN_ID,
+      entries: [],
+    });
+    expect(d.length).toBe(32);
+  });
+
+  it("differs from STCA single-call digest even for one entry", () => {
+    const claim = ("0x" + "07".repeat(32)) as HexString;
+    const vd = ("0x" + "22".repeat(32)) as HexString;
+    const tx = ("0x" + "33".repeat(32)) as HexString;
+    const ben = ("0x" + "44".repeat(28)) as HexString;
+    const mc = ("0x" + "65".repeat(32)) as HexString;
+    const single = settleClaimAttestedPayload({
+      materiosChainId: TEST_CHAIN_ID,
+      claimId: claim,
+      voucherDigest: vd,
+      cardanoTxHash: tx,
+      settledDirect: false,
+      beneficiaryAddrHash: ben,
+      amountLovelace: 1n,
+      observedAtDepth: 1,
+      observedSlot: 1n,
+      mainchainGenesisHash: mc,
+    });
+    const batch = attestBatchSettlePayload({
+      materiosChainId: TEST_CHAIN_ID,
+      entries: [
+        {
+          claimId: claim,
+          voucherDigest: vd,
+          cardanoTxHash: tx,
+          settledDirect: false,
+          beneficiaryAddrHash: ben,
+          amountLovelace: 1n,
+          observedAtDepth: 1,
+          observedSlot: 1n,
+          mainchainGenesisHash: mc,
+        },
+      ],
+    });
+    // STCA (single) and BSTA (batch) are domain-separated by tag + length
+    // prefix, so the two digests MUST differ.
+    expect(u8aToHex(single)).not.toBe(u8aToHex(batch));
+  });
+
+  it("permutes per-entry order — different digest for [a, b] vs [b, a]", () => {
+    const a = {
+      claimId: ("0x" + "07".repeat(32)) as HexString,
+      voucherDigest: ("0x" + "22".repeat(32)) as HexString,
+      cardanoTxHash: ("0x" + "33".repeat(32)) as HexString,
+      settledDirect: false,
+      beneficiaryAddrHash: ("0x" + "44".repeat(28)) as HexString,
+      amountLovelace: 1n,
+      observedAtDepth: 1,
+      observedSlot: 1n,
+      mainchainGenesisHash: ("0x" + "65".repeat(32)) as HexString,
+    };
+    const b = { ...a, claimId: ("0x" + "08".repeat(32)) as HexString };
+    const ab = attestBatchSettlePayload({
+      materiosChainId: TEST_CHAIN_ID,
+      entries: [a, b],
+    });
+    const ba = attestBatchSettlePayload({
+      materiosChainId: TEST_CHAIN_ID,
+      entries: [b, a],
+    });
+    expect(u8aToHex(ab)).not.toBe(u8aToHex(ba));
   });
 });
