@@ -291,12 +291,21 @@ fn credit_motra(who: u64, amount: u128) {
 /// Helper: directly seed `MarginAccount.free_e18` without going through
 /// `deposit_margin`. Used by tests that want to skip the MOTRA leg
 /// for clarity.
+///
+/// `weighted_deposit_rate_e18` is seeded to 0 so `withdraw_margin`
+/// falls back to the LIVE MATRA/USD rate at withdraw time (the legacy
+/// pre-snapshot conversion behaviour, preserved for tests that
+/// directly seed balances and don't care about deposit-rate
+/// accounting). New tests that exercise the snapshot-rate clamp
+/// should call `deposit_margin` through the real extrinsic path so
+/// the rate gets pinned correctly.
 fn seed_free_margin(who: u64, free_e18: u128) {
     pallet_perp_engine::pallet::MarginAccounts::<Test>::insert(
         who,
         MarginAccount {
             free_e18,
             last_deposit_block: 0,
+            weighted_deposit_rate_e18: 0,
         },
     );
 }
@@ -345,8 +354,10 @@ fn it_compiles() {
     let acct = MarginAccount {
         free_e18: 1_000_000_000_000_000_000u128, // 1.0 pMATRA-USD
         last_deposit_block: 50,
+        weighted_deposit_rate_e18: 1_000_000_000_000_000_000u128, // 1.0 MATRA/USD snapshot
     };
     assert_eq!(acct.free_e18, 1_000_000_000_000_000_000u128);
+    assert_eq!(acct.weighted_deposit_rate_e18, 1_000_000_000_000_000_000u128);
     // Default impl gives zero balance + zero block.
     assert_eq!(MarginAccount::default().free_e18, 0);
     assert_eq!(MarginAccount::default().last_deposit_block, 0);
@@ -1119,6 +1130,160 @@ fn adjust_leverage_levers_down_requires_free_margin() {
                 100u32, // 1×
             ),
             Error::<Test>::InsufficientMargin
+        );
+    });
+}
+
+/// Sec-review #259-Vuln-3: `adjust_leverage` must reject calls on a
+/// paused market. Mirrors `open_position`'s paused gate; only
+/// `close_position` may bypass per memo §5.5.
+#[test]
+fn adjust_leverage_rejects_paused_market() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        seed_free_margin(signer, 1_000_000_000_000_000_000u128);
+
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            100u32,
+            50u32,
+            0u128,
+        ));
+
+        // Pause the market.
+        let mut cfg = default_ada_perp_market_config();
+        cfg.paused = true;
+        pallet_perp_engine::pallet::Markets::<Test>::insert(ada_perp_market_id(), cfg);
+
+        assert_noop!(
+            PerpEngine::adjust_leverage(
+                RuntimeOrigin::signed(signer),
+                ada_perp_market_id(),
+                500u32,
+            ),
+            Error::<Test>::MarketPaused
+        );
+    });
+}
+
+/// Sec-review #259-Vuln-2: `adjust_leverage` must reject calls when the
+/// market's oracle feed is stale. A stale oracle returns the cached
+/// price, so without this gate a user could lever up against a
+/// favourable cached price and be immediately liquidation-eligible
+/// when the oracle recovers — bad-debt residual to mat/trsy via §6.5.
+/// Mirrors the `open_position` freshness gate.
+#[test]
+fn adjust_leverage_rejects_stale_oracle() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        seed_free_margin(signer, 1_000_000_000_000_000_000u128);
+
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            100u32,
+            50u32,
+            0u128,
+        ));
+
+        // Mark the market oracle stale; MATRA/USD feed stays fresh so
+        // the MOTRA-conversion path isn't what trips.
+        set_oracle_fresh(&ada_usd_feed_id(), false);
+
+        assert_noop!(
+            PerpEngine::adjust_leverage(
+                RuntimeOrigin::signed(signer),
+                ada_perp_market_id(),
+                500u32,
+            ),
+            Error::<Test>::OracleUnavailable
+        );
+    });
+}
+
+/// Sec-review #259-Vuln-1: pot-solvency invariant. `withdraw_margin`
+/// converts pMATRA-USD → MOTRA at the account's WEIGHTED-AVG DEPOSIT
+/// rate (snapshotted at deposit time), NOT the live rate. This
+/// prevents the deposit-at-peak / withdraw-at-trough sandwich arb
+/// that would otherwise drain other depositors' MOTRA from the pot.
+///
+/// Scenario: deposit 5_000 MOTRA at MATRA/USD = $1, then MATRA
+/// depreciates to $0.50. With the live-rate (PRE-FIX) behaviour the
+/// withdrawer would redeem the same pMATRA-USD claim for DOUBLE the
+/// MOTRA they put in. With the snapshot-rate (POST-FIX) behaviour
+/// they get back exactly what they deposited.
+#[test]
+fn withdraw_margin_uses_snapshot_rate_not_live() {
+    new_test_ext().execute_with(|| {
+        let signer = 1u64;
+        credit_motra(signer, 10_000u128);
+
+        // Deposit at rate $1.00.
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(signer),
+            5_000u128,
+        ));
+
+        // The deposit snapshot rate is now $1.00 = 1e18.
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(
+            acct.weighted_deposit_rate_e18, 1_000_000_000_000_000_000u128,
+            "first deposit must seed the rate snapshot"
+        );
+        // Credit = 5_000 MOTRA × 1e18 = 5e21 pMATRA-USD.
+        assert_eq!(acct.free_e18, 5_000u128 * 1_000_000_000_000_000_000u128);
+
+        // Advance past the dwell.
+        let dwell = <Test as pallet_perp_engine::Config>::WithdrawDwellBlocks::get();
+        System::set_block_number((dwell as u64) + 2);
+
+        // ADVERSARIAL move: MATRA drops to $0.50. If withdraw used
+        // the LIVE rate the user would extract 2× their deposit.
+        set_oracle_price(
+            &matra_usd_feed_id(),
+            500_000_000_000_000_000u128, // $0.50
+        );
+
+        // Withdraw the full 5e21 pMATRA-USD balance.
+        let pot = pallet_perp_engine::pallet::Pallet::<Test>::pot_account();
+        let pot_before = pallet_balances::Pallet::<Test>::free_balance(&pot);
+        let user_before = pallet_balances::Pallet::<Test>::free_balance(&signer);
+
+        assert_ok!(PerpEngine::withdraw_margin(
+            RuntimeOrigin::signed(signer),
+            5_000u128 * 1_000_000_000_000_000_000u128,
+        ));
+
+        let pot_after = pallet_balances::Pallet::<Test>::free_balance(&pot);
+        let user_after = pallet_balances::Pallet::<Test>::free_balance(&signer);
+
+        // Snapshot-rate semantics: user gets back exactly the 5_000
+        // MOTRA they deposited. NOT 10_000 (which is what the
+        // pre-fix live-rate redemption would have paid).
+        let pot_paid = pot_before - pot_after;
+        let user_received = user_after - user_before;
+        assert_eq!(
+            pot_paid, 5_000u128,
+            "pot must NOT pay more MOTRA than the user deposited"
+        );
+        assert_eq!(
+            user_received, 5_000u128,
+            "user redeems at snapshot rate, not live rate"
+        );
+
+        // Free balance zeroed; rate reset to 0 for future re-deposits.
+        let acct_after = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(acct_after.free_e18, 0);
+        assert_eq!(
+            acct_after.weighted_deposit_rate_e18, 0,
+            "full-drain withdraw resets rate snapshot"
         );
     });
 }

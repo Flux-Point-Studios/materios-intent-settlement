@@ -1012,8 +1012,26 @@ pub mod pallet {
                 Error::<T>::InsufficientMargin
             );
 
-            // (4) convert pMATRA-USD → MOTRA at live oracle rate.
-            let amount_motra_balance = Self::pmatra_usd_to_motra(amount_e18)?;
+            // (4) Convert pMATRA-USD → MOTRA at the account's
+            // weighted-avg DEPOSIT rate (NOT the live rate), to honor
+            // the memo §10.2.1 "peg = oracle MATRA/USD price at the
+            // moment of deposit" contract and prevent the live-rate
+            // pot-drain (deposit-at-peak / withdraw-at-trough). Fresh
+            // accounts that somehow have `free_e18 > 0` with a zero
+            // `weighted_deposit_rate_e18` (currently unreachable in v0
+            // — every credit either flows from `do_deposit_margin`
+            // which seeds the rate, or from PnL/funding which inherits
+            // the prior basis) fall back to the live rate, gated on
+            // freshness.
+            let rate_for_withdraw_e18 = if acct.weighted_deposit_rate_e18 == 0 {
+                Self::live_matra_usd_rate_e18()?
+            } else {
+                acct.weighted_deposit_rate_e18
+            };
+            let motra_u128 = amount_e18 / rate_for_withdraw_e18;
+            let amount_motra_balance: BalanceOf<T> = motra_u128
+                .try_into()
+                .map_err(|_| Error::<T>::BalanceConversionOverflow)?;
 
             // (5) transfer MOTRA from pot to user.
             let pot = T::PalletId::get().into_account_truncating();
@@ -1024,8 +1042,15 @@ pub mod pallet {
                 ExistenceRequirement::AllowDeath,
             )?;
 
-            // (6) book the withdrawal in 1e18-scaled pMATRA-USD.
+            // (6) Book the withdrawal in 1e18-scaled pMATRA-USD.
+            // Reset `weighted_deposit_rate_e18` to 0 on full drain so a
+            // future re-deposit seeds a FRESH rate basis (otherwise an
+            // old rate from a prior deposit cycle would silently
+            // weight a much later top-up).
             acct.free_e18 = post_withdraw;
+            if post_withdraw == 0 {
+                acct.weighted_deposit_rate_e18 = 0;
+            }
             MarginAccounts::<T>::insert(&who, acct);
 
             Self::deposit_event(Event::MarginWithdrawn {
@@ -1115,6 +1140,11 @@ pub mod pallet {
 
             let market = Markets::<T>::get(&market_id)
                 .ok_or(Error::<T>::MarketNotFound)?;
+            // Governance kill-switch: a paused market must reject every
+            // position-changing operation that is not an exit. Mirrors
+            // `open_position`'s paused gate; only `close_position`
+            // bypasses (so users can always exit) per memo §5.5.
+            ensure!(!market.paused, Error::<T>::MarketPaused);
             let mut pos = Positions::<T>::get(&market_id, &who)
                 .ok_or(Error::<T>::PositionNotFound)?;
 
@@ -1167,6 +1197,19 @@ pub mod pallet {
             // and the mark has moved against us, this gate fires
             // before we land in a state where the next block triggers
             // liquidation.
+            //
+            // Freshness gate: a stale oracle returns the LAST CACHED
+            // price (not the true current mark). Letting a user adjust
+            // leverage against a stale price would defeat the
+            // equity invariant — the position could be insta-liquidated
+            // the moment the oracle recovers at the true price. Mirror
+            // the `open_position` freshness gate. Per memo §5.5, only
+            // `close_position` may bypass freshness (so users can
+            // always exit).
+            ensure!(
+                T::PriceOracle::is_fresh(&market.oracle_feed_id),
+                Error::<T>::OracleUnavailable
+            );
             let cur_mark_e18 = T::PriceOracle::latest_price_e18(&market.oracle_feed_id)
                 .ok_or(Error::<T>::OracleUnavailable)?;
             ensure!(cur_mark_e18 > 0, Error::<T>::OracleUnavailable);
@@ -1239,41 +1282,13 @@ pub mod pallet {
             T::PalletId::get().into_account_truncating()
         }
 
-        /// Convert a MOTRA `BalanceOf<T>` amount to 1e18-scaled
-        /// pMATRA-USD using the live MATRA/USD oracle feed. Errors
-        /// `OracleUnavailable` if the feed is stale / missing.
-        ///
-        /// Formula: `pMATRA_USD_e18 = motra * matra_usd_e18 / 1`
-        /// (price is itself 1e18-scaled and MOTRA is treated as a
-        /// 1-decimal native integer, matching the runtime's
-        /// `Balance::Decimals = 1` configuration; the dimensional
-        /// reconciliation is the adapter's job). v0 keeps it
-        /// straightforward at the cost of one read.
-        pub(crate) fn motra_to_pmatra_usd(
-            amount_motra: BalanceOf<T>,
-        ) -> Result<u128, DispatchError> {
-            let feed = T::MatraUsdFeedId::get();
-            ensure!(
-                T::PriceOracle::is_fresh(&feed),
-                Error::<T>::OracleUnavailable
-            );
-            let rate_e18 = T::PriceOracle::latest_price_e18(&feed)
-                .ok_or(Error::<T>::OracleUnavailable)?;
-            ensure!(rate_e18 > 0, Error::<T>::OracleUnavailable);
-            let motra: u128 = amount_motra.saturated_into::<u128>();
-            // motra * matra_usd_e18 — result is already
-            // 1e18-scaled.
-            motra
-                .checked_mul(rate_e18)
-                .ok_or_else(|| Error::<T>::ArithmeticOverflow.into())
-        }
 
-        /// Inverse of `motra_to_pmatra_usd`. Errors `OracleUnavailable`
-        /// if the feed is stale, `ArithmeticOverflow` if the
-        /// `BalanceOf<T>` target type can't hold the result.
-        pub(crate) fn pmatra_usd_to_motra(
-            amount_e18: u128,
-        ) -> Result<BalanceOf<T>, DispatchError> {
+        /// Returns the live MATRA/USD rate (1e18-scaled, pMATRA-USD per
+        /// MOTRA). Errors `OracleUnavailable` on stale feed or missing
+        /// price. Helper consumed by both `do_deposit_margin` and
+        /// `withdraw_margin` so each call site can pin the rate ONCE
+        /// and reason about it independently from the conversion math.
+        pub(crate) fn live_matra_usd_rate_e18() -> Result<u128, DispatchError> {
             let feed = T::MatraUsdFeedId::get();
             ensure!(
                 T::PriceOracle::is_fresh(&feed),
@@ -1282,21 +1297,31 @@ pub mod pallet {
             let rate_e18 = T::PriceOracle::latest_price_e18(&feed)
                 .ok_or(Error::<T>::OracleUnavailable)?;
             ensure!(rate_e18 > 0, Error::<T>::OracleUnavailable);
-            // Inverse: motra = amount_e18 / rate_e18.
-            let motra_u128 = amount_e18 / rate_e18;
-            let bal: BalanceOf<T> = motra_u128
-                .try_into()
-                .map_err(|_| Error::<T>::BalanceConversionOverflow)?;
-            Ok(bal)
+            Ok(rate_e18)
         }
 
         /// Shared body for `deposit_margin` extrinsic + `open_position`'s
         /// optional `margin_top_up_motra` path. Per design memo §3.3:
-        ///  1. Transfer MOTRA from caller → pot.
-        ///  2. Convert MOTRA → pMATRA-USD at live oracle rate.
-        ///  3. Credit `MarginAccount.free_e18`.
-        ///  4. Bump `last_deposit_block` for dwell-time gate.
-        ///  5. Emit `MarginDeposited`.
+        ///  1. Pin the live MATRA/USD rate (stale rate blocks the call).
+        ///  2. Compute pMATRA-USD credit = motra * rate.
+        ///  3. Transfer MOTRA from caller → pot.
+        ///  4. Update `MarginAccount.weighted_deposit_rate_e18` —
+        ///     size-weighted average over remaining `free_e18` (old
+        ///     basis) + new credit at new rate. The weighted-avg
+        ///     formula `(old_free * old_rate + new_credit * new_rate)
+        ///     / new_free` can overflow u128 at extreme balances; on
+        ///     overflow we conservatively leave the old rate in place
+        ///     (a strict lower bound on the user's MOTRA-redeemable
+        ///     value, so the pot stays solvent).
+        ///  5. Credit `MarginAccount.free_e18`.
+        ///  6. Bump `last_deposit_block` for the dwell-time gate.
+        ///  7. Emit `MarginDeposited`.
+        ///
+        /// The `weighted_deposit_rate_e18` snapshot is the load-bearing
+        /// fix for the sec-review pot-drain finding: `withdraw_margin`
+        /// uses it (not the live rate) to convert pMATRA-USD → MOTRA,
+        /// so a user cannot deposit at peak MATRA / withdraw at trough
+        /// MATRA and drain the pot of other depositors' MOTRA.
         pub(crate) fn do_deposit_margin(
             who: &T::AccountId,
             amount_motra: BalanceOf<T>,
@@ -1304,12 +1329,18 @@ pub mod pallet {
             if amount_motra.is_zero() {
                 return Ok(());
             }
-            // Convert FIRST so a stale oracle blocks the deposit
-            // before any state mutation. This matches the user-
-            // protection contract: a deposit at an unknown rate is
-            // worse than a failed deposit.
-            let credit_e18 = Self::motra_to_pmatra_usd(amount_motra)?;
+            // (1) Pin the live rate FIRST so a stale oracle blocks the
+            // deposit before any state mutation. A deposit at an
+            // unknown rate is worse than a failed deposit.
+            let rate_e18 = Self::live_matra_usd_rate_e18()?;
 
+            // (2) Compute the pMATRA-USD credit at this rate.
+            let motra_u128: u128 = amount_motra.saturated_into::<u128>();
+            let credit_e18 = motra_u128
+                .checked_mul(rate_e18)
+                .ok_or(Error::<T>::ArithmeticOverflow)?;
+
+            // (3) Transfer MOTRA from caller → pot.
             let pot = Self::pot_account();
             T::Currency::transfer(
                 who,
@@ -1318,14 +1349,42 @@ pub mod pallet {
                 ExistenceRequirement::AllowDeath,
             )?;
 
+            // (4) Update the weighted-avg deposit rate. On overflow of
+            // the intermediate `old_free * old_rate` or `credit_e18 *
+            // rate_e18` we leave the old rate unchanged — the next
+            // withdrawal will use the old rate, which is a STRICTLY
+            // CONSERVATIVE basis (no greater than what the user would
+            // get under a recomputed weighted avg in u256 precision).
+            // For the very-first deposit (or after a full drain) the
+            // old rate is 0; we seed with the new rate directly.
             let mut acct = MarginAccounts::<T>::get(who);
-            acct.free_e18 = acct
+            let new_free = acct
                 .free_e18
                 .checked_add(credit_e18)
                 .ok_or(Error::<T>::ArithmeticOverflow)?;
+
+            if acct.weighted_deposit_rate_e18 == 0 || acct.free_e18 == 0 {
+                // Fresh basis — seed with the new rate.
+                acct.weighted_deposit_rate_e18 = rate_e18;
+            } else if let (Some(old_weight), Some(new_weight)) = (
+                acct.free_e18.checked_mul(acct.weighted_deposit_rate_e18),
+                credit_e18.checked_mul(rate_e18),
+            ) {
+                if let Some(sum) = old_weight.checked_add(new_weight) {
+                    // weighted avg = sum / new_free. new_free > 0 here
+                    // because credit_e18 > 0 (motra_u128 > 0, rate_e18 > 0).
+                    acct.weighted_deposit_rate_e18 = sum / new_free;
+                }
+                // else: overflow on sum, leave rate unchanged (conservative).
+            }
+            // else: overflow on either weight, leave rate unchanged (conservative).
+
+            // (5)+(6) Credit free + bump dwell.
+            acct.free_e18 = new_free;
             acct.last_deposit_block = Self::current_block_u32();
             MarginAccounts::<T>::insert(who, acct.clone());
 
+            // (7) Emit.
             Self::deposit_event(Event::MarginDeposited {
                 who: who.clone(),
                 amount_motra,
