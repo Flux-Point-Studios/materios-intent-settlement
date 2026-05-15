@@ -5322,6 +5322,14 @@ fn task266_legacy_settle_batch_atomic_rejects_after_cutover() {
 fn task266_migration_flags_existing_settled_claims() {
     // Spec-N OnRuntimeUpgrade: walks Claims and flags every settled claim
     // as a pre-audit settlement. Idempotent — second run is a no-op.
+    //
+    // Post sec-review LOW #2: legacy `settle_claim` itself flags
+    // `PreAuditSettlement` at settle time (closes the 50-block-grace-
+    // window audit-trail gap). So this test now verifies BOTH:
+    //   1. legacy settle flags immediately (the LOW #2 property), AND
+    //   2. the migration is idempotent w.r.t. an already-flagged claim
+    //      (the original migration property still holds — re-running
+    //      doesn't toggle the flag off or double-set anything).
     new_test_ext().execute_with(|| {
         use pallet_intent_settlement::pallet::{
             PreAuditSettlement, SettlementStorageVersion,
@@ -5336,13 +5344,18 @@ fn task266_migration_flags_existing_settled_claims() {
             false,
             mock_settle_sigs(),
         ));
-        // Pre-migration state: no pre-audit flag, no cutover scheduled.
-        assert!(!PreAuditSettlement::<Test>::get(claim_id));
+        // LOW #2 property: legacy settle flags PreAuditSettlement
+        // immediately at settle time, not only via the migration sweep.
+        // This closes the 50-block-grace-window gap where a colluding M
+        // could race a fraudulent legacy settle through the deprecated
+        // STCL path post-upgrade-pre-cutover and have audit tooling miss
+        // it because the migration only flagged pre-upgrade settles.
+        assert!(PreAuditSettlement::<Test>::get(claim_id));
         assert_eq!(SettlementStorageVersion::<Test>::get(), 0u32);
         // Run the migration via the on_runtime_upgrade hook.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
-        // Post-migration: settled claim is flagged, version bumped, cutover
-        // scheduled.
+        // Post-migration: settled claim is flagged (idempotent — already
+        // set by legacy settle), version bumped, cutover scheduled.
         assert!(PreAuditSettlement::<Test>::get(claim_id));
         assert_eq!(SettlementStorageVersion::<Test>::get(), 1u32);
         let cutover =

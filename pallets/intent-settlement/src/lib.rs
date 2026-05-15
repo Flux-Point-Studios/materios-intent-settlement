@@ -942,6 +942,16 @@ pub mod pallet {
             batch_digest: [u8; 32],
             settled_direct_count: u32,
         },
+        /// Sec-review LOW #1 hardening: the `on_runtime_upgrade` migration
+        /// that flags pre-audit settled claims iterates `Claims` with a
+        /// per-block cap (`MAX_MIGRATE_CLAIMS = 1024`). If the cap is hit,
+        /// the migration emits this event AND skips the storage-version
+        /// bump so a follow-up call drains the remaining tail. Empty
+        /// preprod state (low single-digit claims) never trips this; it's
+        /// a planning hazard for mainnet-scale `Claims` storage.
+        PreAuditMigrationTruncated {
+            migrated_count: u32,
+        },
         /// Task #211: an `attest_batch_intents` call landed and transitioned
         /// `attested_count` intents from Pending -> Attested under ONE
         /// committee-signature verification. `submitted_count` is the total
@@ -1309,12 +1319,36 @@ pub mod pallet {
                 return Weight::from_parts(10_000, 0);
             }
             let mut total = Weight::from_parts(50_000, 0);
+            // Bound the iteration to prevent the migration from approaching
+            // the per-block weight ceiling if `Claims` grows by mainnet
+            // (per-PR-#33 sec-review LOW #1). For preprod the actual count
+            // is single-digit; this cap is purely a planning-hazard guard.
+            // If hit, the remaining tail is migrated by a follow-up call
+            // (next runtime upgrade or a manual sudo trigger) — flag is
+            // additive so a partial migration is recoverable, not stuck.
+            const MAX_MIGRATE_CLAIMS: usize = 1024;
+            let mut migrated: usize = 0;
+            let mut truncated = false;
             // Flag every already-settled claim as a pre-audit settlement.
             for (claim_id, claim) in Claims::<T>::iter() {
+                if migrated >= MAX_MIGRATE_CLAIMS {
+                    truncated = true;
+                    break;
+                }
                 if claim.settled {
                     PreAuditSettlement::<T>::insert(claim_id, true);
                     total = total.saturating_add(Weight::from_parts(10_000, 0));
+                    migrated = migrated.saturating_add(1);
                 }
+            }
+            if truncated {
+                // Surface the partial-migration so an operator can re-run
+                // (the storage-version bump at the bottom is gated on
+                // !truncated so the migration stays at v0 and runs again
+                // on the next upgrade until the tail is drained).
+                Self::deposit_event(Event::PreAuditMigrationTruncated {
+                    migrated_count: migrated as u32,
+                });
             }
             // Schedule the cutover 50 blocks from now. After this height,
             // the legacy `settle_claim` + `settle_batch_atomic` extrinsics
@@ -1326,7 +1360,9 @@ pub mod pallet {
             let cutover =
                 now.saturating_add(BlockNumberFor::<T>::from(STCA_CUTOVER_GRACE));
             StcaCutoverBlock::<T>::put(cutover);
-            SettlementStorageVersion::<T>::put(1u32);
+            if !truncated {
+                SettlementStorageVersion::<T>::put(1u32);
+            }
             total
         }
     }
@@ -1698,6 +1734,14 @@ pub mod pallet {
             let intent_id = claim.intent_id;
             let amount = claim.amount_ada;
             Claims::<T>::insert(claim_id, claim);
+            // Sec-review LOW #2: legacy settle uses the trust-vacuous STCL
+            // payload. Tag the resulting claim so audit/explorer tooling
+            // can distinguish "trust-vacuous" from STCA-attested settles
+            // even when the settle landed in the 50-block grace window
+            // (i.e., post-upgrade but pre-cutover). Migration only flags
+            // claims that were ALREADY settled at upgrade time; this line
+            // covers the grace window.
+            PreAuditSettlement::<T>::insert(claim_id, true);
 
             if let Some(mut intent) = Intents::<T>::get(intent_id) {
                 intent.status = IntentStatus::Settled;
@@ -2005,6 +2049,12 @@ pub mod pallet {
                         let intent_id = claim.intent_id;
                         let amount = claim.amount_ada;
                         Claims::<T>::insert(entry.claim_id, claim);
+                        // Sec-review LOW #2: legacy batch path uses STBA
+                        // (trust-vacuous batch digest). Flag each settled
+                        // claim so audit tooling can distinguish from
+                        // STCA-attested settles even in the 50-block grace
+                        // window. See `settle_claim` for the rationale.
+                        PreAuditSettlement::<T>::insert(entry.claim_id, true);
 
                         if let Some(mut intent) = Intents::<T>::get(intent_id) {
                             intent.status = IntentStatus::Settled;
