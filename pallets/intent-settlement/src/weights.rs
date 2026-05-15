@@ -36,6 +36,21 @@ use core::marker::PhantomData;
 /// wire `T::WeightInfo = SubstrateWeight<Runtime>` (auto-generated below).
 pub trait WeightInfo {
     fn settle_batch_atomic(n: u32) -> Weight;
+    /// Task #84 (mis-sec P1): scaffold weight for `post_settlement_bond`.
+    /// 500M ref_time placeholder per the sec-review F1 pattern; the
+    /// production runtime replaces this via the bench-cli output after
+    /// this PR lands.
+    fn post_settlement_bond() -> Weight;
+    /// Task #84 (mis-sec P1): scaffold weight for
+    /// `slash_bad_settlement_evidence`. 500M ref_time placeholder; the
+    /// real cost is dominated by the M-of-N sig-verify pass + the two
+    /// `repatriate_reserved` storage layers (watcher + treasury).
+    fn slash_bad_settlement_evidence() -> Weight;
+    /// Task #84 (mis-sec P1): scaffold weight for `release_settlement_bond`.
+    /// 500M ref_time placeholder; the real cost is dominated by the
+    /// `Currency::unreserve` storage write + two `StorageMap::take` calls
+    /// for cleanup.
+    fn release_settlement_bond() -> Weight;
 }
 
 /// Auto-generated `SubstrateWeight` impl. Mirrors the cost slope measured by
@@ -73,6 +88,24 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
             .saturating_add(T::DbWeight::get().writes((2_u64).saturating_mul(n.into())))
             .saturating_add(Weight::from_parts(0, 3119).saturating_mul(n.into()))
     }
+    /// Task #84 (mis-sec P1): scaffold (500M ref_time placeholder).
+    fn post_settlement_bond() -> Weight {
+        Weight::from_parts(500_000_000, 0)
+            .saturating_add(T::DbWeight::get().reads(3))
+            .saturating_add(T::DbWeight::get().writes(2))
+    }
+    /// Task #84 (mis-sec P1): scaffold (500M ref_time placeholder).
+    fn slash_bad_settlement_evidence() -> Weight {
+        Weight::from_parts(500_000_000, 0)
+            .saturating_add(T::DbWeight::get().reads(4))
+            .saturating_add(T::DbWeight::get().writes(4))
+    }
+    /// Task #84 (mis-sec P1): scaffold (500M ref_time placeholder).
+    fn release_settlement_bond() -> Weight {
+        Weight::from_parts(500_000_000, 0)
+            .saturating_add(T::DbWeight::get().reads(3))
+            .saturating_add(T::DbWeight::get().writes(3))
+    }
 }
 
 /// Unit-test default. Mirrors the auto-generated curve at a slightly higher
@@ -84,5 +117,14 @@ impl WeightInfo for () {
             50_000_000u64.saturating_add((n as u64).saturating_mul(17_000_000)),
             321_487u64.saturating_add((n as u64).saturating_mul(3_119)),
         )
+    }
+    fn post_settlement_bond() -> Weight {
+        Weight::from_parts(500_000_000, 0)
+    }
+    fn slash_bad_settlement_evidence() -> Weight {
+        Weight::from_parts(500_000_000, 0)
+    }
+    fn release_settlement_bond() -> Weight {
+        Weight::from_parts(500_000_000, 0)
     }
 }
