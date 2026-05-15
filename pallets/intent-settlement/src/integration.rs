@@ -17,7 +17,10 @@
 use crate as pallet_intent_settlement;
 use crate::pallet::{IsCommitteeMember, VerifyCommitteeSignature};
 use crate::types::*;
-use crate::{credit_deposit_payload, request_voucher_payload, settle_claim_payload};
+use crate::{
+    credit_deposit_payload, request_voucher_payload, settle_claim_attested_payload,
+    settle_claim_payload,
+};
 
 /// #73: integration-runtime test chain identity. Pinned to 0x73*32 to match
 /// `TestMateriosChainId` above. Unit tests in `tests.rs` use the same fixture.
@@ -70,6 +73,12 @@ parameter_types! {
     pub const TestNetworkMagic: u32 = 1u32;
     pub const TestAegisPolicyV1ScriptHash: [u8; 28] = [0x42u8; 28];
     pub const TestSettlementVersion: u32 = 1u32;
+    /// Task #266 (mis-sec P0): integration-runtime values for the
+    /// attested-settle path. Mirror the unit-test fixtures so cross-suite
+    /// helpers can hand back the same canonical pre-image inputs.
+    pub const TestMinFinalityDepth: u32 = 3u32;
+    pub const TestSettlementRequestTtl: u32 = 100u32;
+    pub const TestMainchainGenesisHash: [u8; 32] = [0x65u8; 32];
 }
 
 /// Static committee: Alice/Bob/Charlie by sr25519 dev-key AccountId. Threshold 2.
@@ -209,6 +218,9 @@ impl pallet_intent_settlement::pallet::Config for Testnet {
     type NetworkMagic = TestNetworkMagic;
     type AegisPolicyV1ScriptHash = TestAegisPolicyV1ScriptHash;
     type SettlementVersion = TestSettlementVersion;
+    type MinFinalityDepth = TestMinFinalityDepth;
+    type SettlementRequestTtl = TestSettlementRequestTtl;
+    type MainchainGenesisHash = TestMainchainGenesisHash;
     #[cfg(feature = "runtime-benchmarks")]
     type BenchmarkHelper = IntegrationBenchmarkHelper;
     type WeightInfo = ();
@@ -1240,5 +1252,200 @@ fn task210_submit_batch_intents_happy_path_real_runtime() {
             pallet_intent_settlement::pallet::Nonces::<Testnet>::get(&user),
             5
         );
+    });
+}
+
+/// Task #266 (mis-sec P0): end-to-end attested-settle path with real
+/// sr25519 sigs. Drives the same full lifecycle as
+/// `full_lifecycle_submit_attest_voucher_settle`, but flips the final
+/// settle step from the legacy `settle_claim` (STCL preimage) onto the
+/// new `request_settle` + `attest_settle` pair (STCA preimage).
+///
+/// Why this matters: the unit-suite mocks the sig-verifier, so the
+/// production sr25519 verification path on the new STCA preimage layout
+/// is only exercised here. A drift in the 209-byte body order between
+/// `settle_claim_attested_payload` (Rust) and the SDK / Aiken mirrors
+/// would surface as a `InvalidSignature` here long before it surfaces
+/// on chain.
+#[test]
+fn task266_full_lifecycle_attested_settle_real_sr25519() {
+    new_ext().execute_with(|| {
+        let (alice, bob, _charlie) = committee_accounts();
+        let user = user_account();
+        let alice_pk = {
+            let b: &[u8; 32] = alice.as_ref();
+            *b
+        };
+        let bob_pk = {
+            let b: &[u8; 32] = bob.as_ref();
+            *b
+        };
+
+        // Credit + submit + attest + voucher mirror the legacy lifecycle.
+        let cardano_tx = [0xAA; 32];
+        let mut target_bytes = [0u8; 32];
+        target_bytes.copy_from_slice(&user.encode()[..32]);
+        let deposit_payload = credit_deposit_payload(
+            &TEST_CHAIN_ID,
+            &target_bytes,
+            10_000_000u64,
+            &cardano_tx,
+        );
+        let deposit_sigs = vec![
+            sign_with("//Alice", &deposit_payload),
+            sign_with("//Bob", &deposit_payload),
+        ];
+        assert_ok!(IntentSettlement::credit_deposit(
+            RuntimeOrigin::signed(alice.clone()),
+            user.clone(),
+            10_000_000u64,
+            cardano_tx,
+            deposit_sigs
+        ));
+        System::set_block_number(2);
+        let kind = IntentKind::BuyPolicy {
+            product_id: H256::from([1; 32]),
+            strike: 500_000,
+            term_slots: 86_400,
+            premium_ada: 2_000_000,
+            beneficiary_cardano_addr: BoundedVec::try_from(type0_addr_bytes(0xB1))
+                .unwrap(),
+        };
+        let mut submitter_bytes = [0u8; 32];
+        submitter_bytes.copy_from_slice(&user.encode()[..32]);
+        let expected_id = compute_intent_id(&submitter_bytes, 0, &kind, 2);
+        assert_ok!(IntentSettlement::submit_intent(
+            RuntimeOrigin::signed(user.clone()),
+            kind
+        ));
+        System::set_block_number(3);
+        assert_ok!(IntentSettlement::attest_intent(
+            RuntimeOrigin::signed(alice.clone()),
+            expected_id,
+            alice_pk,
+            sign_attest("//Alice", &expected_id)
+        ));
+        assert_ok!(IntentSettlement::attest_intent(
+            RuntimeOrigin::signed(bob.clone()),
+            expected_id,
+            bob_pk,
+            sign_attest("//Bob", &expected_id)
+        ));
+        System::set_block_number(4);
+        let claim_id = H256::from([0xCC; 32]);
+        let bfpr = BatchFairnessProof {
+            batch_block_range: (2, 4),
+            sorted_intent_ids: BoundedVec::try_from(vec![expected_id]).unwrap(),
+            requested_amounts_ada: BoundedVec::try_from(vec![2_000_000u64]).unwrap(),
+            pool_balance_ada: 100_000_000,
+            pro_rata_scale_bps: 10_000,
+            awarded_amounts_ada: BoundedVec::try_from(vec![2_000_000u64]).unwrap(),
+        };
+        let voucher = Voucher {
+            claim_id,
+            policy_id: H256::from([0x99; 32]),
+            beneficiary_cardano_addr: BoundedVec::try_from(type0_addr_bytes(0xB1))
+                .unwrap(),
+            amount_ada: 2_000_000,
+            batch_fairness_proof_digest: compute_fairness_proof_digest(&bfpr),
+            issued_block: 4,
+            expiry_slot_cardano: 100_000,
+            committee_sigs: BoundedVec::try_from(vec![
+                (alice_pk, [0u8; 64]),
+                (bob_pk, [0u8; 64]),
+            ])
+            .unwrap(),
+        };
+        let voucher_digest = integration_voucher_digest(&voucher);
+        let bfpr_digest = crate::types::compute_fairness_proof_digest(&bfpr);
+        let voucher_payload = request_voucher_payload(
+            &TEST_CHAIN_ID,
+            &claim_id,
+            &expected_id,
+            &voucher_digest,
+            &bfpr_digest,
+        );
+        let voucher_sigs = vec![
+            sign_with("//Alice", &voucher_payload),
+            sign_with("//Bob", &voucher_payload),
+        ];
+        assert_ok!(IntentSettlement::request_voucher(
+            RuntimeOrigin::signed(alice.clone()),
+            claim_id,
+            expected_id,
+            voucher.clone(),
+            bfpr,
+            voucher_sigs
+        ));
+
+        // Block 5: NEW PATH — request_settle + attest_settle.
+        System::set_block_number(5);
+        let payment_hash: [u8; 28] = {
+            let raw = voucher.beneficiary_cardano_addr.as_slice();
+            let (p, _s) = crate::voucher_canonicalize::split_type0_address_bytes(raw)
+                .unwrap();
+            p
+        };
+        let mc_genesis = TestMainchainGenesisHash::get();
+        let evidence = SettlementEvidence {
+            cardano_tx_hash: [0xDE; 32],
+            observed_at_depth: TestMinFinalityDepth::get(),
+            observed_slot: 12_345_678,
+            beneficiary_addr_hash: payment_hash,
+            amount_lovelace: 2_000_000,
+            mainchain_genesis_hash: mc_genesis,
+        };
+        // Anyone (Charlie here — a committee member but not the typical
+        // settle path caller) can post the request_settle. We use Alice
+        // to keep the test minimal; the open-permissionless nature is
+        // exercised by the no `is_member` check in the unit suite.
+        assert_ok!(IntentSettlement::request_settle(
+            RuntimeOrigin::signed(alice.clone()),
+            claim_id,
+            evidence.cardano_tx_hash,
+            false,
+            evidence,
+        ));
+
+        // Committee builds the STCA digest from chain state (re-derives
+        // voucher_digest from the on-chain voucher) and signs it.
+        let stca_payload = settle_claim_attested_payload(
+            &TEST_CHAIN_ID,
+            &claim_id,
+            &voucher_digest,
+            &evidence.cardano_tx_hash,
+            false,
+            &payment_hash,
+            2_000_000,
+            evidence.observed_at_depth,
+            evidence.observed_slot,
+            &mc_genesis,
+        );
+        let attest_sigs = vec![
+            sign_with("//Alice", &stca_payload),
+            sign_with("//Bob", &stca_payload),
+        ];
+        assert_ok!(IntentSettlement::attest_settle(
+            RuntimeOrigin::signed(alice.clone()),
+            claim_id,
+            attest_sigs,
+        ));
+
+        // Post-state: claim settled, pending request consumed, intent terminal.
+        let claim =
+            pallet_intent_settlement::pallet::Claims::<Testnet>::get(claim_id).unwrap();
+        assert!(claim.settled);
+        assert_eq!(claim.cardano_tx_hash, [0xDE; 32]);
+        assert!(
+            pallet_intent_settlement::pallet::ClaimSettlementRequests::<Testnet>::get(
+                claim_id
+            )
+            .is_none(),
+            "pending request must be consumed on successful attestation"
+        );
+        let intent =
+            pallet_intent_settlement::pallet::Intents::<Testnet>::get(expected_id)
+                .unwrap();
+        assert_eq!(intent.status, IntentStatus::Settled);
     });
 }

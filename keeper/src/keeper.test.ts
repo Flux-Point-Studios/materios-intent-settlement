@@ -231,6 +231,12 @@ const baseConfig: KeeperConfig = {
   materiosChainId: TEST_CHAIN_ID,
   networkMagic: TEST_NETWORK_MAGIC,
   settlementVersion: TEST_SETTLEMENT_VERSION,
+  // Task #266 (mis-sec P0): Cardano genesis pin + finality floor for the
+  // new attested-settle pair. Fakecardano returns currentSlot - txSlot
+  // = 3000 (≈150 blocks at 20s/slot), so any minFinalityDepth <= 150
+  // passes the keeper's pre-check.
+  mainchainGenesisHash: ("0x" + "65".repeat(32)) as HexString,
+  minFinalityDepth: 15,
 };
 
 describe("Keeper.runOnce — happy path", () => {
@@ -272,34 +278,40 @@ describe("Keeper.runOnce — happy path", () => {
     expect(metricsSecond.batchesConfirmed).toBeGreaterThanOrEqual(1);
     expect(metricsSecond.batchesSettled).toBeGreaterThanOrEqual(1);
 
-    // settle_claim extrinsic was called with the full 4-arg shape
-    // (claimId, cardanoTxHash, settledDirect, signatures).
-    expect(rpc.submitExtrinsic).toHaveBeenCalledWith(
-      "intentSettlement",
-      "settleClaim",
-      expect.arrayContaining([expect.any(String)]),
+    // Task #266 (mis-sec P0): keeper now fires the attested-settle pair
+    // (request_settle + attest_settle) in place of the legacy settle_claim.
+    // Both extrinsics MUST land in order for the claim to flip to settled.
+    const requestCall = rpc.submitExtrinsic.mock.calls.find(
+      (c) => c[0] === "intentSettlement" && c[1] === "requestSettle",
     );
-    const settleCall = rpc.submitExtrinsic.mock.calls.find(
-      (c) => c[0] === "intentSettlement" && c[1] === "settleClaim",
+    expect(requestCall).toBeDefined();
+    const [, , reqArgs] = requestCall!;
+    expect(reqArgs).toHaveLength(4);
+    // reqArgs[2] = settled_direct boolean — M=1 keeper path is always
+    // false; settled_direct=true is reserved for the 10-min direct-path
+    // fallback (spec §5.7), not the keeper-batch path.
+    expect(reqArgs[2]).toBe(false);
+    // reqArgs[3] = SettlementEvidence object with all six pinned fields.
+    const evidence = reqArgs[3] as Record<string, unknown>;
+    expect(evidence).toHaveProperty("cardano_tx_hash");
+    expect(evidence).toHaveProperty("observed_at_depth");
+    expect(evidence).toHaveProperty("observed_slot");
+    expect(evidence).toHaveProperty("beneficiary_addr_hash");
+    expect(evidence).toHaveProperty("amount_lovelace");
+    expect(evidence).toHaveProperty("mainchain_genesis_hash");
+
+    const attestCall = rpc.submitExtrinsic.mock.calls.find(
+      (c) => c[0] === "intentSettlement" && c[1] === "attestSettle",
     );
-    expect(settleCall).toBeDefined();
-    const [, , args] = settleCall!;
-    expect(args).toHaveLength(4);
-    // args[2] = settled_direct boolean (M=1 keeper path always false —
-    // settled_direct=true is reserved for the 10-min direct-path fallback
-    // spec §5.7, not the keeper-batch path).
-    expect(args[2]).toBe(false);
-    // args[3] = signatures Vec<(CommitteePubkey, CommitteeSig)>. M=1 for
-    // now: the keeper's own mnemonic signs the canonical payload and that
-    // single entry must satisfy the pallet's threshold (runtime sets
-    // DefaultMinSignerThreshold = 1 initially).
-    const signatures = args[3] as Array<[string, string]>;
+    expect(attestCall).toBeDefined();
+    const [, , attestArgs] = attestCall!;
+    expect(attestArgs).toHaveLength(2);
+    // attestArgs[1] = M-of-N signature bundle. M=1 in the keeper interim.
+    const signatures = attestArgs[1] as Array<[string, string]>;
     expect(Array.isArray(signatures)).toBe(true);
     expect(signatures).toHaveLength(1);
     const [pubkey, sig] = signatures[0]!;
-    // sr25519 pubkeys are 32 bytes = 66 hex chars incl. "0x".
     expect(pubkey).toMatch(/^0x[0-9a-f]{64}$/);
-    // sr25519 sigs are 64 bytes = 130 hex chars incl. "0x".
     expect(sig).toMatch(/^0x[0-9a-f]{128}$/);
   });
 });

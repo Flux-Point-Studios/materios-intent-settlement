@@ -333,3 +333,81 @@ pub struct RequestVoucherEntry {
 pub struct SubmitIntentEntry {
     pub kind: IntentKind,
 }
+
+// ---------------------------------------------------------------------------
+// Task #266 (mis-sec P0): settlement evidence + pending request record
+// ---------------------------------------------------------------------------
+
+/// Falsifiable observation of a Cardano settlement transaction, posted by the
+/// requester in `request_settle`. The committee's `attest_settle` later signs
+/// over a digest that pins to this exact evidence + the on-chain voucher_digest,
+/// so each M-of-N signature commits to a verifiable Cardano fact instead of an
+/// unverifiable hash.
+///
+/// Per design memo §3.3, none of these fields are recomputed off chain state
+/// at attest time — they are the requester's claim. The runtime cross-checks
+/// `amount_lovelace` / `beneficiary_addr_hash` against the stored `Voucher`
+/// (matching) and `mainchain_genesis_hash` against the pinned `MainchainGenesisHash`
+/// runtime constant (preprod vs mainnet pinning); future task #84 ships a
+/// permissionless slash route that lets a watcher prove `cardano_tx_hash`
+/// /`observed_slot` are fraudulent.
+#[derive(
+    Clone, Copy, Encode, Decode, TypeInfo, MaxEncodedLen, RuntimeDebug, PartialEq, Eq,
+)]
+pub struct SettlementEvidence {
+    /// 32-byte Cardano transaction hash claimed to have settled this claim.
+    pub cardano_tx_hash: [u8; 32],
+    /// How many Cardano blocks deep the requester observed the tx at the
+    /// moment the evidence was assembled. Must be >= `Config::MinFinalityDepth`
+    /// or `attest_settle` rejects.
+    pub observed_at_depth: u32,
+    /// Cardano slot of the settling tx (the slot of the block it landed in).
+    pub observed_slot: u64,
+    /// 28-byte beneficiary payment-key hash. Lifted from the CIP-0019 type-0
+    /// address bytes stored in the voucher (positions 1..29). Cross-checked
+    /// against the on-chain voucher at attest time so a colluding M cannot
+    /// rebind a real Cardano payment to a different Materios claim.
+    pub beneficiary_addr_hash: [u8; 28],
+    /// Lovelace amount paid by the Cardano tx. Cross-checked against
+    /// `claim.amount_ada` (= `voucher.amount_ada`) at attest time.
+    pub amount_lovelace: u64,
+    /// 32-byte Cardano genesis hash (preprod vs mainnet vs preview).
+    /// Cross-checked against `Config::MainchainGenesisHash` at attest time so
+    /// a preprod sig bundle can never settle a mainnet claim or vice versa.
+    pub mainchain_genesis_hash: [u8; 32],
+}
+
+/// Phase 1 → Phase 2 handoff record for `request_settle` → `attest_settle`.
+/// Generic over `AccountId` and `BlockNumber` so the storage map can be
+/// keyed by the runtime's concrete types. The requester field is the slash
+/// target hook for #84 (bond + slash); the submitted_block field gates the
+/// TTL check.
+#[derive(Clone, Encode, Decode, TypeInfo, MaxEncodedLen, RuntimeDebug, PartialEq, Eq)]
+pub struct SettlementRequestRecord<AccountId, BlockNumber> {
+    /// Originator of the `request_settle` call. Pays the extrinsic fee and
+    /// is the slash target for future #84 watcher dispatches.
+    pub requester: AccountId,
+    /// The falsifiable observation the requester committed to.
+    pub evidence: SettlementEvidence,
+    /// Whether the settlement is the 10-minute fallback path (true) vs the
+    /// keeper-batch path (false). Pinned at request time so the committee
+    /// signs over the same flag they're attesting to.
+    pub settled_direct: bool,
+    /// Materios block number when the request was submitted. The pallet
+    /// rejects attest_settle calls older than `Config::SettlementRequestTtl`
+    /// blocks via `SettlementRequestExpired`.
+    pub submitted_block: BlockNumber,
+}
+
+/// Per-entry settlement evidence for a batch `request_batch_settle` call.
+/// Mirrors the single-call `request_settle` shape so the keeper assembles N
+/// entries instead of N separate extrinsics; the committee then signs ONE
+/// batch digest in `attest_batch_settle`.
+#[derive(
+    Clone, Copy, Encode, Decode, TypeInfo, MaxEncodedLen, RuntimeDebug, PartialEq, Eq,
+)]
+pub struct SettleAttestedBatchEntry {
+    pub claim_id: ClaimId,
+    pub evidence: SettlementEvidence,
+    pub settled_direct: bool,
+}

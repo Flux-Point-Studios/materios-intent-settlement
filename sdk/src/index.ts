@@ -87,6 +87,8 @@ export {
 
 export {
   settleClaimPayload,
+  settleClaimAttestedPayload,
+  attestBatchSettlePayload,
   creditDepositPayload,
   requestVoucherPayload,
   attestBatchIntentsPayload,
@@ -96,11 +98,14 @@ export {
   buildSigBundle,
   TAG_CRDP,
   TAG_STCL,
+  TAG_STCA,
+  TAG_BSTA,
   TAG_RVCH,
   TAG_ABIN,
   TAG_RVBN,
   TAG_SBIN,
 } from "./multisig.js";
+export type { BatchAttestSettleEntry } from "./multisig.js";
 
 export type {
   HexString,

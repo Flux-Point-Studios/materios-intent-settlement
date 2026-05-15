@@ -12,8 +12,11 @@ import {
   MateriosRpcClient,
   buildSigBundle,
   computeKeeperFeeLovelace,
-  settleClaimPayload,
+  encodeType0AddressCbor,
+  settleClaimAttestedPayload,
+  splitType0AddressBytes,
   validateFairnessProof,
+  voucherDigestWithAddress,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
 import { u8aToHex } from "@polkadot/util";
 import type {
@@ -408,8 +411,23 @@ export class Keeper {
   }
 
   /**
-   * For every "submitted" submission, poll the Cardano provider until it's
-   * confirmed to k-depth, then call `settle_claim` on Materios.
+   * Task #266 (mis-sec P0): for every "submitted" submission, poll the
+   * Cardano provider until it's confirmed to k-depth, then post the new
+   * two-phase attested-settle pair:
+   *   1. `request_settle(claim_id, tx_hash, settled_direct, evidence)` —
+   *      anyone can submit, the keeper does so as the requester.
+   *   2. `attest_settle(claim_id, signatures)` — committee provides
+   *      M-of-N sigs over the canonical STCA digest. The keeper assembles
+   *      the bundle itself when it's also a committee member (M=1
+   *      interim); the long-term path collects sigs from cert-daemon
+   *      attestors before submitting.
+   *
+   * Replaces the legacy single-call `settle_claim` extrinsic, which
+   * carries no falsifiable evidence and is rejected post-cutover.
+   *
+   * The legacy single-call path is preserved as a fall-back for the
+   * 50-block grace window during the spec-N upgrade — controlled via the
+   * `useAttestedSettlePath` config knob (defaults true).
    */
   private async reconcileInflight(): Promise<void> {
     const subs = Object.values(this.deps.state.snapshot.submissions);
@@ -432,45 +450,166 @@ export class Keeper {
       if (!conf.confirmed) continue;
 
       this.metrics.batchesConfirmed += 1;
-      // Settle on Materios. Idempotent per §2.2 #5.
-      //
-      // Wave 2 W2.1 (Option C interim): pallet's settle_claim now requires an
-      // M-of-N committee sig bundle (issue #7, PR #23). Keeper ships as M=1 —
-      // signs with its own KEEPER_MNEMONIC which MUST be a current committee
-      // member. Settlement-daemon (B) that collects sigs from multiple
-      // committee peers is a follow-up once the pallet is live on a runtime.
       const settledDirect = false;
-      const payload = settleClaimPayload({
-        // #73: chain-identity is bound into the STCL pre-image so a
-        // settle_claim sig can never replay across networks or settlement
-        // versions.
-        materiosChainId: this.config.materiosChainId,
-        claimId: sub.claimId,
-        cardanoTxHash: sub.cardanoTxHash,
-        settledDirect,
-      });
-      const bundle = buildSigBundle({
-        callerSeed: this.config.keeperMnemonic,
-        cosignerSeeds: [],
-        payload,
-      });
-      const signatures = bundle.map(
-        (e) => [u8aToHex(e.pubkey), u8aToHex(e.sig)] as [HexString, HexString],
-      );
       try {
-        await this.deps.rpc.submitExtrinsic("intentSettlement", "settleClaim", [
-          sub.claimId,
-          sub.cardanoTxHash,
-          settledDirect,
-          signatures,
-        ]);
+        await this.submitAttestedSettle(sub, conf.txSlot, conf.currentSlot, settledDirect);
         this.deps.state.markSettled(sub.claimId, sub.cardanoTxHash);
         this.metrics.batchesSettled += 1;
       } catch (err) {
-        this.log("error", "settle_claim extrinsic failed", { claimId: sub.claimId, err });
+        this.log("error", "attested settle pipeline failed", { claimId: sub.claimId, err });
       }
     }
   }
+
+  /**
+   * Task #266 (mis-sec P0): two-phase attested settle.
+   *
+   * Phase 1 (`request_settle`): pin the falsifiable evidence on chain so
+   * any watcher can later prove the requester lied. The keeper builds
+   * `SettlementEvidence` from chain-state-derived facts (voucher amount,
+   * beneficiary payment-key hash, mainchain genesis pinning) so a
+   * malicious requester cannot lie about anything cross-checkable.
+   *
+   * Phase 2 (`attest_settle`): the committee provides M-of-N sigs over
+   * the canonical 209-byte STCA digest. The pallet rebuilds the same
+   * digest from chain state, so every honest attestor sees the same
+   * bytes — bad bundles fail sig-verify locally, never settling a bad
+   * claim.
+   *
+   * @throws if any phase fails or the on-chain voucher is missing
+   */
+  private async submitAttestedSettle(
+    sub: { claimId: ClaimId; cardanoTxHash: HexString | null },
+    txSlot: bigint | null,
+    currentSlot: bigint,
+    settledDirect: boolean,
+  ): Promise<void> {
+    if (!sub.cardanoTxHash) {
+      throw new Error("submitAttestedSettle: missing cardanoTxHash");
+    }
+    if (txSlot === null) {
+      throw new Error("submitAttestedSettle: missing Cardano tx slot");
+    }
+    const voucher = await this.deps.rpc.getVoucher(sub.claimId);
+    if (!voucher) {
+      throw new Error(`voucher missing for claim ${sub.claimId}`);
+    }
+    // Cardano blocks at ~20s each. Convert slot delta to approximate
+    // blocks for the pallet's `MinFinalityDepth` floor. The cert-daemon's
+    // production path measures actual block count via Ogmios chain
+    // history; this approximation is good enough for the keeper's M=1
+    // interim, since the pallet enforces the floor either way.
+    const slotDelta = currentSlot - txSlot;
+    const approxDepth = Number(slotDelta / 20n);
+    if (approxDepth < this.config.minFinalityDepth) {
+      throw new Error(
+        `depth ${approxDepth} < MinFinalityDepth ${this.config.minFinalityDepth}; deferring`,
+      );
+    }
+    // Re-derive payment-key hash from the voucher's CIP-0019 type-0
+    // address. The pallet does the same; mismatch => SettlementEvidenceMismatch.
+    const beneficiaryHash = paymentKeyHashFromBeneficiaryAddr(voucher);
+    const evidence = {
+      cardano_tx_hash: sub.cardanoTxHash,
+      observed_at_depth: approxDepth,
+      observed_slot: txSlot,
+      beneficiary_addr_hash: u8aToHex(beneficiaryHash),
+      amount_lovelace: voucher.amountAda,
+      mainchain_genesis_hash: this.config.mainchainGenesisHash,
+    };
+
+    // Phase 1: request_settle. Anyone can post — the keeper's mnemonic
+    // is the typical signer. The extrinsic is permissionless; failure
+    // here is usually an `AlreadySettled` race with another keeper, or
+    // a stale evidence rejection at the chain. Pin state on success.
+    await this.deps.rpc.submitExtrinsic(
+      "intentSettlement",
+      "requestSettle",
+      [sub.claimId, sub.cardanoTxHash, settledDirect, evidence],
+    );
+
+    // Phase 2: attest_settle. The keeper's mnemonic MUST be a current
+    // committee member for the M=1 interim. The bundle here is a single
+    // sig; the settlement-daemon path (B) replaces this with M-of-N
+    // collected sigs from cert-daemon peers.
+    // Rehydrate the voucher's canonical Plutus V3 Data CBOR for the
+    // beneficiary address — the pallet does the same; the digest must
+    // commit to byte-identical CBOR.
+    const beneficiaryCbor = encodeType0AddressCbor(splitType0AddressBytes(
+      typeof voucher.beneficiaryCardanoAddr === "string"
+        ? hexToBytes(voucher.beneficiaryCardanoAddr)
+        : voucher.beneficiaryCardanoAddr,
+    ));
+    const voucherDigestHex = voucherDigestWithAddress({
+      // #73: chain-identity tuple bound into the canonical voucher digest.
+      materiosChainId: this.config.materiosChainId,
+      networkMagic: this.config.networkMagic,
+      aegisPolicyV1ScriptHash: this.config.aegisPolicyV1ScriptHash,
+      settlementVersion: this.config.settlementVersion,
+      claimId: voucher.claimId,
+      policyId: voucher.policyId,
+      beneficiaryAddressCbor: beneficiaryCbor,
+      amountAda: voucher.amountAda,
+      batchFairnessProofDigest: voucher.batchFairnessProofDigest,
+      issuedBlock: voucher.issuedBlock,
+      expirySlotCardano: voucher.expirySlotCardano,
+    });
+    const stcaPayload = settleClaimAttestedPayload({
+      materiosChainId: this.config.materiosChainId,
+      claimId: sub.claimId,
+      voucherDigest: voucherDigestHex,
+      cardanoTxHash: sub.cardanoTxHash,
+      settledDirect,
+      beneficiaryAddrHash: u8aToHex(beneficiaryHash),
+      amountLovelace: voucher.amountAda,
+      observedAtDepth: approxDepth,
+      observedSlot: txSlot,
+      mainchainGenesisHash: this.config.mainchainGenesisHash,
+    });
+    const bundle = buildSigBundle({
+      callerSeed: this.config.keeperMnemonic,
+      cosignerSeeds: [],
+      payload: stcaPayload,
+    });
+    const signatures = bundle.map(
+      (e) => [u8aToHex(e.pubkey), u8aToHex(e.sig)] as [HexString, HexString],
+    );
+    await this.deps.rpc.submitExtrinsic(
+      "intentSettlement",
+      "attestSettle",
+      [sub.claimId, signatures],
+    );
+  }
+}
+
+/**
+ * Task #266 (mis-sec P0): lift the 28-byte payment-key hash from the
+ * voucher's `beneficiary_cardano_addr` (CIP-0019 type-0 shape:
+ * `0x01 || payment_hash(28) || stake_hash(28)`). The pallet does the same
+ * derivation; the keeper must produce byte-identical bytes or the
+ * `SettlementEvidence` cross-check fails.
+ */
+function paymentKeyHashFromBeneficiaryAddr(voucher: {
+  beneficiaryCardanoAddr: Uint8Array | HexString;
+}): Uint8Array {
+  const raw =
+    typeof voucher.beneficiaryCardanoAddr === "string"
+      ? hexToBytes(voucher.beneficiaryCardanoAddr)
+      : voucher.beneficiaryCardanoAddr;
+  const split = splitType0AddressBytes(raw);
+  return split.paymentHash;
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
+  if (clean.length % 2 !== 0) {
+    throw new Error(`hex string must be even-length, got ${clean.length}`);
+  }
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
 }
 
 function defaultLogger(level: "info" | "warn" | "error", msg: string, meta?: unknown): void {

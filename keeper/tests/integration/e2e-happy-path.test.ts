@@ -162,8 +162,10 @@ describe("E2E happy path — intent → attest → batch → submit → settle",
     const { batch, voucher, committeePubkey } = makeIntentAndBatch();
 
     // Mock Materios RPC: returns the batch + voucher the committee produced,
-    // records settle_claim. Separate tracking for keeper vs daemon polls.
-    let settleCalled: any = null;
+    // records the new request_settle + attest_settle calls (Task #266).
+    // Separate tracking for keeper vs daemon polls.
+    let requestSettleArgs: any = null;
+    let attestSettleArgs: any = null;
     let keeperPolls = 0;
     const makeRpc = (label: "daemon" | "keeper") => ({
       getPendingBatches: async () => {
@@ -175,8 +177,11 @@ describe("E2E happy path — intent → attest → batch → submit → settle",
       getVoucher: async () => voucher,
       getLatestBlockNumber: async () => 200,
       submitExtrinsic: async (section: string, method: string, args: unknown[]) => {
-        if (section === "intentSettlement" && method === "settleClaim") {
-          settleCalled = args;
+        if (section === "intentSettlement" && method === "requestSettle") {
+          requestSettleArgs = args;
+        }
+        if (section === "intentSettlement" && method === "attestSettle") {
+          attestSettleArgs = args;
         }
         return { txHash: ("0x" + "ff".repeat(32)) as HexString, blockHash: null };
       },
@@ -232,6 +237,13 @@ describe("E2E happy path — intent → attest → batch → submit → settle",
         materiosChainId: TEST_CHAIN_ID,
         networkMagic: TEST_NETWORK_MAGIC,
         settlementVersion: TEST_SETTLEMENT_VERSION,
+        // Task #266 (mis-sec P0): mainchain genesis pin + finality floor
+        // for the new request_settle + attest_settle path. fakeCardano's
+        // currentSlot - txSlot = 200 slots = ~10 blocks (20s/slot); use
+        // a low minFinalityDepth so the test fixture doesn't have to
+        // burn through 300+ mock slots.
+        mainchainGenesisHash: ("0x" + "65".repeat(32)) as HexString,
+        minFinalityDepth: 3,
       },
       {
         rpc: keeperRpc as any,
@@ -267,11 +279,21 @@ describe("E2E happy path — intent → attest → batch → submit → settle",
     expect(keeper.metrics.batchesConfirmed).toBe(1);
     expect(keeper.metrics.batchesSettled).toBe(1);
 
-    // settle_claim was called with the Cardano tx hash.
-    expect(settleCalled).not.toBeNull();
-    expect(settleCalled[0]).toBeTruthy(); // claim_id
-    expect(typeof settleCalled[1]).toBe("string"); // cardano_tx_hash hex
-    expect(settleCalled[2]).toBe(false); // settled_direct = false (keeper path)
+    // Task #266 (mis-sec P0): the attested-settle pair both landed.
+    expect(requestSettleArgs).not.toBeNull();
+    expect(requestSettleArgs[0]).toBeTruthy(); // claim_id
+    expect(typeof requestSettleArgs[1]).toBe("string"); // cardano_tx_hash
+    expect(requestSettleArgs[2]).toBe(false); // settled_direct
+    // requestSettleArgs[3] = SettlementEvidence struct.
+    expect(requestSettleArgs[3]).toHaveProperty("cardano_tx_hash");
+    expect(requestSettleArgs[3]).toHaveProperty("amount_lovelace");
+    expect(requestSettleArgs[3]).toHaveProperty("beneficiary_addr_hash");
+    expect(requestSettleArgs[3]).toHaveProperty("mainchain_genesis_hash");
+
+    expect(attestSettleArgs).not.toBeNull();
+    expect(attestSettleArgs[0]).toBeTruthy(); // claim_id
+    expect(Array.isArray(attestSettleArgs[1])).toBe(true);
+    expect((attestSettleArgs[1] as unknown[]).length).toBe(1); // M=1 interim
 
     // State machine: submission is marked confirmed/settled.
     const final = state.snapshot.submissions[batch.intentId as unknown as HexString];
