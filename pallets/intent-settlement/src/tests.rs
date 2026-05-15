@@ -190,6 +190,20 @@ impl pallet_intent_settlement::pallet::Config for Test {
     type NetworkMagic = TestNetworkMagic;
     type AegisPolicyV1ScriptHash = TestAegisPolicyV1ScriptHash;
     type SettlementVersion = TestSettlementVersion;
+    #[cfg(feature = "runtime-benchmarks")]
+    type BenchmarkHelper = MockBenchmarkHelper;
+    type WeightInfo = ();
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+pub struct MockBenchmarkHelper;
+#[cfg(feature = "runtime-benchmarks")]
+impl pallet_intent_settlement::BenchmarkHelper<u64> for MockBenchmarkHelper {
+    fn whitelist_as_committee(_who: &u64) {
+        // The mock's `MockCommittee` already treats any seeded id as a
+        // member (see `tests::mock_pubkey_of` / member predicate); the
+        // bench itself isn't invoked from the pallet's test suite.
+    }
 }
 
 pub const ALICE: u64 = 100;
@@ -4738,6 +4752,16 @@ mod max_submit_batch_boundary {
         type NetworkMagic = TestNetworkMagic;
         type AegisPolicyV1ScriptHash = TestAegisPolicyV1ScriptHash;
         type SettlementVersion = TestSettlementVersion;
+        #[cfg(feature = "runtime-benchmarks")]
+        type BenchmarkHelper = NoopBenchmarkHelper;
+        type WeightInfo = ();
+    }
+
+    #[cfg(feature = "runtime-benchmarks")]
+    pub struct NoopBenchmarkHelper;
+    #[cfg(feature = "runtime-benchmarks")]
+    impl pallet_intent_settlement::BenchmarkHelper<u64> for NoopBenchmarkHelper {
+        fn whitelist_as_committee(_who: &u64) {}
     }
 
     const ALICE: u64 = 100;

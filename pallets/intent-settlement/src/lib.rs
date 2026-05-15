@@ -21,6 +21,7 @@ extern crate alloc;
 pub use pallet::*;
 pub mod types;
 pub mod voucher_canonicalize;
+pub mod weights;
 
 #[cfg(test)]
 mod tests;
@@ -35,6 +36,7 @@ mod proptest;
 mod benchmarking;
 
 pub use types::*;
+pub use weights::WeightInfo;
 
 use parity_scale_codec::Encode;
 
@@ -466,6 +468,32 @@ pub mod pallet {
         /// domain-separated even when all other fields collide.
         #[pallet::constant]
         type SettlementVersion: Get<u32>;
+
+        /// Task #43: hook for runtime-benchmarks runs to bootstrap state
+        /// that `T::CommitteeMembership` and `T::SigVerifier` would otherwise
+        /// gate. Production runtimes wire this to a no-op for any
+        /// non-bench feature flag; the runtime-benchmarks build injects a
+        /// stub that registers the bench caller as a committee member and
+        /// makes signature verification permissive. Only compiled under
+        /// `feature = "runtime-benchmarks"` so it has zero on-chain cost.
+        #[cfg(feature = "runtime-benchmarks")]
+        type BenchmarkHelper: BenchmarkHelper<Self::AccountId>;
+
+        /// Task #43: weight surface for the auto-generated frame-benchmarking
+        /// output. Production runtimes wire this to the `SubstrateWeight`
+        /// impl in `pallet_intent_settlement::weights` (auto-generated via
+        /// `frame-omni-bencher`). Test runtimes default to `()` which
+        /// returns a hand-tuned slope mirroring the generated curve.
+        type WeightInfo: crate::weights::WeightInfo;
+    }
+
+    /// Bench-only setup hook (see `Config::BenchmarkHelper`).
+    #[cfg(feature = "runtime-benchmarks")]
+    pub trait BenchmarkHelper<AccountId> {
+        /// Add the supplied account to whatever committee-membership backing
+        /// store the runtime uses, and make the M-of-N signature check
+        /// pass-through for the duration of the benchmark.
+        fn whitelist_as_committee(who: &AccountId);
     }
 
     /// Abstraction for verifying an `sr25519` signature over a committee
@@ -481,6 +509,23 @@ pub mod pallet {
             let pk = sp_core::sr25519::Public::from_raw(*pubkey);
             let sg = sp_core::sr25519::Signature::from_raw(*sig);
             sp_io::crypto::sr25519_verify(&sg, msg, &pk)
+        }
+    }
+
+    /// Task #43: bench-only verifier that accepts ANY signature. Compiled
+    /// only under `feature = "runtime-benchmarks"` so it CANNOT be wired
+    /// into a production binary by accident — the runtime's
+    /// `type SigVerifier` flips to this struct via a `cfg(runtime-benchmarks)`
+    /// guard in `runtime/src/lib.rs`. With the bench `sigverify` removed,
+    /// the weight measurement reflects per-claim storage cost; downstream
+    /// runtimes typically RE-ADD a fixed `sr25519_verify` weight charge in
+    /// `weights.rs` to account for the production sig-verify cost.
+    #[cfg(feature = "runtime-benchmarks")]
+    pub struct BenchAllowAnyVerifier;
+    #[cfg(feature = "runtime-benchmarks")]
+    impl VerifyCommitteeSignature for BenchAllowAnyVerifier {
+        fn verify(_pubkey: &CommitteePubkey, _sig: &CommitteeSig, _msg: &[u8]) -> bool {
+            true
         }
     }
 
@@ -1507,13 +1552,13 @@ pub mod pallet {
         /// not-yet-settled subset.
         #[pallet::call_index(9)]
         #[pallet::weight((
-            // Base weight ≈ one settle_claim's sig-verify (50M) plus per-entry
-            // storage cost (~5M). The benchmarking case overrides this once
-            // weights are generated (see benchmarking.rs).
-            Weight::from_parts(
-                50_000_000u64.saturating_add((entries.len() as u64).saturating_mul(5_000_000)),
-                0,
-            ),
+            // Auto-generated via frame-benchmarking (task #43). The
+            // generated curve excludes sig-verify cost (the bench uses
+            // `BenchAllowAnyVerifier`); we add a fixed 50M ref_time
+            // budget to cover the single sr25519 verification the
+            // production `Sr25519Verifier` performs.
+            <T as Config>::WeightInfo::settle_batch_atomic(entries.len() as u32)
+                .saturating_add(Weight::from_parts(50_000_000, 0)),
             DispatchClass::Operational,
             Pays::No,
         ))]

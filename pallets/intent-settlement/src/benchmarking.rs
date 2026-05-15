@@ -25,6 +25,7 @@
 use super::*;
 use crate::pallet::{Call, Config, IsCommitteeMember};
 use frame_benchmarking::v2::*;
+use frame_system::pallet_prelude::BlockNumberFor;
 use frame_system::RawOrigin;
 use sp_std::vec::Vec;
 
@@ -109,6 +110,7 @@ mod benchmarks {
         // Sr25519Verifier and this benchmark's weight will reflect that
         // production cost.
         let caller: T::AccountId = whitelisted_caller();
+        T::BenchmarkHelper::whitelist_as_committee(&caller);
         let caller_pubkey = T::CommitteeMembership::pubkey_of(&caller);
         let signatures: Vec<(CommitteePubkey, CommitteeSig)> =
             sp_std::vec![(caller_pubkey, [0u8; 64])];
@@ -173,6 +175,7 @@ mod benchmarks {
         }
 
         let caller: T::AccountId = whitelisted_caller();
+        T::BenchmarkHelper::whitelist_as_committee(&caller);
         let caller_pubkey = T::CommitteeMembership::pubkey_of(&caller);
         let signatures: sp_std::vec::Vec<(CommitteePubkey, CommitteeSig)> =
             sp_std::vec![(caller_pubkey, [0u8; 64])];
@@ -268,6 +271,7 @@ mod benchmarks {
         }
 
         let caller: T::AccountId = whitelisted_caller();
+        T::BenchmarkHelper::whitelist_as_committee(&caller);
         let caller_pubkey = T::CommitteeMembership::pubkey_of(&caller);
         let signatures: sp_std::vec::Vec<(CommitteePubkey, CommitteeSig)> =
             sp_std::vec![(caller_pubkey, [0u8; 64])];
