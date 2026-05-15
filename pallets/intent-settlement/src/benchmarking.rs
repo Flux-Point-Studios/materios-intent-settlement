@@ -706,6 +706,157 @@ mod benchmarks {
         _(RawOrigin::Signed(caller), bv, signatures);
     }
 
+    // ---- Task #267 (mis-sec P0) — request_expire_policy + attest_expire_policy benches
+    //
+    // The new attested-expire path replaces the legacy `expire_policy_mirror`.
+    // Per design memo §6 #7 the EXPP pre-image is 172 bytes vs the legacy
+    // unsigned `expire_policy_mirror` (no sig pre-image at all). One blake2
+    // block round-trip per sig, mirroring the spec-220 cost overhead.
+    //
+    // Bench-cli command (run via downstream materios-runtime):
+    //   frame-omni-bencher v1 benchmark pallet \
+    //     --runtime <materios_runtime.compact.compressed.wasm> \
+    //     --pallet pallet_intent_settlement \
+    //     --extrinsic request_expire_policy,attest_expire_policy \
+    //     --steps 10 --repeat 5 --genesis-builder runtime
+    //
+    // Expected slope (the bench uses BenchAllowAnyVerifier so sig-verify is
+    // excluded; production runtimes add a fixed Sr25519Verifier cost on top):
+    //   request_expire_policy  ~25M ref_time  (intent hydration + storage write)
+    //   attest_expire_policy   ~50M ref_time  (intent hydration + storage writes
+    //                                          + M-of-N verify)
+    // ---------------------------------------------------------------------
+
+    /// Bench `request_expire_policy` — phase 1 of the attested expire path.
+    /// Seeds an attested BuyPolicy intent so the policy_id_witness check
+    /// has a deterministic match against the on-chain product_id.
+    #[benchmark]
+    fn request_expire_policy() {
+        use crate::pallet::Intents;
+        let caller: T::AccountId = whitelisted_caller();
+
+        let mut iid_bytes = [0u8; 32];
+        iid_bytes[..4].copy_from_slice(b"REXP");
+        let intent_id = IntentId::from(iid_bytes);
+        let product_id = PolicyId::from([0x77u8; 32]);
+
+        // Type-0 address (header 0x01 + 28-byte payment + 28-byte stake)
+        // — required by the canonical voucher digest in BuyPolicy intents.
+        let mut addr = sp_std::vec::Vec::with_capacity(57);
+        addr.push(0x01u8);
+        for _ in 0..28 {
+            addr.push(0xB1u8);
+        }
+        for _ in 0..28 {
+            addr.push(0xB1u8);
+        }
+        let kind = IntentKind::BuyPolicy {
+            product_id,
+            strike: 1,
+            term_slots: 86_400,
+            premium_ada: 1_000,
+            beneficiary_cardano_addr: frame_support::BoundedVec::try_from(addr)
+                .expect("57B fits ConstU32<MAX_CARDANO_ADDR>"),
+        };
+        Intents::<T>::insert(
+            intent_id,
+            Intent {
+                submitter: caller.clone(),
+                nonce: 0u64,
+                kind,
+                submitted_block: 1,
+                ttl_block: 1_000_000,
+                status: IntentStatus::Attested,
+            },
+        );
+
+        let mc_g = T::MainchainGenesisHash::get();
+        let depth = T::MinFinalityDepth::get();
+        let evidence = ExpiryEvidence {
+            cardano_tx_hash: [0xCFu8; 32],
+            observed_at_depth: depth,
+            observed_slot: 12_345_678,
+            mainchain_genesis_hash: mc_g,
+            policy_id_witness: product_id,
+        };
+
+        #[extrinsic_call]
+        _(
+            RawOrigin::Signed(caller),
+            intent_id,
+            evidence.cardano_tx_hash,
+            evidence,
+        );
+    }
+
+    /// Bench `attest_expire_policy` — phase 2 of the attested expire path.
+    /// Pre-seeds the pending expire request + attested intent so the bench
+    /// measures only the sig-verify + storage-mutation cost of the attest
+    /// call itself.
+    #[benchmark]
+    fn attest_expire_policy() {
+        use crate::pallet::{Intents, PolicyExpireRequests};
+        let caller: T::AccountId = whitelisted_caller();
+        T::BenchmarkHelper::whitelist_as_committee(&caller);
+
+        let mut iid_bytes = [0u8; 32];
+        iid_bytes[..4].copy_from_slice(b"ATXP");
+        let intent_id = IntentId::from(iid_bytes);
+        let product_id = PolicyId::from([0x88u8; 32]);
+
+        let mut addr = sp_std::vec::Vec::with_capacity(57);
+        addr.push(0x01u8);
+        for _ in 0..28 {
+            addr.push(0xB1u8);
+        }
+        for _ in 0..28 {
+            addr.push(0xB1u8);
+        }
+        let kind = IntentKind::BuyPolicy {
+            product_id,
+            strike: 1,
+            term_slots: 86_400,
+            premium_ada: 1_000,
+            beneficiary_cardano_addr: frame_support::BoundedVec::try_from(addr)
+                .expect("57B fits ConstU32<MAX_CARDANO_ADDR>"),
+        };
+        Intents::<T>::insert(
+            intent_id,
+            Intent {
+                submitter: caller.clone(),
+                nonce: 0u64,
+                kind,
+                submitted_block: 1,
+                ttl_block: 1_000_000,
+                status: IntentStatus::Attested,
+            },
+        );
+
+        let mc_g = T::MainchainGenesisHash::get();
+        let evidence = ExpiryEvidence {
+            cardano_tx_hash: [0xCFu8; 32],
+            observed_at_depth: T::MinFinalityDepth::get(),
+            observed_slot: 12_345_678,
+            mainchain_genesis_hash: mc_g,
+            policy_id_witness: product_id,
+        };
+        PolicyExpireRequests::<T>::insert(
+            intent_id,
+            ExpiryRequestRecord::<T::AccountId, BlockNumberFor<T>> {
+                requester: caller.clone(),
+                evidence,
+                submitted_block: <frame_system::Pallet<T>>::block_number(),
+            },
+        );
+
+        let caller_pubkey = T::CommitteeMembership::pubkey_of(&caller);
+        let signatures: sp_std::vec::Vec<(CommitteePubkey, CommitteeSig)> =
+            sp_std::vec![(caller_pubkey, [0u8; 64])];
+
+        #[extrinsic_call]
+        _(RawOrigin::Signed(caller), intent_id, signatures);
+    }
+
     // ---- Task #210 — submit_batch_intents bench -------------------------
 
     /// Bench `submit_batch_intents` across `Linear<1, MAX_BATCH>` so the

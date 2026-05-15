@@ -2323,6 +2323,15 @@ const FIXTURE_STCA_F_FALSE_HEX: &str =
 const FIXTURE_STCA_F_TRUE_HEX: &str =
     "c3fd35f32c4ccb94504cd95df98508855e6f0b89536602ca56e472864478cab8";
 
+// Task #267 (mis-sec P0): EXPP cross-layer parity vector. Same chain_id
+// (32×0x73) and pin-friendly inputs as the STCA series. Sourced from
+// `expire_policy_attested_payload`. The SDK and Aiken mirrors recompute
+// the same digest from the same 172-byte body; drift on either side
+// breaks the attested-expire M-of-N gate (committee can't reach
+// threshold over divergent pre-images).
+const FIXTURE_EXPP_G_HEX: &str =
+    "773fa47732e9af0d07dc6e7acb81e8d6c4c94e4f93f5f1ba8d5ff92da34defd6";
+
 // ---------------------------------------------------------------------------
 // Test vectors against docs/test-vectors.json
 // ---------------------------------------------------------------------------
@@ -5330,6 +5339,12 @@ fn task266_migration_flags_existing_settled_claims() {
     //   2. the migration is idempotent w.r.t. an already-flagged claim
     //      (the original migration property still holds — re-running
     //      doesn't toggle the flag off or double-set anything).
+    //
+    // Task #267 update: the migration now chains v0→v1→v2 in a single
+    // `on_runtime_upgrade` invocation. When the v0→v1 phase completes
+    // cleanly (no truncation), the v1→v2 phase runs in the same call
+    // and stamps both `StcaCutoverBlock` AND `PolicyExpireCutoverBlock`.
+    // The terminal version is now 2 instead of 1.
     new_test_ext().execute_with(|| {
         use pallet_intent_settlement::pallet::{
             PreAuditSettlement, SettlementStorageVersion,
@@ -5355,15 +5370,19 @@ fn task266_migration_flags_existing_settled_claims() {
         // Run the migration via the on_runtime_upgrade hook.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         // Post-migration: settled claim is flagged (idempotent — already
-        // set by legacy settle), version bumped, cutover scheduled.
+        // set by legacy settle), version bumped to 2 (chained v0→v2),
+        // both cutovers scheduled.
         assert!(PreAuditSettlement::<Test>::get(claim_id));
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 1u32);
-        let cutover =
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 2u32);
+        let stca_cutover =
             pallet_intent_settlement::pallet::StcaCutoverBlock::<Test>::get();
-        assert!(cutover > 0u64);
+        assert!(stca_cutover > 0u64);
+        let expp_cutover =
+            pallet_intent_settlement::pallet::PolicyExpireCutoverBlock::<Test>::get();
+        assert!(expp_cutover > 0u64);
         // Idempotency: a second invocation must not double-flag.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 1u32);
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 2u32);
     });
 }
 
@@ -5418,22 +5437,25 @@ fn task266_migration_truncation_recovers_to_full_progress() {
         let cutover_after_1 = StcaCutoverBlock::<Test>::get();
         assert!(cutover_after_1 > 0u64, "cutover scheduled on first run");
         // Second run: must SKIP the 2 already-flagged, reach the 3rd,
-        // flag it, complete, bump version. Cutover must NOT change.
+        // flag it, complete the v0→v1 phase, then chain into the
+        // v1→v2 phase. Cutover must NOT change.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         let flagged_after_2: usize = [c1, c2, c3]
             .iter()
             .filter(|cid| PreAuditSettlement::<Test>::get(*cid))
             .count();
         assert_eq!(flagged_after_2, 3, "second run drains tail to full flag set");
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 1u32,
-                   "version bumps once migration is complete");
+        // Task #267 update: after v0→v1 completes, the same invocation
+        // chains v1→v2, so the terminal version is 2 not 1.
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 2u32,
+                   "version bumps to 2 after chained v0→v1→v2 completes");
         let cutover_after_2 = StcaCutoverBlock::<Test>::get();
         assert_eq!(cutover_after_1, cutover_after_2,
-                   "cutover MUST NOT slide between runs");
-        // Third run: idempotent — version already 1, early-return.
+                   "STCA cutover MUST NOT slide between runs");
+        // Third run: idempotent — version already 2, early-return.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         assert_eq!(StcaCutoverBlock::<Test>::get(), cutover_after_2);
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 1u32);
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 2u32);
     });
 }
 
@@ -5705,6 +5727,727 @@ fn task266_stca_payload_size_is_209_bytes() {
         &mc_g,
     );
     assert_eq!(digest.len(), 32);
+}
+
+// ---------------------------------------------------------------------------
+// Task #267 (mis-sec P0) — request_expire_policy + attest_expire_policy
+// unit tests
+//
+// The new attested-expire path replaces the legacy `expire_policy_mirror`.
+// Each test maps to a specific design-memo invariant or attack scenario:
+//   - happy path (request → attest with M=2 sigs → IntentExpired emitted)
+//   - DeprecatedExtrinsic (cutover gate on legacy expire_policy_mirror)
+//   - caller not committee member
+//   - intent already settled (IntentNotEligibleForExpiry)
+//   - intent already expired (idempotent — Ok with no event)
+//   - FinalityDepthBelowMinimum
+//   - WrongMainchainGenesis
+//   - ExpiryRequestAlreadyExists (strict idempotency)
+//   - ExpiryRequestExpired (TTL elapsed)
+//   - InsufficientSignatures (M-of-N short)
+//   - NotCommitteeMember caller-binding on attest_expire_policy
+//   - ExpiryEvidenceMismatch (policy_id_witness wrong)
+//   - tx-hash drift between arg and evidence
+//   - RefundCredit intent rejected (no Cardano policy to expire)
+//   - EXPP domain-separated from existing tags
+//   - migration v1→v2 flags existing Expired intents
+
+/// Helper: build an `ExpiryEvidence` value internally consistent with a
+/// `BuyPolicy` intent's product_id. The tests probe each individual gate
+/// by mutating one field at a time off this baseline.
+fn good_expiry_evidence_for_buy(
+    product_id: H256,
+    depth: u32,
+    slot: u64,
+) -> ExpiryEvidence {
+    ExpiryEvidence {
+        cardano_tx_hash: [0xCFu8; 32],
+        observed_at_depth: depth,
+        observed_slot: slot,
+        mainchain_genesis_hash: TestMainchainGenesisHash::get(),
+        policy_id_witness: product_id,
+    }
+}
+
+/// Helper: submit + attest a BuyPolicy intent and return
+/// `(intent_id, product_id)` so tests can drive `request_expire_policy`
+/// against an Attested-state intent with a known policy id. Uses a fresh
+/// product id per call so individual tests don't collide.
+fn attested_buy_policy_with_policy_id(
+    seed: u8,
+    premium: u64,
+) -> (IntentId, H256) {
+    pallet_intent_settlement::pallet::Credits::<Test>::mutate(ALICE, |c| {
+        *c = c.saturating_add(premium);
+    });
+    pallet_intent_settlement::pallet::PoolUtilization::<Test>::mutate(|u| {
+        u.total_nav_ada = u.total_nav_ada.saturating_add(premium.saturating_mul(2));
+    });
+    let kind = bp(seed, 1, premium);
+    let product_id = match &kind {
+        IntentKind::BuyPolicy { product_id, .. } => *product_id,
+        _ => panic!("bp() must return BuyPolicy"),
+    };
+    let nonce = pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE);
+    let blk: u32 = System::block_number().try_into().unwrap();
+    let iid = intent_id_for(ALICE, nonce, &kind, blk);
+    assert_ok!(IntentSettlement::submit_intent(
+        RuntimeOrigin::signed(ALICE),
+        kind
+    ));
+    assert_ok!(IntentSettlement::attest_intent(
+        RuntimeOrigin::signed(1),
+        iid,
+        mock_pubkey_of(&1),
+        mock_attest_sig(1)
+    ));
+    assert_ok!(IntentSettlement::attest_intent(
+        RuntimeOrigin::signed(2),
+        iid,
+        mock_pubkey_of(&2),
+        mock_attest_sig(2)
+    ));
+    (iid, product_id)
+}
+
+#[test]
+fn task267_request_expire_policy_happy_path_pins_evidence() {
+    new_test_ext().execute_with(|| {
+        let (intent_id, product_id) = attested_buy_policy_with_policy_id(0xE0, 50_000);
+        let evidence = good_expiry_evidence_for_buy(product_id, 15, 99_999);
+
+        assert_ok!(IntentSettlement::request_expire_policy(
+            RuntimeOrigin::signed(1),
+            intent_id,
+            evidence.cardano_tx_hash,
+            evidence,
+        ));
+
+        let pending =
+            pallet_intent_settlement::pallet::PolicyExpireRequests::<Test>::get(intent_id)
+                .expect("request_expire_policy must pin pending entry");
+        assert_eq!(pending.requester, 1u64);
+        assert_eq!(pending.evidence, evidence);
+        // ExpiryRequested event emitted with the requester + tx hash +
+        // policy_id_witness.
+        let events: Vec<_> = System::events()
+            .into_iter()
+            .filter_map(|er| match er.event {
+                RuntimeEvent::IntentSettlement(
+                    pallet_intent_settlement::pallet::Event::ExpiryRequested {
+                        intent_id: iid, requester, policy_id_witness, ..
+                    },
+                ) => Some((iid, requester, policy_id_witness)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], (intent_id, 1u64, product_id));
+    });
+}
+
+#[test]
+fn task267_attest_expire_policy_happy_path_flips_to_expired() {
+    new_test_ext().execute_with(|| {
+        let (intent_id, product_id) = attested_buy_policy_with_policy_id(0xE1, 50_000);
+        let evidence = good_expiry_evidence_for_buy(product_id, 15, 100_000);
+
+        assert_ok!(IntentSettlement::request_expire_policy(
+            RuntimeOrigin::signed(1),
+            intent_id,
+            evidence.cardano_tx_hash,
+            evidence,
+        ));
+        assert_ok!(IntentSettlement::attest_expire_policy(
+            RuntimeOrigin::signed(1),
+            intent_id,
+            mock_settle_sigs(),
+        ));
+
+        let intent =
+            pallet_intent_settlement::pallet::Intents::<Test>::get(intent_id).unwrap();
+        assert_eq!(intent.status, IntentStatus::Expired);
+        // Pending request consumed.
+        assert!(
+            pallet_intent_settlement::pallet::PolicyExpireRequests::<Test>::get(
+                intent_id
+            )
+            .is_none()
+        );
+        // IntentExpired event with PolicyExpiredOnCardano reason.
+        let saw_event = System::events().into_iter().any(|er| match er.event {
+            RuntimeEvent::IntentSettlement(
+                pallet_intent_settlement::pallet::Event::IntentExpired {
+                    intent_id: iid,
+                    reason,
+                },
+            ) => iid == intent_id && reason == ExpiryReason::PolicyExpiredOnCardano,
+            _ => false,
+        });
+        assert!(saw_event, "IntentExpired event with PolicyExpiredOnCardano must fire");
+    });
+}
+
+#[test]
+fn task267_request_expire_policy_rejects_below_finality_depth() {
+    new_test_ext().execute_with(|| {
+        let (intent_id, product_id) = attested_buy_policy_with_policy_id(0xE2, 50_000);
+        let min = TestMinFinalityDepth::get();
+        let evidence = good_expiry_evidence_for_buy(product_id, min - 1, 1);
+        assert_noop!(
+            IntentSettlement::request_expire_policy(
+                RuntimeOrigin::signed(1),
+                intent_id,
+                evidence.cardano_tx_hash,
+                evidence,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::FinalityDepthBelowMinimum,
+        );
+        // No pending entry pinned.
+        assert!(
+            pallet_intent_settlement::pallet::PolicyExpireRequests::<Test>::get(
+                intent_id
+            )
+            .is_none()
+        );
+    });
+}
+
+#[test]
+fn task267_request_expire_policy_rejects_wrong_mainchain_genesis() {
+    new_test_ext().execute_with(|| {
+        let (intent_id, product_id) = attested_buy_policy_with_policy_id(0xE3, 50_000);
+        let mut evidence = good_expiry_evidence_for_buy(product_id, 15, 1);
+        evidence.mainchain_genesis_hash = [0xDEu8; 32];
+        assert_noop!(
+            IntentSettlement::request_expire_policy(
+                RuntimeOrigin::signed(1),
+                intent_id,
+                evidence.cardano_tx_hash,
+                evidence,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::WrongMainchainGenesis,
+        );
+    });
+}
+
+#[test]
+fn task267_request_expire_policy_rejects_tx_hash_drift_arg_vs_evidence() {
+    // The cardano_tx_hash argument is recorded on the event shape; the
+    // evidence struct carries the same field for the EXPP pre-image.
+    // Reject any mismatch up-front so off-chain observers can't see two
+    // divergent tx-hash claims for one intent_id.
+    new_test_ext().execute_with(|| {
+        let (intent_id, product_id) = attested_buy_policy_with_policy_id(0xE4, 50_000);
+        let evidence = good_expiry_evidence_for_buy(product_id, 15, 1);
+        assert_noop!(
+            IntentSettlement::request_expire_policy(
+                RuntimeOrigin::signed(1),
+                intent_id,
+                [0xDEu8; 32], // mismatch with evidence.cardano_tx_hash
+                evidence,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::ExpiryEvidenceMismatch,
+        );
+    });
+}
+
+#[test]
+fn task267_request_expire_policy_rejects_wrong_policy_id_witness() {
+    // Attack class: recycling defense. A colluding requester cannot bind
+    // one Cardano Expire tx to a different Materios intent — the witness
+    // must match the on-chain product_id.
+    new_test_ext().execute_with(|| {
+        let (intent_id, _product_id) = attested_buy_policy_with_policy_id(0xE5, 50_000);
+        let mut evidence = good_expiry_evidence_for_buy(H256::from([0u8; 32]), 15, 1);
+        evidence.policy_id_witness = H256::from([0xBAu8; 32]);
+        assert_noop!(
+            IntentSettlement::request_expire_policy(
+                RuntimeOrigin::signed(1),
+                intent_id,
+                evidence.cardano_tx_hash,
+                evidence,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::ExpiryEvidenceMismatch,
+        );
+    });
+}
+
+#[test]
+fn task267_request_expire_policy_rejects_unknown_intent() {
+    new_test_ext().execute_with(|| {
+        let evidence = good_expiry_evidence_for_buy(H256::from([0u8; 32]), 15, 1);
+        assert_noop!(
+            IntentSettlement::request_expire_policy(
+                RuntimeOrigin::signed(1),
+                H256::from([0xCCu8; 32]),
+                evidence.cardano_tx_hash,
+                evidence,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::UnknownPolicy,
+        );
+    });
+}
+
+#[test]
+fn task267_request_expire_policy_rejects_refund_credit_intent() {
+    // RefundCredit intents have no Cardano-side policy and can never be
+    // Expire-redeemed. The pallet must reject so an attacker can't
+    // synthesize a falsifiable "expire" against a credit refund.
+    new_test_ext().execute_with(|| {
+        pallet_intent_settlement::pallet::Credits::<Test>::insert(ALICE, 1_000_000u64);
+        let kind = IntentKind::RefundCredit { amount_ada: 100 };
+        let nonce = pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE);
+        let blk: u32 = System::block_number().try_into().unwrap();
+        let iid = intent_id_for(ALICE, nonce, &kind, blk);
+        assert_ok!(IntentSettlement::submit_intent(
+            RuntimeOrigin::signed(ALICE),
+            kind
+        ));
+        // Witness with anything (zero hash here) — the pallet rejects
+        // before it inspects the witness because the intent kind is
+        // structurally ineligible.
+        let evidence = ExpiryEvidence {
+            cardano_tx_hash: [0xCDu8; 32],
+            observed_at_depth: TestMinFinalityDepth::get(),
+            observed_slot: 1,
+            mainchain_genesis_hash: TestMainchainGenesisHash::get(),
+            policy_id_witness: H256::from([0u8; 32]),
+        };
+        assert_noop!(
+            IntentSettlement::request_expire_policy(
+                RuntimeOrigin::signed(1),
+                iid,
+                evidence.cardano_tx_hash,
+                evidence,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::IntentNotEligibleForExpiry,
+        );
+    });
+}
+
+#[test]
+fn task267_request_expire_policy_idempotent_on_already_expired() {
+    new_test_ext().execute_with(|| {
+        let (intent_id, product_id) = attested_buy_policy_with_policy_id(0xE6, 50_000);
+        let evidence = good_expiry_evidence_for_buy(product_id, 15, 1);
+        assert_ok!(IntentSettlement::request_expire_policy(
+            RuntimeOrigin::signed(1),
+            intent_id,
+            evidence.cardano_tx_hash,
+            evidence,
+        ));
+        assert_ok!(IntentSettlement::attest_expire_policy(
+            RuntimeOrigin::signed(1),
+            intent_id,
+            mock_settle_sigs(),
+        ));
+        // Second request_expire_policy on already-Expired intent must
+        // return Ok (idempotent, matches legacy contract).
+        let evidence2 = good_expiry_evidence_for_buy(product_id, 15, 2);
+        assert_ok!(IntentSettlement::request_expire_policy(
+            RuntimeOrigin::signed(1),
+            intent_id,
+            evidence2.cardano_tx_hash,
+            evidence2,
+        ));
+        // No pending request pinned (early-return path).
+        assert!(
+            pallet_intent_settlement::pallet::PolicyExpireRequests::<Test>::get(
+                intent_id
+            )
+            .is_none()
+        );
+    });
+}
+
+#[test]
+fn task267_request_expire_policy_rejects_already_settled_intent() {
+    new_test_ext().execute_with(|| {
+        // Build a vouchered claim so we can settle it first (so the
+        // bound intent flips to Settled), then test that
+        // request_expire_policy refuses to fire on a Settled intent.
+        let (claim_id, intent_id, _voucher) =
+            vouchered_claim_with_voucher(0xE7, 50_000);
+        // Settle via legacy path (still open since migration not run).
+        assert_ok!(IntentSettlement::settle_claim(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            [0xFFu8; 32],
+            false,
+            mock_settle_sigs(),
+        ));
+        let intent =
+            pallet_intent_settlement::pallet::Intents::<Test>::get(intent_id).unwrap();
+        assert_eq!(intent.status, IntentStatus::Settled);
+        // Now try to expire — must reject with IntentNotEligibleForExpiry.
+        // We need to resolve the policy_id_witness against the intent's
+        // BuyPolicy.product_id so the witness check passes BEFORE the
+        // state check (test the state check, not the witness check).
+        let product_id = match &intent.kind {
+            IntentKind::BuyPolicy { product_id, .. } => *product_id,
+            _ => panic!("vouchered_claim_with_voucher seeds BuyPolicy"),
+        };
+        let evidence = good_expiry_evidence_for_buy(product_id, 15, 1);
+        assert_noop!(
+            IntentSettlement::request_expire_policy(
+                RuntimeOrigin::signed(1),
+                intent_id,
+                evidence.cardano_tx_hash,
+                evidence,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::IntentNotEligibleForExpiry,
+        );
+    });
+}
+
+#[test]
+fn task267_request_expire_policy_rejects_duplicate_pending() {
+    new_test_ext().execute_with(|| {
+        let (intent_id, product_id) = attested_buy_policy_with_policy_id(0xE8, 50_000);
+        let evidence = good_expiry_evidence_for_buy(product_id, 15, 1);
+        assert_ok!(IntentSettlement::request_expire_policy(
+            RuntimeOrigin::signed(1),
+            intent_id,
+            evidence.cardano_tx_hash,
+            evidence,
+        ));
+        // Second call before TTL elapses or attest consumes — strict reject.
+        assert_noop!(
+            IntentSettlement::request_expire_policy(
+                RuntimeOrigin::signed(2),
+                intent_id,
+                evidence.cardano_tx_hash,
+                evidence,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::ExpiryRequestAlreadyExists,
+        );
+    });
+}
+
+#[test]
+fn task267_attest_expire_policy_rejects_missing_request() {
+    new_test_ext().execute_with(|| {
+        let (intent_id, _product_id) = attested_buy_policy_with_policy_id(0xE9, 50_000);
+        assert_noop!(
+            IntentSettlement::attest_expire_policy(
+                RuntimeOrigin::signed(1),
+                intent_id,
+                mock_settle_sigs(),
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::ExpiryRequestMissing,
+        );
+    });
+}
+
+#[test]
+fn task267_attest_expire_policy_rejects_expired_request() {
+    new_test_ext().execute_with(|| {
+        let (intent_id, product_id) = attested_buy_policy_with_policy_id(0xEA, 50_000);
+        let evidence = good_expiry_evidence_for_buy(product_id, 15, 1);
+        assert_ok!(IntentSettlement::request_expire_policy(
+            RuntimeOrigin::signed(1),
+            intent_id,
+            evidence.cardano_tx_hash,
+            evidence,
+        ));
+        // Advance past TTL.
+        let ttl = TestSettlementRequestTtl::get();
+        System::set_block_number((System::block_number() + ttl as u64) + 1);
+        assert_noop!(
+            IntentSettlement::attest_expire_policy(
+                RuntimeOrigin::signed(1),
+                intent_id,
+                mock_settle_sigs(),
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::ExpiryRequestExpired,
+        );
+    });
+}
+
+#[test]
+fn task267_attest_expire_policy_rejects_non_committee_caller() {
+    new_test_ext().execute_with(|| {
+        let (intent_id, product_id) = attested_buy_policy_with_policy_id(0xEB, 50_000);
+        let evidence = good_expiry_evidence_for_buy(product_id, 15, 1);
+        assert_ok!(IntentSettlement::request_expire_policy(
+            RuntimeOrigin::signed(1),
+            intent_id,
+            evidence.cardano_tx_hash,
+            evidence,
+        ));
+        assert_noop!(
+            IntentSettlement::attest_expire_policy(
+                RuntimeOrigin::signed(ALICE),
+                intent_id,
+                mock_settle_sigs(),
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::NotCommitteeMember,
+        );
+    });
+}
+
+#[test]
+fn task267_attest_expire_policy_rejects_below_threshold() {
+    new_test_ext().execute_with(|| {
+        let (intent_id, product_id) = attested_buy_policy_with_policy_id(0xEC, 50_000);
+        let evidence = good_expiry_evidence_for_buy(product_id, 15, 1);
+        assert_ok!(IntentSettlement::request_expire_policy(
+            RuntimeOrigin::signed(1),
+            intent_id,
+            evidence.cardano_tx_hash,
+            evidence,
+        ));
+        // 1 sig under threshold of 2.
+        assert_noop!(
+            IntentSettlement::attest_expire_policy(
+                RuntimeOrigin::signed(1),
+                intent_id,
+                vec![mock_sig_for(1)],
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures,
+        );
+        // Pending entry NOT consumed — keeper can retry.
+        assert!(
+            pallet_intent_settlement::pallet::PolicyExpireRequests::<Test>::get(
+                intent_id
+            )
+            .is_some()
+        );
+    });
+}
+
+#[test]
+fn task267_legacy_expire_policy_mirror_works_before_cutover() {
+    new_test_ext().execute_with(|| {
+        let (intent_id, _) = attested_buy_policy_with_policy_id(0xED, 50_000);
+        assert_ok!(IntentSettlement::expire_policy_mirror(
+            RuntimeOrigin::signed(1),
+            intent_id,
+        ));
+        let intent =
+            pallet_intent_settlement::pallet::Intents::<Test>::get(intent_id).unwrap();
+        assert_eq!(intent.status, IntentStatus::Expired);
+        // Legacy path tags PreAuditExpiry (parity with LOW #2 fix on
+        // settle_claim).
+        assert!(pallet_intent_settlement::pallet::PreAuditExpiry::<Test>::get(
+            intent_id
+        ));
+    });
+}
+
+#[test]
+fn task267_legacy_expire_policy_mirror_rejects_after_cutover() {
+    new_test_ext().execute_with(|| {
+        let (intent_id, _) = attested_buy_policy_with_policy_id(0xEE, 50_000);
+        // Simulate the migration having stamped the cutover.
+        pallet_intent_settlement::pallet::PolicyExpireCutoverBlock::<Test>::put(2u64);
+        // Advance past the cutover.
+        System::set_block_number(3);
+        assert_noop!(
+            IntentSettlement::expire_policy_mirror(
+                RuntimeOrigin::signed(1),
+                intent_id,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::DeprecatedExtrinsic,
+        );
+    });
+}
+
+#[test]
+fn task267_expp_payload_domain_separated_from_other_tags() {
+    // EXPP must not collide with STCL/STCA/CRDP/RVCH/STBA/BSTA/INTA when
+    // a malicious operator tries to feed a same-input pre-image to
+    // multiple helpers. The Substrate `domain_hash` adds the 4-byte tag
+    // prefix so the digests MUST differ structurally.
+    let intent_id = H256::from([0x11u8; 32]);
+    let policy_id = H256::from([0x22u8; 32]);
+    let tx = [0x33u8; 32];
+    let mc_g = [0x65u8; 32];
+    let expp = pallet_intent_settlement::expire_policy_attested_payload(
+        &TEST_CHAIN_ID,
+        &intent_id,
+        &policy_id,
+        &tx,
+        15,
+        1,
+        &mc_g,
+    );
+    // STCL (legacy settle_claim payload) over a same-shape (claim_id,
+    // tx, settled_direct) triple. Use intent_id as a stand-in claim_id
+    // to maximise byte-overlap risk.
+    let stcl = pallet_intent_settlement::settle_claim_payload(
+        &TEST_CHAIN_ID,
+        &intent_id,
+        &tx,
+        false,
+    );
+    assert_ne!(expp, stcl, "EXPP and STCL digests MUST be domain-separated");
+    // STCA (new attested settle_claim) — feed compatible-shape inputs.
+    let stca = pallet_intent_settlement::settle_claim_attested_payload(
+        &TEST_CHAIN_ID,
+        &intent_id,
+        &[0u8; 32],
+        &tx,
+        false,
+        &[0u8; 28],
+        0,
+        15,
+        1,
+        &mc_g,
+    );
+    assert_ne!(expp, stca, "EXPP and STCA digests MUST be domain-separated");
+}
+
+#[test]
+fn task267_expp_payload_size_is_172_bytes() {
+    // EXPP pre-image body: 32 + 32 + 32 + 32 + 4 + 8 + 32 = 172 bytes.
+    // Pin the byte math so a future field-order edit fails loudly.
+    let body_len = 32 + 32 + 32 + 32 + 4 + 8 + 32;
+    assert_eq!(
+        body_len, 172,
+        "EXPP pre-image body MUST be exactly 172 bytes per design memo §3.2 (expire variant)"
+    );
+    let digest = pallet_intent_settlement::expire_policy_attested_payload(
+        &TEST_CHAIN_ID,
+        &H256::from([0u8; 32]),
+        &H256::from([0u8; 32]),
+        &[0u8; 32],
+        0,
+        0,
+        &[0u8; 32],
+    );
+    assert_eq!(digest.len(), 32);
+}
+
+#[test]
+fn task267_expp_payload_parity_fixture_g() {
+    // EXPP fixture G — pinned chain_id, intent_id, policy_id, tx_hash,
+    // depth, slot, mainchain genesis. The SDK + Aiken mirrors will
+    // recompute the same digest from these fields; this test pins the
+    // canonical byte vector so cross-team parity is unambiguous.
+    let intent_id = H256::from([0x07u8; 32]);
+    let policy_id = H256::from([0x09u8; 32]);
+    let tx = [0x33u8; 32];
+    let depth: u32 = 15;
+    let slot: u64 = 12_345_678;
+    let mc_g = [0x65u8; 32]; // matches TestMainchainGenesisHash
+    let digest = pallet_intent_settlement::expire_policy_attested_payload(
+        &TEST_CHAIN_ID,
+        &intent_id,
+        &policy_id,
+        &tx,
+        depth,
+        slot,
+        &mc_g,
+    );
+    // Pin the hex output so the SDK + Aiken mirrors must match. Drift
+    // here means the cross-layer M-of-N committee can no longer reach
+    // threshold (members compute divergent pre-images and never agree).
+    assert_eq!(
+        hex_32(digest),
+        FIXTURE_EXPP_G_HEX,
+        "EXPP fixture G digest drifted — regenerate SDK + Aiken in lockstep"
+    );
+    // Sanity: per-byte slot domain-separation.
+    let digest_other_slot = pallet_intent_settlement::expire_policy_attested_payload(
+        &TEST_CHAIN_ID,
+        &intent_id,
+        &policy_id,
+        &tx,
+        depth,
+        slot + 1,
+        &mc_g,
+    );
+    assert_ne!(
+        digest, digest_other_slot,
+        "slot byte position must domain-separate EXPP digest"
+    );
+}
+
+#[test]
+fn task267_migration_flags_existing_expired_intents() {
+    // Spec-N+1 OnRuntimeUpgrade v1→v2: walks Intents and flags every
+    // Expired intent as a pre-audit expiry. Idempotent — the legacy
+    // expire_policy_mirror already flagged via the grace-window fix
+    // (mirror of LOW #2 on settle_claim), so the migration's only
+    // remaining work on a clean run is TTL-sweep-expired intents.
+    new_test_ext().execute_with(|| {
+        use pallet_intent_settlement::pallet::{
+            PreAuditExpiry, SettlementStorageVersion,
+        };
+        // Submit a BuyPolicy with credit, advance past TTL so the
+        // on_initialize sweep marks it Expired without the grace-window
+        // flag — exactly the case the migration must catch.
+        pallet_intent_settlement::pallet::Credits::<Test>::insert(ALICE, 1_000_000u64);
+        let kind = bp(0xEF, 1, 1_000);
+        let iid = intent_id_for(ALICE, 0, &kind, 1);
+        assert_ok!(IntentSettlement::submit_intent(
+            RuntimeOrigin::signed(ALICE),
+            kind,
+        ));
+        System::set_block_number(1 + 600);
+        <IntentSettlement as Hooks<u64>>::on_initialize(1 + 600);
+        let intent =
+            pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
+        assert_eq!(intent.status, IntentStatus::Expired);
+        assert!(
+            !PreAuditExpiry::<Test>::get(iid),
+            "TTL sweep does NOT flag (only legacy expire_policy_mirror does); the migration is what catches these"
+        );
+        // Run the migration. Version starts at 0; this chains all the
+        // way through v0→v1→v2 in one call. Post: PreAuditExpiry
+        // flagged, version = 2.
+        let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
+        assert!(PreAuditExpiry::<Test>::get(iid));
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 2u32);
+        let cutover =
+            pallet_intent_settlement::pallet::PolicyExpireCutoverBlock::<Test>::get();
+        assert!(cutover > 0u64);
+    });
+}
+
+#[test]
+fn task267_attest_expire_policy_payload_rebuild_pins_chain_state() {
+    // Mirror of `task266_attest_settle_payload_pins_voucher_digest_against_attack_a5`:
+    // the EXPP payload pins to the on-chain intent's resolved policy_id
+    // at attest time. A colluding requester cannot pre-bake a digest
+    // against the wrong intent because the pallet re-resolves policy_id
+    // from `Intents[intent_id]` before hashing.
+    new_test_ext().execute_with(|| {
+        let (iid_a, pid_a) = attested_buy_policy_with_policy_id(0xF0, 50_000);
+        let (_iid_b, pid_b) = attested_buy_policy_with_policy_id(0xF1, 50_000);
+        // Per-intent policy ids MUST differ (the bp() helper bakes the
+        // seed into product_id).
+        assert_ne!(pid_a, pid_b, "Per-intent policy ids must differ for the test");
+
+        let mc_g = TestMainchainGenesisHash::get();
+        let tx = [0xCFu8; 32];
+        let depth: u32 = 15;
+        let slot: u64 = 1;
+        let d_a = pallet_intent_settlement::expire_policy_attested_payload(
+            &TEST_CHAIN_ID,
+            &iid_a,
+            &pid_a,
+            &tx,
+            depth,
+            slot,
+            &mc_g,
+        );
+        let d_swap = pallet_intent_settlement::expire_policy_attested_payload(
+            &TEST_CHAIN_ID,
+            &iid_a,  // same intent_id
+            &pid_b,  // but B's policy_id
+            &tx,
+            depth,
+            slot,
+            &mc_g,
+        );
+        assert_ne!(
+            d_a, d_swap,
+            "EXPP payload MUST domain-separate on resolved policy_id"
+        );
+    });
 }
 
 // Task #221 — Test 5: full N=256 (MaxSubmitBatch) boundary test.

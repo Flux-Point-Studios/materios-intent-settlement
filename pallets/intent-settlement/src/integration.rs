@@ -18,8 +18,8 @@ use crate as pallet_intent_settlement;
 use crate::pallet::{IsCommitteeMember, VerifyCommitteeSignature};
 use crate::types::*;
 use crate::{
-    credit_deposit_payload, request_voucher_payload, settle_claim_attested_payload,
-    settle_claim_payload,
+    credit_deposit_payload, expire_policy_attested_payload, request_voucher_payload,
+    settle_claim_attested_payload, settle_claim_payload,
 };
 
 /// #73: integration-runtime test chain identity. Pinned to 0x73*32 to match
@@ -1447,5 +1447,152 @@ fn task266_full_lifecycle_attested_settle_real_sr25519() {
             pallet_intent_settlement::pallet::Intents::<Testnet>::get(expected_id)
                 .unwrap();
         assert_eq!(intent.status, IntentStatus::Settled);
+    });
+}
+
+/// Task #267 (mis-sec P0): real-sr25519 driven full lifecycle through the
+/// new `request_expire_policy` + `attest_expire_policy` path. Mirrors
+/// `task266_full_lifecycle_attested_settle_real_sr25519` but for the
+/// expire side. Drives an Attested-state intent (no voucher yet — the
+/// expire path can fire pre-voucher) through the new EXPP digest gate
+/// with production sr25519 signatures.
+///
+/// Why this matters: the unit-suite mocks the sig-verifier, so the
+/// production sr25519 verification path on the new 172-byte EXPP
+/// pre-image layout is only exercised here. A drift in field order
+/// between `expire_policy_attested_payload` (Rust) and the SDK / Aiken
+/// mirrors would surface as an `InvalidSignature` here long before it
+/// surfaces on chain.
+#[test]
+fn task267_full_lifecycle_attested_expire_real_sr25519() {
+    new_ext().execute_with(|| {
+        let (alice, bob, _charlie) = committee_accounts();
+        let user = user_account();
+        let alice_pk = {
+            let b: &[u8; 32] = alice.as_ref();
+            *b
+        };
+        let bob_pk = {
+            let b: &[u8; 32] = bob.as_ref();
+            *b
+        };
+
+        // Credit Alice's user account so they can submit a BuyPolicy.
+        let cardano_tx = [0xAA; 32];
+        let mut target_bytes = [0u8; 32];
+        target_bytes.copy_from_slice(&user.encode()[..32]);
+        let deposit_payload = credit_deposit_payload(
+            &TEST_CHAIN_ID,
+            &target_bytes,
+            10_000_000u64,
+            &cardano_tx,
+        );
+        let deposit_sigs = vec![
+            sign_with("//Alice", &deposit_payload),
+            sign_with("//Bob", &deposit_payload),
+        ];
+        assert_ok!(IntentSettlement::credit_deposit(
+            RuntimeOrigin::signed(alice.clone()),
+            user.clone(),
+            10_000_000u64,
+            cardano_tx,
+            deposit_sigs
+        ));
+        System::set_block_number(2);
+        let product_id = H256::from([0x77; 32]);
+        let kind = IntentKind::BuyPolicy {
+            product_id,
+            strike: 500_000,
+            term_slots: 86_400,
+            premium_ada: 2_000_000,
+            beneficiary_cardano_addr: BoundedVec::try_from(type0_addr_bytes(0xB1))
+                .unwrap(),
+        };
+        let mut submitter_bytes = [0u8; 32];
+        submitter_bytes.copy_from_slice(&user.encode()[..32]);
+        let intent_id = compute_intent_id(&submitter_bytes, 0, &kind, 2);
+        assert_ok!(IntentSettlement::submit_intent(
+            RuntimeOrigin::signed(user.clone()),
+            kind
+        ));
+        System::set_block_number(3);
+        // Attest 2-of-3 so the intent flips to Attested. The expire path
+        // is also valid on Pending intents, but Attested exercises the
+        // most realistic real-world scenario (expire arrives mid-pipeline).
+        assert_ok!(IntentSettlement::attest_intent(
+            RuntimeOrigin::signed(alice.clone()),
+            intent_id,
+            alice_pk,
+            sign_attest("//Alice", &intent_id)
+        ));
+        assert_ok!(IntentSettlement::attest_intent(
+            RuntimeOrigin::signed(bob.clone()),
+            intent_id,
+            bob_pk,
+            sign_attest("//Bob", &intent_id)
+        ));
+
+        // Block 4: NEW PATH — request_expire_policy + attest_expire_policy.
+        System::set_block_number(4);
+        let mc_genesis = TestMainchainGenesisHash::get();
+        let evidence = ExpiryEvidence {
+            cardano_tx_hash: [0xEF; 32],
+            observed_at_depth: TestMinFinalityDepth::get(),
+            observed_slot: 99_999_999,
+            mainchain_genesis_hash: mc_genesis,
+            policy_id_witness: product_id,
+        };
+        // Anyone (committee or not) can post the request. The pallet
+        // checks policy_id_witness against the on-chain intent's
+        // product_id — defends against attack class A2 (cross-binding
+        // one Cardano Expire tx to the wrong Materios intent).
+        assert_ok!(IntentSettlement::request_expire_policy(
+            RuntimeOrigin::signed(alice.clone()),
+            intent_id,
+            evidence.cardano_tx_hash,
+            evidence,
+        ));
+
+        // Committee builds the EXPP digest from chain state (re-resolves
+        // policy_id from `Intents[intent_id]`) and signs it.
+        let expp_payload = expire_policy_attested_payload(
+            &TEST_CHAIN_ID,
+            &intent_id,
+            &product_id,
+            &evidence.cardano_tx_hash,
+            evidence.observed_at_depth,
+            evidence.observed_slot,
+            &mc_genesis,
+        );
+        let attest_sigs = vec![
+            sign_with("//Alice", &expp_payload),
+            sign_with("//Bob", &expp_payload),
+        ];
+        assert_ok!(IntentSettlement::attest_expire_policy(
+            RuntimeOrigin::signed(alice.clone()),
+            intent_id,
+            attest_sigs,
+        ));
+
+        // Post-state: intent expired, pending expire request consumed.
+        let intent =
+            pallet_intent_settlement::pallet::Intents::<Testnet>::get(intent_id)
+                .unwrap();
+        assert_eq!(intent.status, IntentStatus::Expired);
+        assert!(
+            pallet_intent_settlement::pallet::PolicyExpireRequests::<Testnet>::get(
+                intent_id
+            )
+            .is_none(),
+            "pending expire request must be consumed on successful attestation"
+        );
+        // The new path does NOT set the PreAuditExpiry flag — only the
+        // legacy `expire_policy_mirror` does. Audit tooling distinguishes
+        // attested vs legacy expiries via this storage absence + the
+        // ExpiryRequested event presence in the same block.
+        assert!(
+            !pallet_intent_settlement::pallet::PreAuditExpiry::<Testnet>::get(intent_id),
+            "EXPP path MUST NOT flag as pre-audit (only legacy expire_policy_mirror does)"
+        );
     });
 }
