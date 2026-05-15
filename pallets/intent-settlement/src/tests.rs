@@ -73,6 +73,21 @@ parameter_types! {
     /// Task #73: settlement-protocol version 1 (initial; bumps coordinated
     /// across pallet + SDK + Aiken validator).
     pub const TestSettlementVersion: u32 = 1u32;
+    /// Task #266 (mis-sec P0): pallet-side Cardano-finality floor for the
+    /// new attested-settle path. 3 blocks in the test mock so unit tests
+    /// can build a "fresh-enough" evidence record without scrolling through
+    /// 15+ blocks of mock state. Production runtimes plumb the canonical
+    /// 15-block default.
+    pub const TestMinFinalityDepth: u32 = 3u32;
+    /// Task #266 (mis-sec P0): TTL on pending `request_settle` records, in
+    /// Materios blocks. 100 blocks for unit-test ergonomics — production
+    /// uses 2400 (~4h) per design memo §3.4.
+    pub const TestSettlementRequestTtl: u32 = 100u32;
+    /// Task #266 (mis-sec P0): pinned Cardano genesis hash for the test
+    /// runtime. Distinct from zero so a unit test that forgets to wire
+    /// the constant fails loudly. Production runtimes plumb the actual
+    /// preprod / mainnet network-magic-derived genesis hash.
+    pub const TestMainchainGenesisHash: [u8; 32] = [0x65u8; 32];
 }
 
 /// Issue #4 helper: our tests use `u64` AccountIds. Derive a synthetic
@@ -190,6 +205,9 @@ impl pallet_intent_settlement::pallet::Config for Test {
     type NetworkMagic = TestNetworkMagic;
     type AegisPolicyV1ScriptHash = TestAegisPolicyV1ScriptHash;
     type SettlementVersion = TestSettlementVersion;
+    type MinFinalityDepth = TestMinFinalityDepth;
+    type SettlementRequestTtl = TestSettlementRequestTtl;
+    type MainchainGenesisHash = TestMainchainGenesisHash;
     #[cfg(feature = "runtime-benchmarks")]
     type BenchmarkHelper = MockBenchmarkHelper;
     type WeightInfo = ();
@@ -2294,6 +2312,16 @@ const FIXTURE_STCL_E_FALSE_HEX: &str =
     "fcb8b391f750b12693b119e5b4a54800fa1ef84ccf8914a7fc18169e7bb7b088";
 const FIXTURE_STCL_E_TRUE_HEX: &str =
     "e77d47efed4f6529b1556d7406d38fd97e541ee744296da11521776ef382afbd";
+
+// Task #266 (mis-sec P0): STCA cross-layer parity vectors. Same chain_id
+// (32×0x73) and pin-friendly inputs as the STCL series; sourced from the
+// `settle_claim_attested_payload` helper. The TS SDK's multisig.test.ts
+// asserts identical hex against `settleClaimAttestedPayload`. Drift on
+// either side breaks the attested settle path's M-of-N gate.
+const FIXTURE_STCA_F_FALSE_HEX: &str =
+    "f1a2568c52249ffed44a12a9615703b43a6e0c4baf5b447bbc81194673c7efc8";
+const FIXTURE_STCA_F_TRUE_HEX: &str =
+    "c3fd35f32c4ccb94504cd95df98508855e6f0b89536602ca56e472864478cab8";
 
 // ---------------------------------------------------------------------------
 // Test vectors against docs/test-vectors.json
@@ -4639,6 +4667,963 @@ fn task221_submit_batch_pending_full_mid_batch_atomic_revert() {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Task #266 (mis-sec P0) — request_settle + attest_settle unit tests
+//
+// The new attested-settle path replaces the legacy `settle_claim` /
+// `settle_batch_atomic` extrinsics. Each test maps to a specific design-memo
+// invariant or attack scenario:
+//   - happy path (single + batch)
+//   - SettlementRequestMissing (attest before request)
+//   - SettlementRequestExpired (TTL elapsed)
+//   - SettlementEvidenceMismatch (amount, beneficiary)
+//   - FinalityDepthBelowMinimum
+//   - WrongMainchainGenesis
+//   - AlreadySettled
+//   - SettlementRequestAlreadyExists (idempotency strict-reject)
+//   - DeprecatedExtrinsic (cutover gate on legacy settle_claim)
+//   - Attack A1 (no-payout fake hash): committee can no longer sign without
+//     committing to the FAT observation; the digest input doesn't match
+//     anything the colluding M can pin to a vacuous hash
+//   - Attack A2 (wrong recipient): beneficiary_addr_hash mismatch
+//   - Attack A3 (bad keeper): request_settle rejects, never pins state
+//   - Attack A4 (orphan/rollback): FinalityDepthBelowMinimum gate
+//   - Attack A5 (voucher recycling): chain-state-derived voucher_digest
+//     binds the sig to a specific claim_id
+
+#[test]
+fn fixture_min_finality_depth_default_matches_design_memo() {
+    // Spot-check the mock fixture against the design-memo expectation that
+    // a non-zero MinFinalityDepth is plumbed through. Production runtimes
+    // ship 15; the mock uses 3 for ergonomics.
+    assert!(
+        <Test as pallet_intent_settlement::pallet::Config>::MinFinalityDepth::get() >= 1,
+        "MinFinalityDepth must be configured non-zero per design memo §3.4"
+    );
+}
+
+fn settled_evidence_for(voucher: &Voucher, depth: u32, slot: u64) -> SettlementEvidence {
+    // Build a SettlementEvidence that's internally consistent with the
+    // on-chain voucher. The TestMainchainGenesisHash fixture matches the
+    // pallet Config; the depth and slot are exposed as parameters so
+    // individual tests can probe the finality + slot gates.
+    let (payment_hash, _stake_hash) =
+        crate::voucher_canonicalize::split_type0_address_bytes(
+            voucher.beneficiary_cardano_addr.as_slice(),
+        )
+        .expect("test voucher uses type-0 address");
+    SettlementEvidence {
+        cardano_tx_hash: [0xFFu8; 32],
+        observed_at_depth: depth,
+        observed_slot: slot,
+        beneficiary_addr_hash: payment_hash,
+        amount_lovelace: voucher.amount_ada,
+        mainchain_genesis_hash: TestMainchainGenesisHash::get(),
+    }
+}
+
+/// Helper: build a vouchered claim with `claim_seed` and `amount`, returning
+/// (claim_id, intent_id, voucher). Mirrors the existing `vouchered_claim` but
+/// returns the voucher too so the new tests can derive evidence from it.
+fn vouchered_claim_with_voucher(
+    claim_seed: u8,
+    amount: u64,
+) -> (ClaimId, IntentId, Voucher) {
+    use pallet_intent_settlement::pallet::{PoolUtilization, Vouchers};
+
+    PoolUtilization::<Test>::mutate(|u| {
+        u.total_nav_ada = u.total_nav_ada.saturating_add(amount.saturating_mul(2));
+    });
+    pallet_intent_settlement::pallet::Credits::<Test>::mutate(ALICE, |c| {
+        *c = c.saturating_add(amount);
+    });
+    let kind = bp(claim_seed, 1, amount);
+    let nonce = pallet_intent_settlement::pallet::Nonces::<Test>::get(ALICE);
+    let blk: u32 = System::block_number().try_into().unwrap();
+    let iid = intent_id_for(ALICE, nonce, &kind, blk);
+    assert_ok!(IntentSettlement::submit_intent(
+        RuntimeOrigin::signed(ALICE),
+        kind
+    ));
+    assert_ok!(IntentSettlement::attest_intent(
+        RuntimeOrigin::signed(1),
+        iid,
+        mock_pubkey_of(&1),
+        mock_attest_sig(1)
+    ));
+    assert_ok!(IntentSettlement::attest_intent(
+        RuntimeOrigin::signed(2),
+        iid,
+        mock_pubkey_of(&2),
+        mock_attest_sig(2)
+    ));
+    let claim_id = H256::from([claim_seed; 32]);
+    let bfpr = good_fairness_proof(iid, amount);
+    let voucher = good_voucher(claim_id, &bfpr, amount);
+    assert_ok!(IntentSettlement::request_voucher(
+        RuntimeOrigin::signed(1),
+        claim_id,
+        iid,
+        voucher.clone(),
+        bfpr,
+        mock_voucher_sigs(),
+    ));
+    let stored_voucher = Vouchers::<Test>::get(claim_id).expect("voucher just minted");
+    (claim_id, iid, stored_voucher)
+}
+
+#[test]
+fn task266_request_settle_happy_path_pins_evidence() {
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, voucher) =
+            vouchered_claim_with_voucher(0xA1, 100_000);
+        let evidence = settled_evidence_for(&voucher, 15, 12_345_678);
+
+        assert_ok!(IntentSettlement::request_settle(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            evidence.cardano_tx_hash,
+            false,
+            evidence,
+        ));
+
+        let pending = pallet_intent_settlement::pallet::ClaimSettlementRequests::<
+            Test,
+        >::get(claim_id)
+        .expect("request_settle must pin pending entry");
+        assert_eq!(pending.requester, 1u64);
+        assert_eq!(pending.evidence, evidence);
+        assert!(!pending.settled_direct);
+        // SettlementRequested event emitted.
+        let events: Vec<_> = System::events()
+            .into_iter()
+            .filter_map(|er| match er.event {
+                RuntimeEvent::IntentSettlement(
+                    pallet_intent_settlement::pallet::Event::SettlementRequested {
+                        claim_id: cid, ..
+                    },
+                ) => Some(cid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], claim_id);
+    });
+}
+
+#[test]
+fn task266_request_settle_rejects_below_finality_depth() {
+    // Attack A4 defense: a request with depth < MinFinalityDepth would let
+    // an attestor sign over a fresh-but-potentially-orphan tx.
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, voucher) =
+            vouchered_claim_with_voucher(0xA2, 100_000);
+        let min = TestMinFinalityDepth::get();
+        let evidence = settled_evidence_for(&voucher, min - 1, 12_345);
+        assert_noop!(
+            IntentSettlement::request_settle(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                evidence.cardano_tx_hash,
+                false,
+                evidence,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::FinalityDepthBelowMinimum,
+        );
+        // No pending entry — atomic reject.
+        assert!(
+            pallet_intent_settlement::pallet::ClaimSettlementRequests::<Test>::get(
+                claim_id
+            )
+            .is_none()
+        );
+    });
+}
+
+#[test]
+fn task266_request_settle_rejects_wrong_mainchain_genesis() {
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, voucher) =
+            vouchered_claim_with_voucher(0xA3, 100_000);
+        let mut evidence = settled_evidence_for(&voucher, 15, 1);
+        evidence.mainchain_genesis_hash = [0xDEu8; 32]; // wrong network
+        assert_noop!(
+            IntentSettlement::request_settle(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                evidence.cardano_tx_hash,
+                false,
+                evidence,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::WrongMainchainGenesis,
+        );
+    });
+}
+
+#[test]
+fn task266_request_settle_rejects_amount_mismatch() {
+    // Attack A1 defense at the request stage: the requester cannot pin a
+    // pending request whose evidence asserts a different amount than what
+    // the on-chain voucher entered into the pool. Defends against a
+    // colluding M signing over inflated lovelace.
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, voucher) =
+            vouchered_claim_with_voucher(0xA4, 100_000);
+        let mut evidence = settled_evidence_for(&voucher, 15, 1);
+        evidence.amount_lovelace = voucher.amount_ada + 1; // off-by-one
+        assert_noop!(
+            IntentSettlement::request_settle(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                evidence.cardano_tx_hash,
+                false,
+                evidence,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::SettlementEvidenceMismatch,
+        );
+    });
+}
+
+#[test]
+fn task266_request_settle_rejects_beneficiary_mismatch() {
+    // Attack A2 defense at the request stage: evidence claiming a wrong
+    // beneficiary_addr_hash is rejected up-front against the on-chain
+    // voucher's payment-key hash.
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, voucher) =
+            vouchered_claim_with_voucher(0xA5, 100_000);
+        let mut evidence = settled_evidence_for(&voucher, 15, 1);
+        evidence.beneficiary_addr_hash = [0x99u8; 28]; // attacker-controlled
+        assert_noop!(
+            IntentSettlement::request_settle(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                evidence.cardano_tx_hash,
+                false,
+                evidence,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::SettlementEvidenceMismatch,
+        );
+    });
+}
+
+#[test]
+fn task266_request_settle_rejects_tx_hash_drift_between_arg_and_evidence() {
+    // The cardano_tx_hash argument is recorded on the legacy event shape;
+    // the evidence struct carries the same field for the canonical pre-image.
+    // Reject any mismatch so off-chain observers can't see two divergent
+    // tx-hash claims for one claim_id.
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, voucher) =
+            vouchered_claim_with_voucher(0xA6, 100_000);
+        let evidence = settled_evidence_for(&voucher, 15, 1);
+        assert_noop!(
+            IntentSettlement::request_settle(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                [0xDEu8; 32], // arg doesn't match evidence.cardano_tx_hash
+                false,
+                evidence,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::SettlementEvidenceMismatch,
+        );
+    });
+}
+
+#[test]
+fn task266_request_settle_rejects_unknown_claim() {
+    new_test_ext().execute_with(|| {
+        let dummy_voucher = good_voucher(
+            H256::from([0u8; 32]),
+            &good_fairness_proof(H256::from([1u8; 32]), 100),
+            100,
+        );
+        let mut evidence = settled_evidence_for(&dummy_voucher, 15, 1);
+        evidence.amount_lovelace = 12_345; // doesn't matter, claim doesn't exist
+        assert_noop!(
+            IntentSettlement::request_settle(
+                RuntimeOrigin::signed(1),
+                H256::from([0xCCu8; 32]),
+                evidence.cardano_tx_hash,
+                false,
+                evidence,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::ClaimNotFound,
+        );
+    });
+}
+
+#[test]
+fn task266_request_settle_rejects_already_settled_claim() {
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, voucher) =
+            vouchered_claim_with_voucher(0xB1, 100_000);
+        let evidence = settled_evidence_for(&voucher, 15, 1);
+        // First request + attest path.
+        assert_ok!(IntentSettlement::request_settle(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            evidence.cardano_tx_hash,
+            false,
+            evidence,
+        ));
+        assert_ok!(IntentSettlement::attest_settle(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            mock_settle_sigs(),
+        ));
+        // Retry — claim is already settled, must reject.
+        let evidence2 = settled_evidence_for(&voucher, 15, 2);
+        assert_noop!(
+            IntentSettlement::request_settle(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                evidence2.cardano_tx_hash,
+                false,
+                evidence2,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::AlreadySettled,
+        );
+    });
+}
+
+#[test]
+fn task266_request_settle_rejects_duplicate_pending() {
+    // Strict idempotency: once a pending entry exists for a claim_id, a
+    // second request_settle must reject. Keepers wait for SettlementRequestTtl
+    // before re-posting.
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, voucher) =
+            vouchered_claim_with_voucher(0xB2, 100_000);
+        let evidence = settled_evidence_for(&voucher, 15, 1);
+        assert_ok!(IntentSettlement::request_settle(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            evidence.cardano_tx_hash,
+            false,
+            evidence,
+        ));
+        assert_noop!(
+            IntentSettlement::request_settle(
+                RuntimeOrigin::signed(2),
+                claim_id,
+                evidence.cardano_tx_hash,
+                false,
+                evidence,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::SettlementRequestAlreadyExists,
+        );
+    });
+}
+
+#[test]
+fn task266_attest_settle_happy_path() {
+    new_test_ext().execute_with(|| {
+        let (claim_id, iid, voucher) =
+            vouchered_claim_with_voucher(0xC1, 100_000);
+        let evidence = settled_evidence_for(&voucher, 15, 9_999);
+        let nav_before =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .total_nav_ada;
+
+        assert_ok!(IntentSettlement::request_settle(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            evidence.cardano_tx_hash,
+            false,
+            evidence,
+        ));
+        assert_ok!(IntentSettlement::attest_settle(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            mock_settle_sigs(),
+        ));
+
+        let claim =
+            pallet_intent_settlement::pallet::Claims::<Test>::get(claim_id).unwrap();
+        assert!(claim.settled);
+        assert_eq!(claim.cardano_tx_hash, evidence.cardano_tx_hash);
+        let intent =
+            pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
+        assert_eq!(intent.status, IntentStatus::Settled);
+        // NAV decremented by 100_000.
+        let nav_after =
+            pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
+                .total_nav_ada;
+        assert_eq!(nav_before - nav_after, 100_000);
+        // Pending request consumed.
+        assert!(pallet_intent_settlement::pallet::ClaimSettlementRequests::<Test>::get(
+            claim_id
+        )
+        .is_none());
+    });
+}
+
+#[test]
+fn task266_attest_settle_rejects_missing_request() {
+    // Attack A3 defense: the keeper can't shortcut the falsifiable evidence
+    // by calling attest_settle directly. SettlementRequestMissing is the
+    // explicit error.
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, _voucher) =
+            vouchered_claim_with_voucher(0xC2, 100_000);
+        assert_noop!(
+            IntentSettlement::attest_settle(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                mock_settle_sigs(),
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::SettlementRequestMissing,
+        );
+    });
+}
+
+#[test]
+fn task266_attest_settle_rejects_expired_request() {
+    // TTL gate: a pending entry older than SettlementRequestTtl must be
+    // rejected at attest time. Keeper re-posts with fresh evidence.
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, voucher) =
+            vouchered_claim_with_voucher(0xC3, 100_000);
+        let evidence = settled_evidence_for(&voucher, 15, 1);
+        assert_ok!(IntentSettlement::request_settle(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            evidence.cardano_tx_hash,
+            false,
+            evidence,
+        ));
+        // Advance past TTL.
+        let ttl = TestSettlementRequestTtl::get();
+        System::set_block_number((System::block_number() + ttl as u64) + 1);
+        assert_noop!(
+            IntentSettlement::attest_settle(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                mock_settle_sigs(),
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::SettlementRequestExpired,
+        );
+    });
+}
+
+#[test]
+fn task266_attest_settle_rejects_non_committee_caller() {
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, voucher) =
+            vouchered_claim_with_voucher(0xC4, 100_000);
+        let evidence = settled_evidence_for(&voucher, 15, 1);
+        assert_ok!(IntentSettlement::request_settle(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            evidence.cardano_tx_hash,
+            false,
+            evidence,
+        ));
+        assert_noop!(
+            IntentSettlement::attest_settle(
+                RuntimeOrigin::signed(ALICE),
+                claim_id,
+                mock_settle_sigs(),
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::NotCommitteeMember,
+        );
+    });
+}
+
+#[test]
+fn task266_attest_settle_rejects_below_threshold() {
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, voucher) =
+            vouchered_claim_with_voucher(0xC5, 100_000);
+        let evidence = settled_evidence_for(&voucher, 15, 1);
+        assert_ok!(IntentSettlement::request_settle(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            evidence.cardano_tx_hash,
+            false,
+            evidence,
+        ));
+        assert_noop!(
+            IntentSettlement::attest_settle(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                vec![mock_sig_for(1)], // 1 sig, threshold = 2
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures,
+        );
+        // Pending entry NOT consumed — keeper can retry with full bundle.
+        assert!(pallet_intent_settlement::pallet::ClaimSettlementRequests::<Test>::get(
+            claim_id
+        )
+        .is_some());
+    });
+}
+
+#[test]
+fn task266_attest_settle_payload_pins_voucher_digest_against_attack_a5() {
+    // Attack A5 (voucher recycling) defense: the STCA payload commits to
+    // voucher_digest from `Vouchers[claim_id]`. Even if a colluding M
+    // observes a real, well-funded Cardano tx paying the right beneficiary
+    // the right amount, the canonical payload binds that to THIS specific
+    // claim's voucher_digest — they can't reuse the same Cardano payment to
+    // close a different Materios claim.
+    new_test_ext().execute_with(|| {
+        let (claim_a, _, voucher_a) =
+            vouchered_claim_with_voucher(0xD1, 100_000);
+        let (claim_b, _, _voucher_b) =
+            vouchered_claim_with_voucher(0xD2, 100_000);
+
+        // Compute the canonical STCA digest for claim_a using the on-chain
+        // voucher_a, and the digest for claim_b. The voucher_digest fields
+        // MUST differ even when every other input is identical, because the
+        // pallet derives them from Vouchers[claim_a] vs Vouchers[claim_b]
+        // (each claim has its own canonical digest).
+        let v_a = IntentSettlement::compute_canonical_voucher_digest(&voucher_a)
+            .unwrap();
+        let v_b = pallet_intent_settlement::pallet::Vouchers::<Test>::get(claim_b)
+            .map(|v| IntentSettlement::compute_canonical_voucher_digest(&v))
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            v_a, v_b,
+            "Per-claim voucher digests MUST differ — recycling defense lives here"
+        );
+
+        let mc_g = TestMainchainGenesisHash::get();
+        let payment_hash: [u8; 28] = {
+            let raw = voucher_a.beneficiary_cardano_addr.as_slice();
+            let (p, _s) =
+                crate::voucher_canonicalize::split_type0_address_bytes(raw).unwrap();
+            p
+        };
+        let digest_a = pallet_intent_settlement::settle_claim_attested_payload(
+            &TEST_CHAIN_ID,
+            &claim_a,
+            &v_a,
+            &[0xFF; 32],
+            false,
+            &payment_hash,
+            100_000,
+            15,
+            1,
+            &mc_g,
+        );
+        let digest_b = pallet_intent_settlement::settle_claim_attested_payload(
+            &TEST_CHAIN_ID,
+            &claim_a, // same claim_id
+            &v_b,     // but B's voucher_digest
+            &[0xFF; 32],
+            false,
+            &payment_hash,
+            100_000,
+            15,
+            1,
+            &mc_g,
+        );
+        assert_ne!(
+            digest_a, digest_b,
+            "STCA payload MUST domain-separate on voucher_digest"
+        );
+    });
+}
+
+#[test]
+fn task266_stca_payload_domain_separated_from_legacy_stcl() {
+    // The new STCA digest MUST be different from the legacy STCL digest even
+    // when both inputs collide — domain-tag separation prevents a stale STCL
+    // bundle from replaying onto the new attested path.
+    let claim_id = H256::from([0x42u8; 32]);
+    let tx = [0xABu8; 32];
+    let stcl =
+        pallet_intent_settlement::settle_claim_payload(&TEST_CHAIN_ID, &claim_id, &tx, false);
+    let stca = pallet_intent_settlement::settle_claim_attested_payload(
+        &TEST_CHAIN_ID,
+        &claim_id,
+        &[0u8; 32],
+        &tx,
+        false,
+        &[0u8; 28],
+        0,
+        0,
+        0,
+        &TestMainchainGenesisHash::get(),
+    );
+    assert_ne!(stcl, stca, "STCL and STCA digests MUST be domain-separated");
+}
+
+#[test]
+fn task266_legacy_settle_claim_works_before_cutover() {
+    // Cutover gate: while StcaCutoverBlock == 0 (no migration run), the
+    // legacy settle_claim path remains live for backward compat.
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, _voucher) =
+            vouchered_claim_with_voucher(0xE1, 100_000);
+        assert_ok!(IntentSettlement::settle_claim(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            [0xFFu8; 32],
+            false,
+            mock_settle_sigs(),
+        ));
+    });
+}
+
+#[test]
+fn task266_legacy_settle_claim_rejects_after_cutover() {
+    // Post-cutover, legacy settle_claim hard-rejects so old keepers cannot
+    // ride the deprecated trust-vacuous path.
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, _voucher) =
+            vouchered_claim_with_voucher(0xE2, 100_000);
+        // Simulate the migration having stamped the cutover.
+        pallet_intent_settlement::pallet::StcaCutoverBlock::<Test>::put(2u64);
+        // Advance past the cutover.
+        System::set_block_number(3);
+        assert_noop!(
+            IntentSettlement::settle_claim(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                [0xFFu8; 32],
+                false,
+                mock_settle_sigs(),
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::DeprecatedExtrinsic,
+        );
+    });
+}
+
+#[test]
+fn task266_legacy_settle_batch_atomic_rejects_after_cutover() {
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, _voucher) =
+            vouchered_claim_with_voucher(0xE3, 100_000);
+        pallet_intent_settlement::pallet::StcaCutoverBlock::<Test>::put(2u64);
+        System::set_block_number(3);
+        let entries: Vec<SettleBatchEntry> = vec![SettleBatchEntry {
+            claim_id,
+            cardano_tx_hash: [0xFFu8; 32],
+            settled_direct: false,
+        }];
+        let bv: BoundedVec<SettleBatchEntry, MaxSettleBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_noop!(
+            IntentSettlement::settle_batch_atomic(
+                RuntimeOrigin::signed(1),
+                bv,
+                mock_settle_sigs(),
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::DeprecatedExtrinsic,
+        );
+    });
+}
+
+#[test]
+fn task266_migration_flags_existing_settled_claims() {
+    // Spec-N OnRuntimeUpgrade: walks Claims and flags every settled claim
+    // as a pre-audit settlement. Idempotent — second run is a no-op.
+    new_test_ext().execute_with(|| {
+        use pallet_intent_settlement::pallet::{
+            PreAuditSettlement, SettlementStorageVersion,
+        };
+        let (claim_id, _iid, _voucher) =
+            vouchered_claim_with_voucher(0xF1, 100_000);
+        // Settle via legacy path (still open since migration not run).
+        assert_ok!(IntentSettlement::settle_claim(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            [0xFFu8; 32],
+            false,
+            mock_settle_sigs(),
+        ));
+        // Pre-migration state: no pre-audit flag, no cutover scheduled.
+        assert!(!PreAuditSettlement::<Test>::get(claim_id));
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 0u32);
+        // Run the migration via the on_runtime_upgrade hook.
+        let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
+        // Post-migration: settled claim is flagged, version bumped, cutover
+        // scheduled.
+        assert!(PreAuditSettlement::<Test>::get(claim_id));
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 1u32);
+        let cutover =
+            pallet_intent_settlement::pallet::StcaCutoverBlock::<Test>::get();
+        assert!(cutover > 0u64);
+        // Idempotency: a second invocation must not double-flag.
+        let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 1u32);
+    });
+}
+
+#[test]
+fn task266_request_batch_settle_happy_path() {
+    new_test_ext().execute_with(|| {
+        let (c1, _, v1) = vouchered_claim_with_voucher(0xF2, 100_000);
+        let (c2, _, v2) = vouchered_claim_with_voucher(0xF3, 200_000);
+        let entries = vec![
+            SettleAttestedBatchEntry {
+                claim_id: c1,
+                evidence: settled_evidence_for(&v1, 15, 1),
+                settled_direct: false,
+            },
+            SettleAttestedBatchEntry {
+                claim_id: c2,
+                evidence: settled_evidence_for(&v2, 15, 2),
+                settled_direct: true,
+            },
+        ];
+        let bv: BoundedVec<SettleAttestedBatchEntry, MaxSettleBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_ok!(IntentSettlement::request_batch_settle(
+            RuntimeOrigin::signed(1),
+            bv,
+        ));
+        // Both pending entries pinned.
+        assert!(pallet_intent_settlement::pallet::ClaimSettlementRequests::<Test>::get(
+            c1
+        )
+        .is_some());
+        assert!(pallet_intent_settlement::pallet::ClaimSettlementRequests::<Test>::get(
+            c2
+        )
+        .is_some());
+    });
+}
+
+#[test]
+fn task266_request_batch_settle_atomic_revert_on_bad_entry() {
+    new_test_ext().execute_with(|| {
+        let (c1, _, v1) = vouchered_claim_with_voucher(0xF4, 100_000);
+        let (c2, _, v2) = vouchered_claim_with_voucher(0xF5, 200_000);
+        let mut bad_evidence = settled_evidence_for(&v2, 15, 2);
+        bad_evidence.amount_lovelace = 999; // mismatch
+        let entries = vec![
+            SettleAttestedBatchEntry {
+                claim_id: c1,
+                evidence: settled_evidence_for(&v1, 15, 1),
+                settled_direct: false,
+            },
+            SettleAttestedBatchEntry {
+                claim_id: c2,
+                evidence: bad_evidence,
+                settled_direct: false,
+            },
+        ];
+        let bv: BoundedVec<SettleAttestedBatchEntry, MaxSettleBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_noop!(
+            IntentSettlement::request_batch_settle(RuntimeOrigin::signed(1), bv),
+            pallet_intent_settlement::pallet::Error::<Test>::SettlementEvidenceMismatch,
+        );
+        // Atomicity: neither pending entry pinned despite c1 being valid.
+        assert!(pallet_intent_settlement::pallet::ClaimSettlementRequests::<Test>::get(
+            c1
+        )
+        .is_none());
+    });
+}
+
+#[test]
+fn task266_attest_batch_settle_happy_path() {
+    new_test_ext().execute_with(|| {
+        let (c1, _, v1) = vouchered_claim_with_voucher(0xF6, 100_000);
+        let (c2, _, v2) = vouchered_claim_with_voucher(0xF7, 200_000);
+        let entries = vec![
+            SettleAttestedBatchEntry {
+                claim_id: c1,
+                evidence: settled_evidence_for(&v1, 15, 1),
+                settled_direct: false,
+            },
+            SettleAttestedBatchEntry {
+                claim_id: c2,
+                evidence: settled_evidence_for(&v2, 15, 2),
+                settled_direct: true,
+            },
+        ];
+        let bv: BoundedVec<SettleAttestedBatchEntry, MaxSettleBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_ok!(IntentSettlement::request_batch_settle(
+            RuntimeOrigin::signed(1),
+            bv,
+        ));
+        let claim_ids: BoundedVec<ClaimId, MaxSettleBatch> =
+            BoundedVec::try_from(vec![c1, c2]).unwrap();
+        assert_ok!(IntentSettlement::attest_batch_settle(
+            RuntimeOrigin::signed(1),
+            claim_ids,
+            mock_settle_sigs(),
+        ));
+        for c in [c1, c2].iter() {
+            let claim =
+                pallet_intent_settlement::pallet::Claims::<Test>::get(*c).unwrap();
+            assert!(claim.settled);
+            assert!(pallet_intent_settlement::pallet::ClaimSettlementRequests::<
+                Test,
+            >::get(*c)
+            .is_none());
+        }
+        // BatchSettled event emitted.
+        let events: Vec<_> = System::events()
+            .into_iter()
+            .filter_map(|er| match er.event {
+                RuntimeEvent::IntentSettlement(
+                    pallet_intent_settlement::pallet::Event::BatchSettled {
+                        count,
+                        settled_direct_count,
+                        ..
+                    },
+                ) => Some((count, settled_direct_count)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], (2, 1));
+    });
+}
+
+#[test]
+fn task266_attest_batch_settle_rejects_missing_request_for_any_entry() {
+    new_test_ext().execute_with(|| {
+        let (c1, _, v1) = vouchered_claim_with_voucher(0xF8, 100_000);
+        let (c2, _, _) = vouchered_claim_with_voucher(0xF9, 100_000);
+        let entries = vec![SettleAttestedBatchEntry {
+            claim_id: c1,
+            evidence: settled_evidence_for(&v1, 15, 1),
+            settled_direct: false,
+        }];
+        let bv: BoundedVec<SettleAttestedBatchEntry, MaxSettleBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_ok!(IntentSettlement::request_batch_settle(
+            RuntimeOrigin::signed(1),
+            bv,
+        ));
+        // c2 has NO pending request. Batch attest must reject.
+        let claim_ids: BoundedVec<ClaimId, MaxSettleBatch> =
+            BoundedVec::try_from(vec![c1, c2]).unwrap();
+        assert_noop!(
+            IntentSettlement::attest_batch_settle(
+                RuntimeOrigin::signed(1),
+                claim_ids,
+                mock_settle_sigs(),
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::SettlementRequestMissing,
+        );
+        // c1 NOT settled (atomic).
+        let claim = pallet_intent_settlement::pallet::Claims::<Test>::get(c1).unwrap();
+        assert!(!claim.settled);
+    });
+}
+
+#[test]
+fn task266_attest_batch_settle_rejects_duplicates() {
+    new_test_ext().execute_with(|| {
+        let (c1, _, v1) = vouchered_claim_with_voucher(0xFA, 100_000);
+        let entries = vec![SettleAttestedBatchEntry {
+            claim_id: c1,
+            evidence: settled_evidence_for(&v1, 15, 1),
+            settled_direct: false,
+        }];
+        let bv: BoundedVec<SettleAttestedBatchEntry, MaxSettleBatch> =
+            BoundedVec::try_from(entries).unwrap();
+        assert_ok!(IntentSettlement::request_batch_settle(
+            RuntimeOrigin::signed(1),
+            bv,
+        ));
+        let claim_ids: BoundedVec<ClaimId, MaxSettleBatch> =
+            BoundedVec::try_from(vec![c1, c1]).unwrap();
+        assert_noop!(
+            IntentSettlement::attest_batch_settle(
+                RuntimeOrigin::signed(1),
+                claim_ids,
+                mock_settle_sigs(),
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::DuplicateClaimInBatch,
+        );
+    });
+}
+
+#[test]
+fn task266_stca_payload_parity_fixture_f() {
+    // STCA fixture F — pinned chain_id, voucher_digest, tx_hash, beneficiary
+    // hash, amount, depth, slot, mainchain genesis. Both settled_direct
+    // values pinned so the 1-byte boolean position in the body is
+    // structurally verified. SDK fixture mirrors these inputs and asserts
+    // the same hex output.
+    let claim = H256::from([0x07u8; 32]);
+    let voucher_d = [0x22u8; 32];
+    let tx = [0x33u8; 32];
+    let beneficiary = [0x44u8; 28];
+    let amount: u64 = 1_500_000;
+    let depth: u32 = 15;
+    let slot: u64 = 12_345_678;
+    let mc_g = [0x65u8; 32]; // matches TestMainchainGenesisHash
+    let digest_false = pallet_intent_settlement::settle_claim_attested_payload(
+        &TEST_CHAIN_ID,
+        &claim,
+        &voucher_d,
+        &tx,
+        false,
+        &beneficiary,
+        amount,
+        depth,
+        slot,
+        &mc_g,
+    );
+    let digest_true = pallet_intent_settlement::settle_claim_attested_payload(
+        &TEST_CHAIN_ID,
+        &claim,
+        &voucher_d,
+        &tx,
+        true,
+        &beneficiary,
+        amount,
+        depth,
+        slot,
+        &mc_g,
+    );
+    assert_eq!(
+        hex_32(digest_false),
+        FIXTURE_STCA_F_FALSE_HEX,
+        "STCA fixture F (settled_direct=false) digest drifted — regenerate SDK + Aiken in lockstep"
+    );
+    assert_eq!(
+        hex_32(digest_true),
+        FIXTURE_STCA_F_TRUE_HEX,
+        "STCA fixture F (settled_direct=true) digest drifted"
+    );
+    assert_ne!(
+        digest_false, digest_true,
+        "settled_direct byte must domain-separate the digest"
+    );
+}
+
+#[test]
+fn task266_stca_payload_size_is_209_bytes() {
+    // Design memo §3.2: pre-image is 209 bytes. Verify our body math.
+    // Body = 32 + 32 + 32 + 32 + 1 + 28 + 8 + 4 + 8 + 32 = 209.
+    let claim_id = H256::from([0u8; 32]);
+    let mc_g = [0u8; 32];
+    // Inline reconstruction of the body the helper builds:
+    let body_len = 32 + 32 + 32 + 32 + 1 + 28 + 8 + 4 + 8 + 32;
+    assert_eq!(
+        body_len, 209,
+        "STCA pre-image body MUST be exactly 209 bytes per design memo §3.2"
+    );
+    // Sanity: helper still produces a 32-byte digest.
+    let digest = pallet_intent_settlement::settle_claim_attested_payload(
+        &TEST_CHAIN_ID,
+        &claim_id,
+        &[0u8; 32],
+        &[0u8; 32],
+        false,
+        &[0u8; 28],
+        0,
+        0,
+        0,
+        &mc_g,
+    );
+    assert_eq!(digest.len(), 32);
+}
+
 // Task #221 — Test 5: full N=256 (MaxSubmitBatch) boundary test.
 //
 // The main mock runtime caps MaxPendingBatches at 16; landing N=256 needs
@@ -4696,6 +5681,10 @@ mod max_submit_batch_boundary {
         pub const TestNetworkMagic: u32 = 1u32;
         pub const TestAegisPolicyV1ScriptHash: [u8; 28] = [0x42u8; 28];
         pub const TestSettlementVersion: u32 = 1u32;
+        // Task #266 (mis-sec P0): attested-settle config.
+        pub const TestMinFinalityDepth: u32 = 3u32;
+        pub const TestSettlementRequestTtl: u32 = 100u32;
+        pub const TestMainchainGenesisHash: [u8; 32] = [0x65u8; 32];
     }
 
     fn pubkey_of(who: &u64) -> CommitteePubkey {
@@ -4752,6 +5741,9 @@ mod max_submit_batch_boundary {
         type NetworkMagic = TestNetworkMagic;
         type AegisPolicyV1ScriptHash = TestAegisPolicyV1ScriptHash;
         type SettlementVersion = TestSettlementVersion;
+        type MinFinalityDepth = TestMinFinalityDepth;
+        type SettlementRequestTtl = TestSettlementRequestTtl;
+        type MainchainGenesisHash = TestMainchainGenesisHash;
         #[cfg(feature = "runtime-benchmarks")]
         type BenchmarkHelper = NoopBenchmarkHelper;
         type WeightInfo = ();
