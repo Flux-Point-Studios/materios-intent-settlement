@@ -358,7 +358,15 @@ pub mod pallet {
         /// emit `PriceUpdated`. Otherwise emit
         /// `PriceAttestationSubmitted` with the post-insert bundle size.
         #[pallet::call_index(0)]
-        #[pallet::weight(Weight::from_parts(10_000_000, 0))]
+        // Conservative placeholder per /security-review F1 (PR #36) — the
+        // worst-case path runs 1 × sr25519_verify (~50M ref_time alone) +
+        // 4-5 storage reads + 3-4 writes + sort(<=16) + threshold-cross
+        // clear loop. The sister pallet-intent-settlement uses 500M for
+        // sig-verify-bearing extrinsics as its established placeholder
+        // until bench-generated WeightInfo lands. 50_000 proof_size is a
+        // conservative upper bound on the PoV cost of the storage churn.
+        // Phase 1D follow-up: wire `T::WeightInfo` + use bench output.
+        #[pallet::weight(Weight::from_parts(500_000_000, 50_000))]
         pub fn submit_price(
             origin: OriginFor<T>,
             pair_id: PairId,
@@ -539,7 +547,11 @@ pub mod pallet {
         /// 3. `try_push` into `Attestors[pair_id]`; full → `Error::AttestorRegistryFull`.
         /// 4. Emit `AttestorRegistered { pair_id, pubkey }`.
         #[pallet::call_index(1)]
-        #[pallet::weight(Weight::from_parts(10_000_000, 0))]
+        // Conservative placeholder per /security-review F1 (PR #36) — sudo-
+        // gated so block-DoS exposure is lower than `submit_price`, but
+        // the actual work is 1 storage read + 1 try_mutate write + event,
+        // far above 10M. Phase 1D bench-generated WeightInfo replaces.
+        #[pallet::weight(Weight::from_parts(100_000_000, 10_000))]
         pub fn register_attestor(
             origin: OriginFor<T>,
             pair_id: PairId,
