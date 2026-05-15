@@ -1,31 +1,34 @@
-//! # `pallet-oracle` — Materios Oracle Network (MON) Phase 1 scaffolding
+//! # `pallet-oracle` — Materios Oracle Network (MON) Phase 1
 //!
 //! Task #268. Design memo:
 //! `/home/deci/work/mon-phase1-aegis-extend-design.md`.
 //!
-//! ## Scope of this skeleton
+//! ## What ships in this impl PR
 //!
-//! What ships as **real impl** (this PR):
-//! - The canonical PRIC payload helper [`types::submit_price_payload`] —
-//!   byte-exact, cross-team parity anchor for Aegis publishers (Python),
-//!   downstream Aiken validators (PlutusV3 byte slices), and substrate
-//!   verifiers.
-//! - The `PairId` / `PriceObservation` / `PriceFeed` / `AggregationMethod`
-//!   type surface in [`types`].
-//! - The pallet's `Config` / `Event` / `Error` / `Storage` shape so the
-//!   compiler enforces it for the impl PR that follows.
-//! - 5 unit tests in [`tests`] covering payload byte-exactness, the
-//!   pair-id sha256 fixture, threshold storage layout, stale-slot
-//!   rejection, and duplicate-pubkey rejection.
+//! - **`submit_price`** — per-attestor price submission. Validates:
+//!   1. caller's substrate account → pubkey binding via
+//!      `T::AttestorRegistry::pubkey_of`,
+//!   2. pubkey ∈ `Attestors[pair_id]`,
+//!   3. `decimals <= 18`,
+//!   4. sr25519 sig over the canonical PRIC preimage
+//!      (`types::submit_price_payload`) via `sp_io::crypto::sr25519_verify`,
+//!   5. idempotency: `AttestorSubmitted[(pair, slot, pubkey)]` not set,
+//!   6. freshness: `slot_observed >= current_slot - MaxStaleSlots`,
+//!   7. anti-front-run: `slot_observed <= current_slot + MaxFutureSlots`,
+//!   8. monotonicity: `slot_observed > Prices[pair_id].last_update_slot`,
+//!   9. decimals coherence in the pending bundle.
 //!
-//! What ships as **stub** (placeholders for impl in a later PR):
-//! - `submit_price` — validates the public surface (signer is committee
-//!   member, `signatures.len() >= MinAttestorThreshold` once impl lands)
-//!   but currently returns `Ok(())` without state mutation. Threshold-
-//!   crossing logic, sig verification, monotonicity gate, aggregation,
-//!   and event emission all land in the impl PR.
-//! - `register_attestor` — sudo-only stub, returns `Ok(())`. Impl PR adds
-//!   `Attestors[pair_id]` insertion + idempotency.
+//!   On accept: push `(pubkey, price, sig)` into
+//!   `PendingAttestations[(pair_id, slot)]`. If `len() >=
+//!   MinAttestorThreshold` for this slot, compute plain median (v1),
+//!   write `Prices[pair_id]`, clear the pending bundle + per-attestor
+//!   idempotency rows, emit `PriceUpdated`. Otherwise emit
+//!   `PriceAttestationSubmitted`.
+//!
+//! - **`register_attestor`** — sudo-only. Appends `pubkey` to
+//!   `Attestors[pair_id]`. Rejects duplicates with
+//!   `AttestorAlreadyRegistered` and a full roster with
+//!   `AttestorRegistryFull`. Emits `AttestorRegistered`.
 //!
 //! ## Pattern alignment
 //!
@@ -33,6 +36,13 @@
 //! (chain_id-prefixed, blake2_256, plain byte stream not SCALE) so a future
 //! shared `ensure_threshold_signatures` helper can be lifted cleanly across
 //! both pallets without duplicating the sig-verify contract.
+//!
+//! ## Aggregation policy
+//!
+//! v1 ships **plain median** per design memo §3 (or single-value
+//! passthrough at M=1). Trimmed median is explicitly v2 and requires
+//! M ≥ 5 to be useful — out-of-scope for Phase 1 where the Aegis fleet
+//! ships at M=1 → M=3.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -181,16 +191,34 @@ pub mod pallet {
         OptionQuery,
     >;
 
+    /// Decimals witness pinned on the first observation of a
+    /// `(pair_id, slot)` bundle. Subsequent observations for the same slot
+    /// must match this value or the call fails with
+    /// `Error::DecimalsBundleMismatch`. Cleared alongside
+    /// `PendingAttestations` on threshold-cross.
+    ///
+    /// Stored separately (not embedded in `PriceObservation`) so that the
+    /// existing on-disk shape of `PriceObservation { pubkey, price, sig }`
+    /// in the scaffold's `types.rs` is preserved byte-for-byte — the
+    /// design memo §1 storage table doesn't include decimals in the
+    /// observation. The witness map is the minimal extension to enforce
+    /// the cross-attestor decimals coherence rule the design memo
+    /// requires.
+    #[pallet::storage]
+    pub type BundleDecimals<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        (PairId, SlotNumber),
+        u8,
+        OptionQuery,
+    >;
+
     // ---------------------------------------------------------------------
     // Events
     // ---------------------------------------------------------------------
 
-    // The event enum is defined here so the storage/runtime layout is
-    // pinned for the impl PR; the `generate_deposit` helper is omitted
-    // until impl PR (re-add `#[pallet::generate_deposit(pub(super) fn
-    // deposit_event)]` once `submit_price` / `register_attestor` emit
-    // events). Skipping it keeps the v1 stub build warning-free.
     #[pallet::event]
+    #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
         /// Aggregated `PriceFeed` was written. Emitted once per pair per
         /// threshold-crossing slot. `attestor_count` is the number of
@@ -275,6 +303,16 @@ pub mod pallet {
         /// `register_attestor` called when `Attestors[pair_id]` is already
         /// at `MaxAttestors` capacity.
         AttestorRegistryFull,
+        /// The signed origin's substrate account does not bind (via
+        /// `T::AttestorRegistry::pubkey_of`) to the `pubkey` argument in
+        /// `submit_price`. Defends against an attestor's substrate account
+        /// being hijacked to submit prices under a DIFFERENT attestor's
+        /// pubkey + sig.
+        OriginPubkeyMismatch,
+        /// This attestor already submitted for `(pair_id, slot_observed)`.
+        /// Equivocation evidence is collected v2; for v1 the duplicate is
+        /// simply rejected.
+        AlreadySubmitted,
     }
 
     // ---------------------------------------------------------------------
@@ -283,73 +321,256 @@ pub mod pallet {
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        /// Phase 1 stub. Future impl will:
+        /// Per-attestor price submission. See module doc for the full
+        /// validation contract.
         ///
-        /// 1. Validate `decimals <= 18`.
-        /// 2. Validate `pubkey ∈ Attestors[pair_id]` via
-        ///    `T::AttestorRegistry::is_attestor`.
-        /// 3. Build the canonical PRIC payload via
-        ///    [`types::submit_price_payload`] and verify the sig with
-        ///    `sp_io::crypto::sr25519_verify`.
-        /// 4. Reject if `AttestorSubmitted[(pair_id, slot_observed,
-        ///    pubkey)]` is already set (duplicate).
-        /// 5. Reject if `slot_observed < current_slot - MaxStaleSlots` or
-        ///    `slot_observed > current_slot + MaxFutureSlots`.
-        /// 6. Reject if `Prices[pair_id]` exists with `last_update_slot >=
-        ///    slot_observed` (monotonicity).
-        /// 7. Push `(pubkey, price, sig)` into `PendingAttestations[(pair_id,
-        ///    slot_observed)]` and set `AttestorSubmitted[…]`.
-        /// 8. If bundle reached `MinAttestorThreshold`, compute median (v1)
-        ///    or trimmed median (v2), write `Prices[pair_id]`, clear
-        ///    `PendingAttestations[(pair_id, slot_observed)]` and
-        ///    `AttestorSubmitted[…]` rows for this slot, emit
-        ///    `PriceUpdated`. Otherwise emit `PriceAttestationSubmitted`.
+        /// Validation order (any failure rolls back without storage writes):
+        /// 1. `ensure_signed(origin)` returns the caller's substrate account.
+        /// 2. `T::AttestorRegistry::pubkey_of(who) == pubkey` —
+        ///    `Error::OriginPubkeyMismatch` otherwise.
+        /// 3. `decimals <= 18` — `Error::DecimalsOutOfRange` otherwise.
+        /// 4. `Attestors[pair_id].contains(&pubkey)` —
+        ///    `Error::NotAttestor` otherwise. `Attestors[pair_id]` empty →
+        ///    `Error::UnknownPair`.
+        /// 5. `sp_io::crypto::sr25519_verify(sig, PRIC_digest, pubkey)` —
+        ///    `Error::InvalidSignature` otherwise.
+        /// 6. `AttestorSubmitted[(pair_id, slot_observed, pubkey)]` not set
+        ///    — `Error::AlreadySubmitted` otherwise.
+        /// 7. Freshness: current_block.saturating_sub(slot_observed) <=
+        ///    `MaxStaleSlots` — `Error::StaleSubmission` otherwise. We use
+        ///    block-number as the chain-slot proxy until #277 wires
+        ///    `pallet-aura` slot lookup.
+        /// 8. Anti-front-run: slot_observed.saturating_sub(current_block) <=
+        ///    `MaxFutureSlots` — `Error::FutureSubmission` otherwise.
+        /// 9. Monotonicity: `slot_observed > Prices[pair_id].last_update_slot`
+        ///    — `Error::StaleSubmission` otherwise.
+        /// 10. Decimals coherence in the pending bundle: every observation
+        ///     for `(pair_id, slot)` must share the same `decimals`.
+        ///     `Error::DecimalsBundleMismatch` otherwise. We persist
+        ///     `decimals` on the slot's first observation via
+        ///     `BundleDecimals[(pair_id, slot)]`.
         ///
-        /// **Current behaviour:** signature parameters are accepted, no
-        /// state mutation, returns `Ok(())`. Build target: skeleton
-        /// compiles, runtime can wire it as a noop pallet, impl PR fills
-        /// the body atomically.
+        /// On accept: push into `PendingAttestations[(pair_id, slot)]`,
+        /// mark `AttestorSubmitted[…]`. If
+        /// `PendingAttestations[(pair_id, slot)].len() >=
+        /// MinAttestorThreshold`, run aggregation (plain median, v1),
+        /// write `Prices[pair_id]`, clear pending rows for this slot,
+        /// emit `PriceUpdated`. Otherwise emit
+        /// `PriceAttestationSubmitted` with the post-insert bundle size.
         #[pallet::call_index(0)]
-        #[pallet::weight(Weight::from_parts(10_000_000, 0))]
+        // Conservative placeholder per /security-review F1 (PR #36) — the
+        // worst-case path runs 1 × sr25519_verify (~50M ref_time alone) +
+        // 4-5 storage reads + 3-4 writes + sort(<=16) + threshold-cross
+        // clear loop. The sister pallet-intent-settlement uses 500M for
+        // sig-verify-bearing extrinsics as its established placeholder
+        // until bench-generated WeightInfo lands. 50_000 proof_size is a
+        // conservative upper bound on the PoV cost of the storage churn.
+        // Phase 1D follow-up: wire `T::WeightInfo` + use bench output.
+        #[pallet::weight(Weight::from_parts(500_000_000, 50_000))]
         pub fn submit_price(
             origin: OriginFor<T>,
-            _pair_id: PairId,
-            _price: u64,
-            _decimals: u8,
-            _slot_observed: SlotNumber,
-            _pubkey: AttestorPubkey,
-            _sig: AttestorSig,
+            pair_id: PairId,
+            price: u64,
+            decimals: u8,
+            slot_observed: SlotNumber,
+            pubkey: AttestorPubkey,
+            sig: AttestorSig,
         ) -> DispatchResult {
-            // v1 surface: caller is a signed origin (attestor's substrate
-            // account, distinct from `pubkey` which is the sr25519 raw
-            // key — these MUST agree under `T::AttestorRegistry::pubkey_of`,
-            // checked in the impl PR).
-            let _who = ensure_signed(origin)?;
-            // Impl PR replaces this stub. See doc above for the contract
-            // the impl must satisfy.
+            // `Saturating` semantics come from u64::saturating_sub /
+            // saturating_add inherent methods on the integer types
+            // themselves — no trait import needed. Per constraint.
+            let who = ensure_signed(origin)?;
+
+            // (1) origin → pubkey binding
+            ensure!(
+                T::AttestorRegistry::pubkey_of(&who) == pubkey,
+                Error::<T>::OriginPubkeyMismatch
+            );
+
+            // (2) decimals range
+            ensure!(decimals <= 18, Error::<T>::DecimalsOutOfRange);
+
+            // (3) pubkey registered for pair
+            let roster = Attestors::<T>::get(pair_id);
+            ensure!(!roster.is_empty(), Error::<T>::UnknownPair);
+            ensure!(roster.contains(&pubkey), Error::<T>::NotAttestor);
+
+            // (4) sr25519 sig verify over the canonical PRIC payload
+            let chain_id = T::MateriosChainId::get();
+            let digest = types::submit_price_payload(
+                &chain_id, &pair_id, price, decimals, slot_observed,
+            );
+            let pk = sp_core::sr25519::Public::from_raw(pubkey);
+            let sg = sp_core::sr25519::Signature::from_raw(sig);
+            ensure!(
+                sp_io::crypto::sr25519_verify(&sg, &digest, &pk),
+                Error::<T>::InvalidSignature
+            );
+
+            // (5) idempotency: per-attestor, per-(pair, slot)
+            ensure!(
+                !AttestorSubmitted::<T>::contains_key((pair_id, slot_observed, pubkey)),
+                Error::<T>::AlreadySubmitted
+            );
+
+            // (6+7) freshness + anti-front-run. Use the block number as the
+            // chain-slot proxy for v1; #277 plumbs real `pallet-aura` slot.
+            // `BlockNumberFor<T>` is some integer-shaped type; cast via
+            // `saturated_into<u64>()`.
+            let current_block: SlotNumber = {
+                use frame_support::sp_runtime::traits::SaturatedConversion;
+                let n: BlockNumberFor<T> = frame_system::Pallet::<T>::block_number();
+                n.saturated_into::<u64>()
+            };
+            ensure!(
+                current_block.saturating_sub(slot_observed) <= T::MaxStaleSlots::get(),
+                Error::<T>::StaleSubmission
+            );
+            ensure!(
+                slot_observed.saturating_sub(current_block) <= T::MaxFutureSlots::get(),
+                Error::<T>::FutureSubmission
+            );
+
+            // (8) monotonicity vs last aggregated update
+            if let Some(feed) = Prices::<T>::get(pair_id) {
+                ensure!(
+                    slot_observed > feed.last_update_slot,
+                    Error::<T>::StaleSubmission
+                );
+            }
+
+            // (9) decimals coherence in the slot's bundle. If a witness is
+            // recorded (i.e. at least one prior observation landed), the
+            // new submission must match. The witness is set on first
+            // observation and cleared on threshold-cross, so it's the
+            // single source of truth.
+            let bundle_was_empty =
+                BundleDecimals::<T>::get((pair_id, slot_observed)).is_none();
+            if let Some(recorded) = BundleDecimals::<T>::get((pair_id, slot_observed)) {
+                ensure!(decimals == recorded, Error::<T>::DecimalsBundleMismatch);
+            }
+
+            // -----------------------------------------------------------------
+            // All validation passed — mutate state.
+            // -----------------------------------------------------------------
+
+            // Push the observation. `try_mutate` so the BoundedVec push
+            // returns Err if at `MaxAttestors` capacity.
+            PendingAttestations::<T>::try_mutate(
+                pair_id,
+                slot_observed,
+                |bundle| -> DispatchResult {
+                    bundle
+                        .try_push(PriceObservation { pubkey, price, sig })
+                        .map_err(|_| Error::<T>::BundleFull)?;
+                    Ok(())
+                },
+            )?;
+
+            AttestorSubmitted::<T>::insert((pair_id, slot_observed, pubkey), ());
+
+            // Persist decimals on first observation for this (pair, slot).
+            if bundle_was_empty {
+                BundleDecimals::<T>::insert((pair_id, slot_observed), decimals);
+            }
+
+            let bundle_after = PendingAttestations::<T>::get(pair_id, slot_observed);
+            let pending_count = bundle_after.len() as u32;
+            let threshold = T::MinAttestorThreshold::get();
+
+            if pending_count >= threshold {
+                // Aggregate and flip Prices[pair_id].
+                let (agg_price, attestor_set) = aggregate_median::<T>(&bundle_after);
+
+                // Bound attestor_set under MAX_ATTESTORS_PER_PAIR. `roster`
+                // is BoundedVec<_, T::MaxAttestors>; MAX_ATTESTORS_PER_PAIR
+                // is the canonical const that bounds the persisted
+                // `attestor_set` field. The runtime MUST configure
+                // `MaxAttestors == MAX_ATTESTORS_PER_PAIR`; if it doesn't,
+                // we still cap here for safety.
+                let mut bounded_set: BoundedVec<
+                    AttestorPubkey,
+                    ConstU32<MAX_ATTESTORS_PER_PAIR>,
+                > = BoundedVec::new();
+                for pk in attestor_set.iter() {
+                    // Truncation-safe: if MaxAttestors > MAX_ATTESTORS_PER_PAIR,
+                    // we silently cap. This is a runtime-config invariant
+                    // not a hot path.
+                    let _ = bounded_set.try_push(*pk);
+                }
+
+                let feed = PriceFeed {
+                    last_price: agg_price,
+                    last_decimals: decimals,
+                    last_update_slot: slot_observed,
+                    last_update_block: frame_system::Pallet::<T>::block_number(),
+                    aggregation: AggregationMethod::Median,
+                    attestor_set: bounded_set,
+                };
+                Prices::<T>::insert(pair_id, feed);
+
+                // Clear per-attestor idempotency rows for this slot.
+                for obs in bundle_after.iter() {
+                    AttestorSubmitted::<T>::remove((pair_id, slot_observed, obs.pubkey));
+                }
+                // Clear the bundle itself + decimals witness.
+                PendingAttestations::<T>::remove(pair_id, slot_observed);
+                BundleDecimals::<T>::remove((pair_id, slot_observed));
+
+                Self::deposit_event(Event::PriceUpdated {
+                    pair_id,
+                    price: agg_price,
+                    decimals,
+                    observed_at_slot: slot_observed,
+                    attestor_count: pending_count,
+                    aggregation: AggregationMethod::Median,
+                });
+            } else {
+                Self::deposit_event(Event::PriceAttestationSubmitted {
+                    pair_id,
+                    slot_observed,
+                    attestor: pubkey,
+                    pending_count,
+                });
+            }
+
             Ok(())
         }
 
-        /// Phase 1 stub. Sudo-only in v1 — Phase 2 swaps for bonded
-        /// permissionless. Future impl will:
+        /// Sudo-registers an attestor for a pair. v1 only; Phase 2+ swaps
+        /// for bonded permissionless registration.
         ///
+        /// Validation:
         /// 1. `ensure_root(origin)`.
-        /// 2. Reject `Attestors[pair_id].contains(&pubkey)` →
+        /// 2. `Attestors[pair_id].contains(&pubkey)` →
         ///    `Error::AttestorAlreadyRegistered`.
-        /// 3. Push `pubkey` into `Attestors[pair_id]`; bail if full →
-        ///    `Error::AttestorRegistryFull`.
-        /// 4. Emit `AttestorRegistered`.
-        ///
-        /// **Current behaviour:** accepts a root origin, no state mutation,
-        /// returns `Ok(())`. Impl PR fills the body.
+        /// 3. `try_push` into `Attestors[pair_id]`; full → `Error::AttestorRegistryFull`.
+        /// 4. Emit `AttestorRegistered { pair_id, pubkey }`.
         #[pallet::call_index(1)]
-        #[pallet::weight(Weight::from_parts(10_000_000, 0))]
+        // Conservative placeholder per /security-review F1 (PR #36) — sudo-
+        // gated so block-DoS exposure is lower than `submit_price`, but
+        // the actual work is 1 storage read + 1 try_mutate write + event,
+        // far above 10M. Phase 1D bench-generated WeightInfo replaces.
+        #[pallet::weight(Weight::from_parts(100_000_000, 10_000))]
         pub fn register_attestor(
             origin: OriginFor<T>,
-            _pair_id: PairId,
-            _pubkey: AttestorPubkey,
+            pair_id: PairId,
+            pubkey: AttestorPubkey,
         ) -> DispatchResult {
             ensure_root(origin)?;
+
+            Attestors::<T>::try_mutate(pair_id, |roster| -> DispatchResult {
+                ensure!(
+                    !roster.contains(&pubkey),
+                    Error::<T>::AttestorAlreadyRegistered
+                );
+                roster
+                    .try_push(pubkey)
+                    .map_err(|_| Error::<T>::AttestorRegistryFull)?;
+                Ok(())
+            })?;
+
+            Self::deposit_event(Event::AttestorRegistered { pair_id, pubkey });
             Ok(())
         }
     }
@@ -385,4 +606,44 @@ pub mod pallet {
             }
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Aggregation (v1: plain median per design memo §3)
+    // ---------------------------------------------------------------------
+
+    /// Plain median of `bundle.iter().map(|o| o.price)`. v1 aggregation
+    /// per design memo §3 — trimmed median is explicitly v2 (requires
+    /// M ≥ 5 to be useful; Phase 1 ships at M=1 → M=3).
+    ///
+    /// Returns `(median_price, attestor_pubkey_set)`. The set is the same
+    /// length and order as the input bundle; downstream stores it in
+    /// `PriceFeed.attestor_set` for audit + v2 slashing forensics.
+    ///
+    /// At M=1 (single Aegis publisher), the lone observation's price
+    /// passes through unchanged. At M=2 the median is the mean of the
+    /// two — but per design memo `MinAttestorThreshold` defaults to 1
+    /// and bumps to 3 only after the pool grows, so M=2 is a transient
+    /// state we don't optimise for.
+    fn aggregate_median<T: Config>(
+        bundle: &BoundedVec<PriceObservation, <T as Config>::MaxAttestors>,
+    ) -> (u64, alloc::vec::Vec<AttestorPubkey>) {
+        let mut prices: alloc::vec::Vec<u64> = bundle.iter().map(|o| o.price).collect();
+        prices.sort_unstable();
+        let n = prices.len();
+        let median = if n == 0 {
+            0u64
+        } else if n % 2 == 1 {
+            prices[n / 2]
+        } else {
+            // Even count: mean of the two middle values, saturating-add
+            // then halve so we never panic on overflow.
+            let lo = prices[n / 2 - 1];
+            let hi = prices[n / 2];
+            ((lo as u128 + hi as u128) / 2) as u64
+        };
+        let pubkeys: alloc::vec::Vec<AttestorPubkey> =
+            bundle.iter().map(|o| o.pubkey).collect();
+        (median, pubkeys)
+    }
 }
+
