@@ -1326,20 +1326,46 @@ pub mod pallet {
             // If hit, the remaining tail is migrated by a follow-up call
             // (next runtime upgrade or a manual sudo trigger) — flag is
             // additive so a partial migration is recoverable, not stuck.
+            // Production cap = 1024 (single normal-class block at preprod
+            // scale + sub-block at low-thousands settled claims). Tests
+            // override to 2 so the truncation-recovery path can be
+            // exercised with a handful of claims (sec-review LOW #1 +
+            // LOW #2 regression coverage).
+            #[cfg(not(test))]
             const MAX_MIGRATE_CLAIMS: usize = 1024;
+            #[cfg(test)]
+            const MAX_MIGRATE_CLAIMS: usize = 2;
             let mut migrated: usize = 0;
             let mut truncated = false;
             // Flag every already-settled claim as a pre-audit settlement.
+            //
+            // Sec-review LOW #1 recovery fix (PR #33 follow-up): the cap
+            // must count ONLY new flag-writes, not iterations. Without the
+            // skip-already-flagged check below, `Claims::iter()` is
+            // deterministic in hash-order so a truncated re-run would
+            // process the same first 1024 settled claims forever and never
+            // reach the tail. Added `contains_key` skip so the cap consumes
+            // only un-flagged work; combined with the legacy-path flag
+            // from LOW #2, this also correctly skips claims that were
+            // settled-and-flagged in the grace window (no double-write).
             for (claim_id, claim) in Claims::<T>::iter() {
                 if migrated >= MAX_MIGRATE_CLAIMS {
                     truncated = true;
                     break;
                 }
-                if claim.settled {
-                    PreAuditSettlement::<T>::insert(claim_id, true);
-                    total = total.saturating_add(Weight::from_parts(10_000, 0));
-                    migrated = migrated.saturating_add(1);
+                if !claim.settled {
+                    continue;
                 }
+                // Skip already-flagged: prevents the head-spin bug above
+                // AND elides redundant storage writes on legacy-settle
+                // grace-window-flagged claims.
+                if PreAuditSettlement::<T>::contains_key(claim_id) {
+                    continue;
+                }
+                PreAuditSettlement::<T>::insert(claim_id, true);
+                // 1 storage read (contains_key) + 1 write per migrated claim.
+                total = total.saturating_add(Weight::from_parts(15_000, 0));
+                migrated = migrated.saturating_add(1);
             }
             if truncated {
                 // Surface the partial-migration so an operator can re-run
@@ -1350,16 +1376,20 @@ pub mod pallet {
                     migrated_count: migrated as u32,
                 });
             }
-            // Schedule the cutover 50 blocks from now. After this height,
-            // the legacy `settle_claim` + `settle_batch_atomic` extrinsics
-            // hard-reject with `DeprecatedExtrinsic`.
-            let now = <frame_system::Pallet<T>>::block_number();
-            // BlockNumberFor<T> doesn't implement Add<u32> directly; we go
-            // via the saturating bounded-arith helpers from sp-runtime so
-            // we don't blow up tests that burn through block numbers.
-            let cutover =
-                now.saturating_add(BlockNumberFor::<T>::from(STCA_CUTOVER_GRACE));
-            StcaCutoverBlock::<T>::put(cutover);
+            // Schedule the cutover 50 blocks from now, BUT only on the
+            // first migration call. Subsequent calls (whether truncated
+            // or not) must NOT re-write the cutover — otherwise a
+            // truncated re-run pushes the cutover 50 blocks further and
+            // the legacy STCL path stays open forever (sec-review LOW #2).
+            // The `ValueQuery` default of 0 is the "not-yet-scheduled"
+            // sentinel — matches the `ensure_legacy_settle_path_open` gate
+            // at the bottom of the pallet.
+            if StcaCutoverBlock::<T>::get() == BlockNumberFor::<T>::from(0u32) {
+                let now = <frame_system::Pallet<T>>::block_number();
+                let cutover = now
+                    .saturating_add(BlockNumberFor::<T>::from(STCA_CUTOVER_GRACE));
+                StcaCutoverBlock::<T>::put(cutover);
+            }
             if !truncated {
                 SettlementStorageVersion::<T>::put(1u32);
             }

@@ -5368,6 +5368,76 @@ fn task266_migration_flags_existing_settled_claims() {
 }
 
 #[test]
+fn task266_migration_truncation_recovers_to_full_progress() {
+    // Sec-review regression: the pre-fix LOW #1 patch was structurally
+    // broken — re-runs after truncation processed the SAME first
+    // MAX_MIGRATE_CLAIMS settled claims (deterministic hash-order iter,
+    // no skip-already-flagged), never reaching the tail. Combined with
+    // unconditional `StcaCutoverBlock::put`, the cutover would slide
+    // 50 blocks further on every truncated re-run, keeping the legacy
+    // STCL path open forever.
+    //
+    // This test exercises the recovery path with cfg(test)
+    // MAX_MIGRATE_CLAIMS=2 + 3 settled claims so truncation fires AND
+    // the second invocation must reach the third claim AND the
+    // cutover must NOT slide.
+    new_test_ext().execute_with(|| {
+        use pallet_intent_settlement::pallet::{
+            PreAuditSettlement, SettlementStorageVersion, StcaCutoverBlock,
+        };
+        // Create 3 settled claims (one past the test cap of 2).
+        let (c1, _, _) = vouchered_claim_with_voucher(0xC1, 100);
+        let (c2, _, _) = vouchered_claim_with_voucher(0xC2, 100);
+        let (c3, _, _) = vouchered_claim_with_voucher(0xC3, 100);
+        for cid in [c1, c2, c3] {
+            assert_ok!(IntentSettlement::settle_claim(
+                RuntimeOrigin::signed(1),
+                cid,
+                [0xFFu8; 32],
+                false,
+                mock_settle_sigs(),
+            ));
+        }
+        // The LOW #2 grace-window flag means legacy settle ALREADY
+        // flagged all three. Clear the flags to simulate the
+        // pre-LOW#2 pre-upgrade settled state that the migration is
+        // supposed to walk.
+        for cid in [c1, c2, c3] {
+            PreAuditSettlement::<Test>::remove(cid);
+        }
+        // First migration run: hits cap (2 of 3), truncates. Cutover
+        // gets set ONCE here. Version stays 0.
+        let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
+        let flagged_after_1: usize = [c1, c2, c3]
+            .iter()
+            .filter(|cid| PreAuditSettlement::<Test>::get(*cid))
+            .count();
+        assert_eq!(flagged_after_1, 2, "first run hits cap, flags exactly 2");
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 0u32,
+                   "version must stay 0 on truncation");
+        let cutover_after_1 = StcaCutoverBlock::<Test>::get();
+        assert!(cutover_after_1 > 0u64, "cutover scheduled on first run");
+        // Second run: must SKIP the 2 already-flagged, reach the 3rd,
+        // flag it, complete, bump version. Cutover must NOT change.
+        let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
+        let flagged_after_2: usize = [c1, c2, c3]
+            .iter()
+            .filter(|cid| PreAuditSettlement::<Test>::get(*cid))
+            .count();
+        assert_eq!(flagged_after_2, 3, "second run drains tail to full flag set");
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 1u32,
+                   "version bumps once migration is complete");
+        let cutover_after_2 = StcaCutoverBlock::<Test>::get();
+        assert_eq!(cutover_after_1, cutover_after_2,
+                   "cutover MUST NOT slide between runs");
+        // Third run: idempotent — version already 1, early-return.
+        let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
+        assert_eq!(StcaCutoverBlock::<Test>::get(), cutover_after_2);
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 1u32);
+    });
+}
+
+#[test]
 fn task266_request_batch_settle_happy_path() {
     new_test_ext().execute_with(|| {
         let (c1, _, v1) = vouchered_claim_with_voucher(0xF2, 100_000);
