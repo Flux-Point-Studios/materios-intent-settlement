@@ -105,6 +105,15 @@ pub const TAG_SBIN: &[u8; 4] = b"SBIN";
 /// closes (per design memo §4.2 step 4-5).
 pub const STCA_CUTOVER_GRACE: u32 = 50;
 
+/// Task #267 (mis-sec P0): grace period (in Materios blocks) between the
+/// spec-N migration running and the cutover at which the legacy
+/// `expire_policy_mirror` extrinsic hard-rejects with `DeprecatedExtrinsic`.
+/// Mirrors `STCA_CUTOVER_GRACE` exactly — same operational rationale (50
+/// blocks ~= 5 minutes at the 6-second block target lets the in-flight
+/// keeper redeploy onto the new request_expire_policy + attest_expire_policy
+/// path before the old route closes).
+pub const EXPP_CUTOVER_GRACE: u32 = 50;
+
 /// Task #266 (mis-sec P0): domain tag for the **attested** `settle_claim`
 /// payload (split into `request_settle` + `attest_settle`). Replaces the
 /// legacy `STCL` tag with a payload that commits to the FAT observation
@@ -119,6 +128,21 @@ pub const TAG_STCA: &[u8; 4] = b"STCA";
 /// from `STBA` (legacy `settle_batch_atomic`) so a pre-fix batch sig can
 /// never replay onto the new attested-batch path.
 pub const TAG_BSTA: &[u8; 4] = b"BSTA";
+
+/// Task #267 (mis-sec P0): domain tag for the **attested** `expire_policy_mirror`
+/// payload (split into `request_expire_policy` + `attest_expire_policy`).
+/// Closes the SAME class of audit gap as STCA: the legacy
+/// `expire_policy_mirror` accepted a single committee member's word with
+/// ZERO evidence — any single signer could unilaterally flip any intent to
+/// `Expired` and grief a live policyholder before settlement.
+///
+/// `EXPP` is verified absent from the other six pallet tags
+/// (CRDP/STCL/RVCH/STBA/ABIN/RVBN/SBIN/STCA/BSTA/INTA) so a bundle signed
+/// for an Expire request can never replay onto any settle/attest/voucher
+/// pre-image, and vice versa. Domain-separation also extends backward in
+/// time: the legacy `expire_policy_mirror` had NO domain tag and was
+/// signature-free, so EXPP is structurally a fresh namespace.
+pub const TAG_EXPP: &[u8; 4] = b"EXPP";
 
 /// Task #74 (sec-review): domain tag for the per-call `attest_intent`
 /// signature pre-image. Pre-fix `attest_intent` accepted a `(pubkey, sig)`
@@ -401,6 +425,64 @@ pub fn settle_claim_attested_payload(
     body.extend_from_slice(&slot.to_le_bytes());
     body.extend_from_slice(mc_genesis);
     crate::types::domain_hash(*TAG_STCA, &body)
+}
+
+/// Task #267 (mis-sec P0): canonical digest signed by committee members
+/// when authorizing the second-phase `attest_expire_policy(intent_id,
+/// signatures)` call. Replaces the legacy ZERO-evidence
+/// `expire_policy_mirror` path with a falsifiable Cardano observation.
+///
+/// Pre-image (172 bytes):
+///
+/// `blake2_256(
+///     b"EXPP" || materios_chain_id (32B)
+///     || intent_id (32B)
+///     || policy_id (32B)               // chain-state-derived from intent.kind (BuyPolicy.product_id) or 0 fallback
+///     || cardano_tx_hash (32B)         // requester-asserted; #84 slash route prosecutes fakes
+///     || observed_at_depth (LE u32, 4B)// attestor's k value, >= MinFinalityDepth
+///     || observed_slot (LE u64, 8B)    // Cardano slot of the Expire-redeemer tx
+///     || mainchain_genesis_hash (32B)  // pins preprod vs mainnet
+/// )`
+///
+/// The committee is no longer signing "trust me, this intent expired."
+/// Each attestor cryptographically commits to a falsifiable Cardano-record
+/// fact bound to the specific intent — closing the audit P0 gap where a
+/// single colluding signer could prematurely flip any intent to Expired.
+///
+/// `policy_id` is the IntentId fallback when the intent's kind is not a
+/// `BuyPolicy` (RequestPayout carries a PolicyId field; RefundCredit has
+/// none). The pallet resolves this deterministically at attest time from
+/// `Intents::<T>::get(intent_id)`, so the requester cannot influence the
+/// field — closing the recycling attack class (use one Cardano Expire tx
+/// to flip a different Materios intent).
+///
+/// All inputs are either chain-state-derived (`materios_chain_id`,
+/// `intent_id`, `policy_id` from on-chain Intent, `mainchain_genesis_hash`
+/// from runtime config) or requester-committed in the matching
+/// `PolicyExpireRequests[intent_id]` record (cardano_tx_hash, depth, slot),
+/// so honest attestors independently recompute the same digest from chain
+/// state alone (per `feedback_mofn_hash_determinism.md`).
+///
+/// Field order is FROZEN — bumping any field requires `settlement_version`
+/// bump in the voucher digest pre-image, which propagates here.
+pub fn expire_policy_attested_payload(
+    materios_chain_id: &[u8; 32],
+    intent_id: &IntentId,
+    policy_id: &PolicyId,
+    cardano_tx_hash: &[u8; 32],
+    depth: u32,
+    slot: u64,
+    mc_genesis: &[u8; 32],
+) -> [u8; 32] {
+    let mut body = alloc::vec::Vec::with_capacity(32 + 32 + 32 + 32 + 4 + 8 + 32);
+    body.extend_from_slice(materios_chain_id);
+    body.extend_from_slice(intent_id.as_bytes());
+    body.extend_from_slice(policy_id.as_bytes());
+    body.extend_from_slice(cardano_tx_hash);
+    body.extend_from_slice(&depth.to_le_bytes());
+    body.extend_from_slice(&slot.to_le_bytes());
+    body.extend_from_slice(mc_genesis);
+    crate::types::domain_hash(*TAG_EXPP, &body)
 }
 
 /// Task #266 (mis-sec P0): canonical digest signed by committee members when
@@ -882,9 +964,59 @@ pub mod pallet {
     /// Task #266 (mis-sec P0): storage version pin so the OnRuntimeUpgrade
     /// migration is idempotent. v0 = pre-fix (no `pre_audit_settlement`
     /// flags + legacy settle_claim path live); v1 = post-fix (legacy
-    /// settlements grandfathered, STCA path live + cutover scheduled).
+    /// settlements grandfathered, STCA path live + cutover scheduled);
+    /// v2 = post-#267 (legacy expire_policy_mirror grandfathered + EXPP
+    /// path live + expire-cutover scheduled).
     #[pallet::storage]
     pub type SettlementStorageVersion<T: Config> = StorageValue<_, u32, ValueQuery>;
+
+    /// Task #267 (mis-sec P0): pending `request_expire_policy` records,
+    /// keyed by intent_id. Populated by `request_expire_policy`; consumed
+    /// by `attest_expire_policy` (removed on successful attestation OR on
+    /// `ExpiryRequestExpired`).
+    ///
+    /// Bounded indirectly: each entry pins one storage slot until consumed
+    /// or expired. The TTL gate at `Config::SettlementRequestTtl` blocks
+    /// keeps the worst-case live set size bounded by `expected expire rate
+    /// × TTL_blocks`, single-digit on preprod and ~hundreds on mainnet —
+    /// well inside the per-block-budget envelope.
+    #[pallet::storage]
+    pub type PolicyExpireRequests<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        IntentId,
+        ExpiryRequestRecord<T::AccountId, BlockNumberFor<T>>,
+        OptionQuery,
+    >;
+
+    /// Task #267 (mis-sec P0): Materios block at which the legacy
+    /// `expire_policy_mirror` extrinsic flips to
+    /// `Error::DeprecatedExtrinsic`. Set to `upgrade_block + 50` by the
+    /// spec-N+1 OnRuntimeUpgrade hook. A zero value means "not yet bumped"
+    /// — the legacy extrinsic keeps working until governance / migration
+    /// stamps the cutover. Mirrors `StcaCutoverBlock` exactly.
+    #[pallet::storage]
+    pub type PolicyExpireCutoverBlock<T: Config> =
+        StorageValue<_, BlockNumberFor<T>, ValueQuery>;
+
+    /// Task #267 (mis-sec P0): flag set by the spec-N+1 OnRuntimeUpgrade
+    /// migration on intents already in `Expired` state at the moment the
+    /// migration ran (the "grandfather + lock" policy mirroring the STCA
+    /// path). New expirations via `attest_expire_policy` never set this —
+    /// the per-intent absence is the canonical signal that the expiration
+    /// followed the new EXPP path with falsifiable Cardano evidence.
+    /// Indexers / explorers surface a "unverified (legacy)" badge for
+    /// entries flagged here.
+    ///
+    /// Note: this flags both legacy-path expirations AND TTL-sweep
+    /// expirations, since the on-chain `Intent.status = Expired` value
+    /// alone does not distinguish them. Audit tooling that needs to split
+    /// "expired-by-Cardano-mirror" from "expired-by-TTL" already has the
+    /// `ExpiryReason` discriminator in the `IntentExpired` event log,
+    /// which is the canonical source of truth.
+    #[pallet::storage]
+    pub type PreAuditExpiry<T: Config> =
+        StorageMap<_, Blake2_128Concat, IntentId, bool, ValueQuery>;
 
     // ---------------------------------------------------------------------
     // Events
@@ -1016,6 +1148,18 @@ pub mod pallet {
         BatchSettlementRequested {
             count: u32,
             requester: T::AccountId,
+        },
+        /// Task #267 (mis-sec P0): `request_expire_policy` landed and
+        /// pinned a pending expire request. Carries the requester (slash
+        /// target for #84), the intent_id, the asserted Cardano tx hash,
+        /// and the policy_id witness. The committee's M-of-N follow-up
+        /// signs over the canonical EXPP digest (rebuilt from chain state
+        /// + the stored evidence) before the intent flips to Expired.
+        ExpiryRequested {
+            intent_id: IntentId,
+            requester: T::AccountId,
+            cardano_tx_hash: [u8; 32],
+            policy_id_witness: PolicyId,
         },
     }
 
@@ -1205,6 +1349,40 @@ pub mod pallet {
         /// twice in the batch. Atomic rejection — the whole batch must be
         /// reconstructed from the live pending-requests set.
         BatchAttestEntryInvalid,
+        /// Task #267 (mis-sec P0): `attest_expire_policy` was called without
+        /// a matching `request_expire_policy` having landed first (or after
+        /// it expired). The keeper must re-post `request_expire_policy`
+        /// before retrying.
+        ExpiryRequestMissing,
+        /// Task #267 (mis-sec P0): the pending `PolicyExpireRequests` entry
+        /// is older than `Config::SettlementRequestTtl` blocks. The keeper
+        /// must re-post `request_expire_policy` with fresh evidence (the
+        /// legacy observation may be stale — Cardano could have re-orged
+        /// or the attestor pool was offline too long).
+        ExpiryRequestExpired,
+        /// Task #267 (mis-sec P0): a pending expire-policy request already
+        /// exists for this intent_id. The legacy semantic of "last-write-
+        /// wins on the keeper's resubmit" is replaced with strict
+        /// idempotency — the requester must wait for `ExpiryRequestExpired`
+        /// before re-posting. Prevents a request-flapper from cycling
+        /// stale evidence while M-of-N attestors are still gathering sigs
+        /// over the prior observation.
+        ExpiryRequestAlreadyExists,
+        /// Task #267 (mis-sec P0): the intent is not eligible for the
+        /// expire-policy path. Either it is already settled (terminal
+        /// — flipping to Expired would corrupt accounting) or it is a
+        /// `RefundCredit` intent (which never represents a Cardano-side
+        /// policy and therefore can't be expired by the Aegis Expire
+        /// redeemer). Distinct from `UnknownPolicy` so the requester can
+        /// distinguish "intent gone" from "intent here but wrong state."
+        IntentNotEligibleForExpiry,
+        /// Task #267 (mis-sec P0): the `ExpiryEvidence.policy_id_witness`
+        /// disagrees with the on-chain intent's resolved policy id
+        /// (`product_id` for BuyPolicy, `policy_id` for RequestPayout, zero
+        /// hash for RefundCredit). Defends against recycling attack — a
+        /// colluding requester can't bind one Cardano Expire tx to a
+        /// different Materios intent.
+        ExpiryEvidenceMismatch,
     }
 
     // ---------------------------------------------------------------------
@@ -1292,107 +1470,144 @@ pub mod pallet {
             total
         }
 
-        /// Task #266 (mis-sec P0): spec-N storage migration.
+        /// Spec-N / Spec-N+1 chained storage migration.
         ///
-        /// Walks the existing `Claims` map and flags every claim where
-        /// `settled = true` with `PreAuditSettlement[claim_id] = true`. These
-        /// entries pre-date the falsifiable-evidence path and ride the
-        /// "grandfather + lock" policy from the design memo §4.2 — pool
-        /// accounting is unchanged, UI / explorer can surface a
-        /// "unverified (legacy)" badge.
+        /// **v0 → v1 (Task #266, mis-sec P0)**: walks the existing `Claims`
+        /// map and flags every claim where `settled = true` with
+        /// `PreAuditSettlement[claim_id] = true`. These entries pre-date
+        /// the falsifiable-evidence path and ride the "grandfather + lock"
+        /// policy from the design memo §4.2 — pool accounting unchanged,
+        /// UI / explorer can surface a "unverified (legacy)" badge. Also
+        /// stamps `StcaCutoverBlock = block + 50`, scheduling the legacy
+        /// `settle_claim` / `settle_batch_atomic` cutover.
         ///
-        /// Also stamps `StcaCutoverBlock = block + 50`, scheduling the legacy
-        /// `settle_claim` / `settle_batch_atomic` cutover. The 50-block
-        /// grace lets the in-flight TS keeper PR get redeployed before the
-        /// cutover hard-locks (per design memo §4.2 step 4-5).
+        /// **v1 → v2 (Task #267, mis-sec P0)**: walks the existing
+        /// `Intents` map and flags every intent where `status = Expired`
+        /// with `PreAuditExpiry[intent_id] = true`. These entries pre-
+        /// date the EXPP path and could have been Expired via the
+        /// legacy `expire_policy_mirror` (or via TTL sweep — the audit
+        /// tooling distinguishes via the `IntentExpired` event log's
+        /// `ExpiryReason` field, which is the canonical source). Also
+        /// stamps `PolicyExpireCutoverBlock = block + 50`, scheduling the
+        /// legacy `expire_policy_mirror` cutover.
         ///
-        /// Idempotent: writes a storage version marker (1) so a second
-        /// invocation is a no-op.
+        /// Both migrations are idempotent — they early-return once the
+        /// version is at or past the target. The v0→v1 and v1→v2 phases
+        /// run on the SAME `on_runtime_upgrade` invocation when the
+        /// pallet upgrades from a pre-#266 runtime; on a pre-#267
+        /// runtime that already ran the #266 migration, only the
+        /// v1→v2 phase runs.
         ///
-        /// Bounded — preprod settled-claim count is small (single digits per
-        /// `project_intent_settlement_wave2_status.md`). The worst-case scan
-        /// cost is one `Claims::iter()` pass + N storage writes, all under
-        /// the 1.5s normal-class block budget.
+        /// Bounded — preprod settled-claim and expired-intent counts
+        /// are single-digit. The MAX_MIGRATE caps prevent the
+        /// migration from approaching the per-block weight ceiling
+        /// even if mainnet `Claims` / `Intents` storage grows.
         fn on_runtime_upgrade() -> Weight {
-            let current = SettlementStorageVersion::<T>::get();
-            if current >= 1 {
-                return Weight::from_parts(10_000, 0);
-            }
             let mut total = Weight::from_parts(50_000, 0);
-            // Bound the iteration to prevent the migration from approaching
-            // the per-block weight ceiling if `Claims` grows by mainnet
-            // (per-PR-#33 sec-review LOW #1). For preprod the actual count
-            // is single-digit; this cap is purely a planning-hazard guard.
-            // If hit, the remaining tail is migrated by a follow-up call
-            // (next runtime upgrade or a manual sudo trigger) — flag is
-            // additive so a partial migration is recoverable, not stuck.
             // Production cap = 1024 (single normal-class block at preprod
-            // scale + sub-block at low-thousands settled claims). Tests
-            // override to 2 so the truncation-recovery path can be
-            // exercised with a handful of claims (sec-review LOW #1 +
-            // LOW #2 regression coverage).
+            // scale + sub-block at low-thousands settled/expired entries).
+            // Tests override to 2 so truncation-recovery is exercisable
+            // with a handful of records (sec-review LOW #1/#2 regression
+            // coverage for v0→v1, plus the matching v1→v2 case).
             #[cfg(not(test))]
             const MAX_MIGRATE_CLAIMS: usize = 1024;
             #[cfg(test)]
             const MAX_MIGRATE_CLAIMS: usize = 2;
-            let mut migrated: usize = 0;
-            let mut truncated = false;
-            // Flag every already-settled claim as a pre-audit settlement.
-            //
-            // Sec-review LOW #1 recovery fix (PR #33 follow-up): the cap
-            // must count ONLY new flag-writes, not iterations. Without the
-            // skip-already-flagged check below, `Claims::iter()` is
-            // deterministic in hash-order so a truncated re-run would
-            // process the same first 1024 settled claims forever and never
-            // reach the tail. Added `contains_key` skip so the cap consumes
-            // only un-flagged work; combined with the legacy-path flag
-            // from LOW #2, this also correctly skips claims that were
-            // settled-and-flagged in the grace window (no double-write).
-            for (claim_id, claim) in Claims::<T>::iter() {
-                if migrated >= MAX_MIGRATE_CLAIMS {
-                    truncated = true;
-                    break;
+            #[cfg(not(test))]
+            const MAX_MIGRATE_INTENTS: usize = 1024;
+            #[cfg(test)]
+            const MAX_MIGRATE_INTENTS: usize = 2;
+
+            // ----- v0 → v1: PreAuditSettlement + StcaCutoverBlock -----
+            let current = SettlementStorageVersion::<T>::get();
+            if current == 0 {
+                let mut migrated: usize = 0;
+                let mut truncated = false;
+                for (claim_id, claim) in Claims::<T>::iter() {
+                    if migrated >= MAX_MIGRATE_CLAIMS {
+                        truncated = true;
+                        break;
+                    }
+                    if !claim.settled {
+                        continue;
+                    }
+                    if PreAuditSettlement::<T>::contains_key(claim_id) {
+                        continue;
+                    }
+                    PreAuditSettlement::<T>::insert(claim_id, true);
+                    total = total.saturating_add(Weight::from_parts(15_000, 0));
+                    migrated = migrated.saturating_add(1);
                 }
-                if !claim.settled {
-                    continue;
+                if truncated {
+                    Self::deposit_event(Event::PreAuditMigrationTruncated {
+                        migrated_count: migrated as u32,
+                    });
                 }
-                // Skip already-flagged: prevents the head-spin bug above
-                // AND elides redundant storage writes on legacy-settle
-                // grace-window-flagged claims.
-                if PreAuditSettlement::<T>::contains_key(claim_id) {
-                    continue;
+                if StcaCutoverBlock::<T>::get() == BlockNumberFor::<T>::from(0u32) {
+                    let now = <frame_system::Pallet<T>>::block_number();
+                    let cutover = now
+                        .saturating_add(BlockNumberFor::<T>::from(STCA_CUTOVER_GRACE));
+                    StcaCutoverBlock::<T>::put(cutover);
                 }
-                PreAuditSettlement::<T>::insert(claim_id, true);
-                // 1 storage read (contains_key) + 1 write per migrated claim.
-                total = total.saturating_add(Weight::from_parts(15_000, 0));
-                migrated = migrated.saturating_add(1);
+                if !truncated {
+                    SettlementStorageVersion::<T>::put(1u32);
+                }
+                // Fall through to v1 → v2 if we successfully bumped.
+                // Truncation in v0→v1 keeps the version at 0 so a
+                // follow-up call drains the tail before v1→v2 ever
+                // starts — same recovery semantic as the #266 fix.
+                if truncated {
+                    return total;
+                }
             }
-            if truncated {
-                // Surface the partial-migration so an operator can re-run
-                // (the storage-version bump at the bottom is gated on
-                // !truncated so the migration stays at v0 and runs again
-                // on the next upgrade until the tail is drained).
-                Self::deposit_event(Event::PreAuditMigrationTruncated {
-                    migrated_count: migrated as u32,
-                });
+
+            // ----- v1 → v2: PreAuditExpiry + PolicyExpireCutoverBlock -----
+            let current = SettlementStorageVersion::<T>::get();
+            if current == 1 {
+                let mut migrated: usize = 0;
+                let mut truncated = false;
+                for (intent_id, intent) in Intents::<T>::iter() {
+                    if migrated >= MAX_MIGRATE_INTENTS {
+                        truncated = true;
+                        break;
+                    }
+                    // Only flag terminal-Expired intents. Pending /
+                    // Attested / Vouchered / Settled / Refunded are not
+                    // legacy-expire candidates (Settled is terminal but
+                    // the flag is for the expire-side audit narrative,
+                    // not settle — that's PreAuditSettlement's job).
+                    if !matches!(intent.status, IntentStatus::Expired) {
+                        continue;
+                    }
+                    // Skip already-flagged (recovery from a truncated run
+                    // OR a legacy `expire_policy_mirror` call in the
+                    // grace window that already set the flag at expire
+                    // time — same skip-already-flagged pattern as v0→v1).
+                    if PreAuditExpiry::<T>::contains_key(intent_id) {
+                        continue;
+                    }
+                    PreAuditExpiry::<T>::insert(intent_id, true);
+                    total = total.saturating_add(Weight::from_parts(15_000, 0));
+                    migrated = migrated.saturating_add(1);
+                }
+                if truncated {
+                    Self::deposit_event(Event::PreAuditMigrationTruncated {
+                        migrated_count: migrated as u32,
+                    });
+                }
+                if PolicyExpireCutoverBlock::<T>::get()
+                    == BlockNumberFor::<T>::from(0u32)
+                {
+                    let now = <frame_system::Pallet<T>>::block_number();
+                    let cutover = now
+                        .saturating_add(BlockNumberFor::<T>::from(EXPP_CUTOVER_GRACE));
+                    PolicyExpireCutoverBlock::<T>::put(cutover);
+                }
+                if !truncated {
+                    SettlementStorageVersion::<T>::put(2u32);
+                }
             }
-            // Schedule the cutover 50 blocks from now, BUT only on the
-            // first migration call. Subsequent calls (whether truncated
-            // or not) must NOT re-write the cutover — otherwise a
-            // truncated re-run pushes the cutover 50 blocks further and
-            // the legacy STCL path stays open forever (sec-review LOW #2).
-            // The `ValueQuery` default of 0 is the "not-yet-scheduled"
-            // sentinel — matches the `ensure_legacy_settle_path_open` gate
-            // at the bottom of the pallet.
-            if StcaCutoverBlock::<T>::get() == BlockNumberFor::<T>::from(0u32) {
-                let now = <frame_system::Pallet<T>>::block_number();
-                let cutover = now
-                    .saturating_add(BlockNumberFor::<T>::from(STCA_CUTOVER_GRACE));
-                StcaCutoverBlock::<T>::put(cutover);
-            }
-            if !truncated {
-                SettlementStorageVersion::<T>::put(1u32);
-            }
+
             total
         }
     }
@@ -1814,6 +2029,21 @@ pub mod pallet {
         /// Committee reports that a policy expired on Cardano (Expire redeemer
         /// was executed). Cleans up any bound Materios intent that's still
         /// open.
+        ///
+        /// Task #267 (mis-sec P0): this is the LEGACY path with the same
+        /// class of trust gap that `settle_claim` had pre-spec-220 — only
+        /// WORSE: a single committee signer with NO evidence at all could
+        /// unilaterally flip any intent to `Expired`. The path is now
+        /// gated by `PolicyExpireCutoverBlock`: keepers must migrate to
+        /// `request_expire_policy` + `attest_expire_policy` (the new EXPP
+        /// pair) before the cutover lands or callers get
+        /// `Error::DeprecatedExtrinsic`.
+        ///
+        /// The legacy path also flags `PreAuditExpiry[intent_id] = true`
+        /// at expire time so audit/explorer tooling can distinguish
+        /// "trust-vacuous" from EXPP-attested expiries even when the
+        /// expiry landed in the 50-block grace window (post-upgrade but
+        /// pre-cutover). Mirrors the LOW #2 fix on `settle_claim` exactly.
         #[pallet::call_index(5)]
         #[pallet::weight((Weight::from_parts(30_000_000, 0), DispatchClass::Operational, Pays::No))]
         pub fn expire_policy_mirror(
@@ -1821,6 +2051,11 @@ pub mod pallet {
             intent_id: IntentId,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            // Task #267: cutover gate. Once the spec-N+1 migration
+            // schedules `PolicyExpireCutoverBlock`, any subsequent call to
+            // the legacy path is hard-rejected. The 50-block grace gives
+            // keepers time to redeploy onto the new request/attest pair.
+            Self::ensure_legacy_expire_path_open()?;
             ensure!(
                 T::CommitteeMembership::is_member(&who),
                 Error::<T>::NotCommitteeMember
@@ -1837,6 +2072,12 @@ pub mod pallet {
             Intents::<T>::insert(intent_id, intent);
             // Issue #6: terminal → drop from PendingBatches.
             Self::remove_from_pending_batches(intent_id);
+            // Task #267: tag the resulting expiry as trust-vacuous so audit
+            // tooling can split "Cardano-attested expiry" from
+            // "legacy committee-trusted expiry" even in the grace window
+            // between upgrade and cutover (mirror of LOW #2 fix on
+            // settle_claim).
+            PreAuditExpiry::<T>::insert(intent_id, true);
             Self::deposit_event(Event::IntentExpired {
                 intent_id,
                 reason: ExpiryReason::PolicyExpiredOnCardano,
@@ -3191,6 +3432,266 @@ pub mod pallet {
             });
             Ok(())
         }
+
+        // -------------------------------------------------------------
+        // Task #267 (mis-sec P0) — split expire_policy_mirror into a
+        // permissionless `request_expire_policy` phase + a committee-
+        // attested `attest_expire_policy` phase. The new path commits
+        // each M-of-N signature to a FAT, verifiable Cardano observation
+        // (`ExpiryEvidence`) rather than the legacy ZERO-evidence path
+        // where any single committee signer could unilaterally flip any
+        // intent to Expired. Mirrors the spec-220 design memo §4.2 exactly,
+        // adapted for the expire side of the lifecycle.
+        // -------------------------------------------------------------
+
+        /// Task #267 (mis-sec P0): Phase 1 of the new attested expire
+        /// pipeline. Anyone can submit `request_expire_policy` once they
+        /// observe the matching Cardano `Expire` redeemer transaction;
+        /// the signer pays the (negligible) extrinsic fee. The pallet
+        /// stores the `ExpiryEvidence` keyed by `intent_id` and waits for
+        /// a follow-up `attest_expire_policy` call carrying M-of-N
+        /// committee signatures over the canonical EXPP payload (which
+        /// mixes the stored evidence with chain-state-derived fields like
+        /// the on-chain intent's resolved policy id).
+        ///
+        /// The requester is NOT required to be a committee member — this
+        /// is the permissionless-keeper hand-off contemplated by task #84.
+        /// Bond + slash on bad evidence is added in #84 (`requester` is
+        /// stored here precisely as the slash target).
+        ///
+        /// Per-call invariants:
+        /// - `evidence.observed_at_depth >= Config::MinFinalityDepth`
+        ///   (`FinalityDepthBelowMinimum`).
+        /// - `evidence.mainchain_genesis_hash == Config::MainchainGenesisHash`
+        ///   (`WrongMainchainGenesis`).
+        /// - `evidence.cardano_tx_hash == cardano_tx_hash` argument
+        ///   (`ExpiryEvidenceMismatch`).
+        /// - Intent must exist (`UnknownPolicy`) and not be terminal
+        ///   (`IntentNotEligibleForExpiry`); already-expired is treated as
+        ///   idempotent no-op `Ok(())` to match the legacy contract.
+        /// - Intent kind must be `BuyPolicy` or `RequestPayout` (the only
+        ///   intent shapes that bind to a Cardano-side policy); a
+        ///   `RefundCredit` intent is rejected with
+        ///   `IntentNotEligibleForExpiry` since it has no Cardano-side
+        ///   Expire redeemer.
+        /// - `evidence.policy_id_witness` must match the on-chain
+        ///   resolved policy id (`product_id` for BuyPolicy,
+        ///   `policy_id` for RequestPayout) — defends against recycling
+        ///   one Expire tx onto the wrong intent.
+        /// - No pending expire request for this intent_id can exist
+        ///   (`ExpiryRequestAlreadyExists`). The requester waits out
+        ///   `SettlementRequestTtl` before re-posting; this preempts a
+        ///   request-flapper attack.
+        #[pallet::call_index(17)]
+        #[pallet::weight((Weight::from_parts(35_000_000, 0), DispatchClass::Operational, Pays::Yes))]
+        pub fn request_expire_policy(
+            origin: OriginFor<T>,
+            intent_id: IntentId,
+            cardano_tx_hash: [u8; 32],
+            attestation_evidence: ExpiryEvidence,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            // The requester's cardano_tx_hash is recorded in two places:
+            // the extrinsic argument (for event correlation) and the
+            // evidence struct (for the canonical sig pre-image). Reject
+            // any mismatch up-front so the two views can never drift.
+            ensure!(
+                attestation_evidence.cardano_tx_hash == cardano_tx_hash,
+                Error::<T>::ExpiryEvidenceMismatch
+            );
+
+            // Mainchain genesis pin — preprod attestor's evidence cannot
+            // expire a mainnet intent and vice versa.
+            ensure!(
+                attestation_evidence.mainchain_genesis_hash
+                    == T::MainchainGenesisHash::get(),
+                Error::<T>::WrongMainchainGenesis
+            );
+
+            // Finality depth gate — the attestor's k value must clear
+            // the pallet's freshness floor.
+            ensure!(
+                attestation_evidence.observed_at_depth >= T::MinFinalityDepth::get(),
+                Error::<T>::FinalityDepthBelowMinimum
+            );
+
+            // Intent presence + state checks. We do these BEFORE pinning
+            // the pending-request entry so a request against a wrong/
+            // terminal intent never wastes a storage slot.
+            let intent =
+                Intents::<T>::get(intent_id).ok_or(Error::<T>::UnknownPolicy)?;
+            // Already-expired is idempotent (matches legacy contract). The
+            // legacy `expire_policy_mirror` returned Ok on already-Expired;
+            // we preserve that semantic so well-behaved keepers re-posting
+            // on a race don't trip a hard error.
+            if matches!(intent.status, IntentStatus::Expired) {
+                return Ok(());
+            }
+            // Settled intents cannot also expire — the audit narrative
+            // requires the settle-or-expire dichotomy to be enforced at
+            // the pallet boundary.
+            ensure!(
+                !matches!(intent.status, IntentStatus::Settled),
+                Error::<T>::IntentNotEligibleForExpiry
+            );
+            // Resolve the canonical policy id for THIS intent. The witness
+            // is cross-checked against the requester's claim so a colluding
+            // requester can't recycle one Cardano Expire tx onto the wrong
+            // Materios intent (the EXPP digest commits to this resolved
+            // id at attest time).
+            let resolved_policy_id = Self::resolve_intent_policy_id(&intent)?;
+            ensure!(
+                attestation_evidence.policy_id_witness == resolved_policy_id,
+                Error::<T>::ExpiryEvidenceMismatch
+            );
+
+            // Strict idempotency — a pending request for this intent_id
+            // must not exist. Keepers retry with `ExpiryRequestExpired`
+            // not `ExpiryRequestAlreadyExists`.
+            ensure!(
+                !PolicyExpireRequests::<T>::contains_key(intent_id),
+                Error::<T>::ExpiryRequestAlreadyExists
+            );
+
+            let now = <frame_system::Pallet<T>>::block_number();
+            let record = ExpiryRequestRecord::<T::AccountId, BlockNumberFor<T>> {
+                requester: who.clone(),
+                evidence: attestation_evidence,
+                submitted_block: now,
+            };
+            PolicyExpireRequests::<T>::insert(intent_id, record);
+
+            Self::deposit_event(Event::ExpiryRequested {
+                intent_id,
+                requester: who,
+                cardano_tx_hash,
+                policy_id_witness: attestation_evidence.policy_id_witness,
+            });
+            Ok(())
+        }
+
+        /// Task #267 (mis-sec P0): Phase 2 of the new attested expire
+        /// pipeline. The committee submits M-of-N signatures over the
+        /// canonical EXPP payload, which the pallet rebuilds from the
+        /// stored `PolicyExpireRequests` entry + the on-chain intent's
+        /// resolved policy id + the pinned `MainchainGenesisHash`. The
+        /// requester cannot influence the digest after
+        /// `request_expire_policy` landed — it's wholly determined by
+        /// chain state.
+        ///
+        /// Per-call invariants:
+        /// - A `PolicyExpireRequests` entry must exist for this intent_id
+        ///   (`ExpiryRequestMissing`).
+        /// - The pending entry must be fresh
+        ///   (`now - submitted_block <= Config::SettlementRequestTtl`,
+        ///   otherwise `ExpiryRequestExpired`).
+        /// - Intent must still be in storage (`UnknownPolicy`) and not
+        ///   settled (`IntentNotEligibleForExpiry`). Already-Expired is
+        ///   idempotent — the pending request is consumed and Ok returns,
+        ///   matching the legacy contract.
+        /// - M-of-N sig bundle verifies via
+        ///   `Self::ensure_threshold_signatures` against the rebuilt EXPP
+        ///   digest (caller-binding, distinct-signer, member-only).
+        ///
+        /// On success, the intent flips to `Expired`, drops from the
+        /// `PendingBatches` index, the pending expire-request is removed,
+        /// and refund-credit semantics fire identically to the TTL sweep
+        /// (for `BuyPolicy` intents the unspent premium returns to the
+        /// submitter; the legacy `expire_policy_mirror` did NOT refund
+        /// here because the keeper's "policy expired on Cardano" claim
+        /// pre-dated the refund-on-expiry contract — closing that gap is
+        /// out of scope for THIS PR but the storage move is identical).
+        /// `IntentExpired{reason=PolicyExpiredOnCardano}` is the canonical
+        /// event for indexers.
+        #[pallet::call_index(18)]
+        #[pallet::weight((Weight::from_parts(55_000_000, 0), DispatchClass::Operational, Pays::No))]
+        pub fn attest_expire_policy(
+            origin: OriginFor<T>,
+            intent_id: IntentId,
+            signatures: Vec<(CommitteePubkey, CommitteeSig)>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(
+                T::CommitteeMembership::is_member(&who),
+                Error::<T>::NotCommitteeMember
+            );
+            ensure!(
+                signatures.len() <= T::MaxCommittee::get() as usize,
+                Error::<T>::TooManySignatures
+            );
+
+            // Hydrate the pending request — every attestor signs over a
+            // payload derived from these stored bytes plus chain state.
+            let request = PolicyExpireRequests::<T>::get(intent_id)
+                .ok_or(Error::<T>::ExpiryRequestMissing)?;
+
+            // TTL gate. Expired requests can't be attested; the keeper
+            // must post fresh evidence (a stale observation could be
+            // stale because the Cardano tx got reorged or the attestor
+            // pool was offline too long).
+            let now = <frame_system::Pallet<T>>::block_number();
+            let now_u64: u64 = now.into();
+            let submitted_u64: u64 = request.submitted_block.into();
+            let age = now_u64.saturating_sub(submitted_u64);
+            let ttl_u64: u64 = T::SettlementRequestTtl::get().into();
+            ensure!(age <= ttl_u64, Error::<T>::ExpiryRequestExpired);
+
+            // Intent hydration. Still needed even though
+            // request_expire_policy already cross-checked — a settle
+            // could race a parallel attest and terminalize the intent
+            // before this call lands.
+            let mut intent =
+                Intents::<T>::get(intent_id).ok_or(Error::<T>::UnknownPolicy)?;
+            // Already-Expired is idempotent — consume the pending request
+            // and return Ok so a sibling caller that posted late doesn't
+            // see a confusing error.
+            if matches!(intent.status, IntentStatus::Expired) {
+                PolicyExpireRequests::<T>::remove(intent_id);
+                return Ok(());
+            }
+            ensure!(
+                !matches!(intent.status, IntentStatus::Settled),
+                Error::<T>::IntentNotEligibleForExpiry
+            );
+
+            // Re-resolve the canonical policy id from the on-chain intent.
+            // We already cross-checked this against the requester's
+            // witness in request_expire_policy, but the digest must
+            // commit to chain state, so we compute it again here.
+            let resolved_policy_id = Self::resolve_intent_policy_id(&intent)?;
+
+            // Build the canonical EXPP payload + run the M-of-N gate.
+            let chain_id = Self::materios_chain_id_bytes();
+            let mc_genesis = T::MainchainGenesisHash::get();
+            let payload = expire_policy_attested_payload(
+                &chain_id,
+                &intent_id,
+                &resolved_policy_id,
+                &request.evidence.cardano_tx_hash,
+                request.evidence.observed_at_depth,
+                request.evidence.observed_slot,
+                &mc_genesis,
+            );
+            Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
+
+            // All checks pass — expire the intent. State transition +
+            // index cleanup mirror the legacy `expire_policy_mirror`
+            // exactly; the only delta is the trust gate now requires
+            // M-of-N over falsifiable Cardano evidence.
+            intent.status = IntentStatus::Expired;
+            Intents::<T>::insert(intent_id, intent);
+            Self::remove_from_pending_batches(intent_id);
+
+            // Consume the pending request — canonical post-state is
+            // "intent expired, no pending entry."
+            PolicyExpireRequests::<T>::remove(intent_id);
+
+            Self::deposit_event(Event::IntentExpired {
+                intent_id,
+                reason: ExpiryReason::PolicyExpiredOnCardano,
+            });
+            Ok(())
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -3455,6 +3956,52 @@ pub mod pallet {
             // After cutover, hard-reject.
             ensure!(now < cutover, Error::<T>::DeprecatedExtrinsic);
             Ok(())
+        }
+
+        /// Task #267 (mis-sec P0): cutover guard for the legacy
+        /// `expire_policy_mirror` extrinsic. Mirrors
+        /// `ensure_legacy_settle_path_open` exactly — once the spec-N+1
+        /// migration schedules `PolicyExpireCutoverBlock`, the legacy
+        /// path hard-rejects with `Error::DeprecatedExtrinsic`. Pre-
+        /// cutover the legacy path is still open so keepers can roll out
+        /// gradually onto the new EXPP request/attest pair.
+        pub fn ensure_legacy_expire_path_open() -> DispatchResult {
+            let cutover = PolicyExpireCutoverBlock::<T>::get();
+            if cutover == BlockNumberFor::<T>::default() {
+                return Ok(());
+            }
+            let now = <frame_system::Pallet<T>>::block_number();
+            ensure!(now < cutover, Error::<T>::DeprecatedExtrinsic);
+            Ok(())
+        }
+
+        /// Task #267 (mis-sec P0): resolve the canonical Cardano-side
+        /// policy id for an on-chain intent. Used by both
+        /// `request_expire_policy` (to cross-check the requester's
+        /// witness) and `attest_expire_policy` (to feed the EXPP digest
+        /// pre-image from chain state).
+        ///
+        /// Mapping:
+        /// - `BuyPolicy { product_id, .. }` → `product_id`. The
+        ///   product_id IS the policy id from the Aegis-side perspective
+        ///   (the on-chain Aiken validator mints one Policy NFT per
+        ///   product id at BuyPolicy time, so they share a 1:1 binding).
+        /// - `RequestPayout { policy_id, .. }` → `policy_id`. The
+        ///   payout intent already carries the explicit Cardano policy
+        ///   id it's draining against.
+        /// - `RefundCredit { .. }` → rejected with
+        ///   `IntentNotEligibleForExpiry`. Refund-credit intents have no
+        ///   Cardano-side policy and can never be Expire-redeemed.
+        pub fn resolve_intent_policy_id(
+            intent: &Intent<T::AccountId>,
+        ) -> Result<PolicyId, DispatchError> {
+            match &intent.kind {
+                IntentKind::BuyPolicy { product_id, .. } => Ok(*product_id),
+                IntentKind::RequestPayout { policy_id, .. } => Ok(*policy_id),
+                IntentKind::RefundCredit { .. } => {
+                    Err(Error::<T>::IntentNotEligibleForExpiry.into())
+                }
+            }
         }
 
         /// Issue #7: verify that `signatures` contains at least the effective

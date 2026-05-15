@@ -411,3 +411,70 @@ pub struct SettleAttestedBatchEntry {
     pub evidence: SettlementEvidence,
     pub settled_direct: bool,
 }
+
+// ---------------------------------------------------------------------------
+// Task #267 (mis-sec P0): expiry evidence + pending expire-request record
+// ---------------------------------------------------------------------------
+
+/// Falsifiable observation of a Cardano `Expire` redeemer transaction, posted
+/// by the requester in `request_expire_policy`. The committee's
+/// `attest_expire_policy` later signs over a digest that pins to this exact
+/// evidence + the on-chain `policy_id`, so each M-of-N signature commits to a
+/// verifiable Cardano fact instead of the trust-vacuous "trust me, it
+/// expired" claim that the legacy `expire_policy_mirror` accepted (a single
+/// committee signer with ZERO evidence).
+///
+/// Per design memo §3.3, none of these fields are recomputed off chain state
+/// at attest time — they are the requester's claim. The runtime cross-checks
+/// `mainchain_genesis_hash` against the pinned `MainchainGenesisHash` runtime
+/// constant (preprod vs mainnet pinning) and `observed_at_depth` against
+/// `MinFinalityDepth`. The `policy_id_witness` field is cross-checked against
+/// the on-chain intent's resolved policy id so the requester cannot bind an
+/// expire observation to the wrong intent (recycling defense). Future task
+/// #84 ships a permissionless slash route that lets a watcher prove
+/// `cardano_tx_hash` / `observed_slot` are fraudulent.
+#[derive(
+    Clone, Copy, Encode, Decode, TypeInfo, MaxEncodedLen, RuntimeDebug, PartialEq, Eq,
+)]
+pub struct ExpiryEvidence {
+    /// 32-byte Cardano transaction hash of the `Expire` redeemer that
+    /// closed this policy on the Aegis-side validator.
+    pub cardano_tx_hash: [u8; 32],
+    /// How many Cardano blocks deep the requester observed the tx at the
+    /// moment the evidence was assembled. Must be >= `Config::MinFinalityDepth`
+    /// or `request_expire_policy` rejects.
+    pub observed_at_depth: u32,
+    /// Cardano slot of the expiring tx (the slot of the block it landed in).
+    pub observed_slot: u64,
+    /// 32-byte Cardano genesis hash (preprod vs mainnet vs preview).
+    /// Cross-checked against `Config::MainchainGenesisHash` at request time
+    /// so a preprod sig bundle can never expire a mainnet intent or vice
+    /// versa.
+    pub mainchain_genesis_hash: [u8; 32],
+    /// 32-byte witness of the policy id the requester observed expiring on
+    /// Cardano. Cross-checked against the on-chain intent's resolved policy
+    /// id at request time. For `BuyPolicy` intents this is
+    /// `intent.kind.product_id`; for `RequestPayout` intents this is
+    /// `intent.kind.policy_id`. For `RefundCredit` intents this field MUST
+    /// be the zero hash (refund-credit intents are not Cardano-side
+    /// policies; expire-policy is structurally inapplicable).
+    pub policy_id_witness: PolicyId,
+}
+
+/// Phase 1 → Phase 2 handoff record for `request_expire_policy` →
+/// `attest_expire_policy`. Generic over `AccountId` and `BlockNumber` so the
+/// storage map can be keyed by the runtime's concrete types. The requester
+/// field is the slash target hook for #84 (bond + slash); the submitted_block
+/// field gates the TTL check.
+#[derive(Clone, Encode, Decode, TypeInfo, MaxEncodedLen, RuntimeDebug, PartialEq, Eq)]
+pub struct ExpiryRequestRecord<AccountId, BlockNumber> {
+    /// Originator of the `request_expire_policy` call. Pays the extrinsic
+    /// fee and is the slash target for future #84 watcher dispatches.
+    pub requester: AccountId,
+    /// The falsifiable observation the requester committed to.
+    pub evidence: ExpiryEvidence,
+    /// Materios block number when the request was submitted. The pallet
+    /// rejects `attest_expire_policy` calls older than
+    /// `Config::SettlementRequestTtl` blocks via `ExpiryRequestExpired`.
+    pub submitted_block: BlockNumber,
+}
