@@ -596,13 +596,60 @@ pub fn attest_intent_payload(
     crate::types::domain_hash(*TAG_INTA, &body)
 }
 
+/// Task #84 (mis-sec P1): canonical digest signed by committee members when
+/// authorizing a `slash_bad_settlement_evidence(claim_id, fraud_proof,
+/// signatures)` call. The committee is attesting that the watcher's
+/// `fraud_proof` is truthful — i.e., that the requester's stored
+/// `SettlementEvidence` lied about a falsifiable Cardano fact.
+///
+/// Pre-image:
+///
+/// `blake2_256(b"FRAU" || materios_chain_id (32B)
+///             || claim_id (32B) || scale(fraud_proof))`
+///
+/// The SCALE encoding of `FraudProof` carries the discriminant + variant
+/// fields (e.g., `actual_lovelace` for `WrongAmount`), so each committee
+/// signature commits to the *specific* alleged fraud rather than a vacuous
+/// "evidence is wrong" claim. Same domain-separation property as the rest
+/// of the pallet's M-of-N tags: a FRAU sig cannot replay onto an STCL /
+/// STCA / EXPP / etc. payload because the prefix bytes differ in the
+/// blake2 pre-image.
+///
+/// Per `feedback_mofn_hash_determinism.md`: chain_id is chain-derived,
+/// claim_id is the public extrinsic argument, fraud_proof is the public
+/// extrinsic argument. No operator-local state appears in the pre-image,
+/// so honest committee members independently recompute the same digest.
+pub fn slash_bad_settlement_evidence_payload(
+    materios_chain_id: &[u8; 32],
+    claim_id: &ClaimId,
+    fraud_proof: &FraudProof,
+) -> [u8; 32] {
+    let encoded = fraud_proof.encode();
+    let mut body = alloc::vec::Vec::with_capacity(32 + 32 + encoded.len());
+    body.extend_from_slice(materios_chain_id);
+    body.extend_from_slice(claim_id.as_bytes());
+    body.extend_from_slice(&encoded);
+    crate::types::domain_hash(*TAG_FRAU, &body)
+}
+
 #[frame_support::pallet]
 pub mod pallet {
     use super::*;
     use alloc::vec::Vec;
-    use frame_support::{pallet_prelude::*, BoundedVec};
+    use frame_support::{
+        pallet_prelude::*,
+        traits::{tokens::BalanceStatus, Currency, ReservableCurrency},
+        BoundedVec, PalletId,
+    };
     use frame_system::pallet_prelude::*;
-    use sp_runtime::traits::Saturating;
+    use sp_runtime::traits::{AccountIdConversion, Saturating, Zero};
+
+    /// Task #84 (mis-sec P1): currency-balance alias for the bond surface.
+    /// Aliased here so the pallet body can stay in terms of `BalanceOf<T>`
+    /// without restating the full associated-type chain at every call site.
+    pub type BalanceOf<T> = <<T as Config>::Currency as Currency<
+        <T as frame_system::Config>::AccountId,
+    >>::Balance;
 
     // ---------------------------------------------------------------------
     // Config
@@ -757,6 +804,51 @@ pub mod pallet {
         /// runtime and vice versa.
         #[pallet::constant]
         type MainchainGenesisHash: Get<[u8; 32]>;
+
+        /// Task #84 (mis-sec P1): reservable-currency surface used by
+        /// `post_settlement_bond` / `release_settlement_bond` /
+        /// `slash_bad_settlement_evidence`. In prod this wires to the
+        /// runtime's native balances (`pallet_balances`); in tests we wire
+        /// the same `pallet_balances` against the mock runtime.
+        type Currency: ReservableCurrency<Self::AccountId>;
+
+        /// Task #84 (mis-sec P1): basis-point share of a slashed bond paid
+        /// out to the watcher who proved the fraud. `5000` (= 50%) is the
+        /// test default and the design-memo §6 #9 starting point;
+        /// governance-tunable post-launch. Values outside `[0, 10_000]`
+        /// are clamped at the call site so a misconfigured runtime can
+        /// never pay out more than the bond.
+        #[pallet::constant]
+        type SlashWatcherShareBps: Get<u32>;
+
+        /// Task #84 (mis-sec P1): minimum number of Materios blocks that
+        /// must elapse between `attest_settle` landing and
+        /// `release_settlement_bond` succeeding. Production runtimes plumb
+        /// `2 * MinFinalityDepth` (so Cardano has had two finality windows
+        /// to surface any reorg before the bond is returned). Tests use
+        /// `30` (= 2 × the mock's 15-block min finality scaled up so
+        /// `release_settlement_bond_rejects_too_early` can be exercised
+        /// inside a single block-stepped harness).
+        #[pallet::constant]
+        type BondReleaseDelayBlocks: Get<u32>;
+
+        /// Task #84 (mis-sec P1): minimum bond a requester must reserve
+        /// via `post_settlement_bond` for the call to succeed. Defaulting
+        /// to zero keeps the bond opt-in (matches the design memo §5.2
+        /// "opt-in by default" property); production runtimes can bump
+        /// this via governance once a credible MATRA-denominated value
+        /// surface lands.
+        #[pallet::constant]
+        type MinSettlementBond: Get<u128>;
+
+        /// Task #84 (mis-sec P1): pallet-id used to derive the treasury
+        /// account that receives the non-watcher share of a slashed bond
+        /// via `repatriate_reserved`. Per the task spec, production
+        /// runtimes wire this to `PalletId(*b"mat/trsy")` so the
+        /// slashed-bond destination matches the Materios treasury
+        /// convention.
+        #[pallet::constant]
+        type SettlementTreasuryPalletId: Get<PalletId>;
     }
 
     /// Bench-only setup hook (see `Config::BenchmarkHelper`).
@@ -1018,6 +1110,78 @@ pub mod pallet {
     pub type PreAuditExpiry<T: Config> =
         StorageMap<_, Blake2_128Concat, IntentId, bool, ValueQuery>;
 
+    /// Task #84 (mis-sec P1): tombstone set for claims whose bond was
+    /// slashed via `slash_bad_settlement_evidence`. The presence of an
+    /// entry blocks a re-attest, re-bond, or release attempt on the same
+    /// claim — once a watcher has prosecuted a fraudulent settlement
+    /// request, the requester cannot re-post the same claim_id under a
+    /// fresh evidence record nor recover the bond. Acts as the
+    /// "slashed-no-release" gate referenced by `BondSlashedNoRelease`.
+    ///
+    /// Bounded indirectly: only `slash_bad_settlement_evidence` inserts,
+    /// and the call requires a successful M-of-N round + an internally-
+    /// consistent fraud proof, so the live set tracks actual prosecuted
+    /// fraud events — single-digit on preprod, ~tens worst case on
+    /// mainnet.
+    #[pallet::storage]
+    pub type BondSlashedRequests<T: Config> =
+        StorageMap<_, Blake2_128Concat, ClaimId, (), OptionQuery>;
+
+    /// Task #84 (mis-sec P1): per-claim Materios block at which the
+    /// matching `ClaimSettlementRequests` entry was attested via
+    /// `attest_settle` (i.e., the claim flipped to `settled`). Required by
+    /// `release_settlement_bond` so the `BondReleaseDelayBlocks` gate has
+    /// a concrete attested-at value to compare against — pinning this at
+    /// attest time avoids re-deriving from a downstream `Claim` mutation.
+    ///
+    /// Set ONLY when a bond was previously posted (i.e., the matching
+    /// request's `bond_amount > 0`). New attest_settle calls on
+    /// non-bonded requests never write this storage — saves a slot.
+    #[pallet::storage]
+    pub type BondedClaimAttestedAt<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        ClaimId,
+        BlockNumberFor<T>,
+        OptionQuery,
+    >;
+
+    /// Task #84 (mis-sec P1): per-claim `(requester, bond_amount)` side
+    /// record pinned at attest time when the matching request carried a
+    /// positive bond. The pending `ClaimSettlementRequests` entry is
+    /// consumed by `attest_settle`, so we need a separate slot to keep
+    /// the unreserve target + amount visible to
+    /// `release_settlement_bond` (which can be called by anyone). Pruned
+    /// on successful release or successful slash.
+    #[pallet::storage]
+    pub type BondedClaimRequester<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        ClaimId,
+        (T::AccountId, u128),
+        OptionQuery,
+    >;
+
+    /// Task #84 (mis-sec P1): cursor that tracks which claim_ids the
+    /// v2→v3 migration walk has already rewritten. Used to drive
+    /// truncation-recovery — the second `on_runtime_upgrade` invocation
+    /// after a truncated first run reads this set and skips the rows
+    /// already touched, so the version bump deterministically reaches
+    /// the tail without re-processing the head. Cleared once v2→v3
+    /// completes; never written outside the migration path.
+    ///
+    /// Bound: `MAX_SETTLE_BATCH` is the per-block envelope; on mainnet
+    /// the live pending-request set is bounded by the keeper-throughput
+    /// times TTL, which stays under 256 in steady state. A larger
+    /// pending set would force more than one chunked migration block,
+    /// which is exactly the recovery property we're preserving.
+    #[pallet::storage]
+    pub type BondMigrationProgress<T: Config> = StorageValue<
+        _,
+        BoundedVec<ClaimId, ConstU32<MAX_SETTLE_BATCH>>,
+        ValueQuery,
+    >;
+
     // ---------------------------------------------------------------------
     // Events
     // ---------------------------------------------------------------------
@@ -1160,6 +1324,45 @@ pub mod pallet {
             requester: T::AccountId,
             cardano_tx_hash: [u8; 32],
             policy_id_witness: PolicyId,
+        },
+        /// Task #84 (mis-sec P1): the requester reserved `amount` of
+        /// `Config::Currency` against an existing
+        /// `ClaimSettlementRequests` entry via `post_settlement_bond`. The
+        /// matching record's `bond_amount` field is rewritten to the
+        /// supplied amount; release happens via
+        /// `release_settlement_bond` (after the delay) or
+        /// `slash_bad_settlement_evidence` (on prosecuted fraud).
+        SettlementBondPosted {
+            claim_id: ClaimId,
+            requester: T::AccountId,
+            amount: u128,
+        },
+        /// Task #84 (mis-sec P1): a `slash_bad_settlement_evidence` call
+        /// succeeded. The reserved bond is split: `watcher_share` units
+        /// go to the caller (the watcher who posted the fraud proof);
+        /// `treasury_share` units go to the
+        /// `SettlementTreasuryPalletId`-derived treasury account. The
+        /// `fraud_proof` discriminant is surfaced so explorers can
+        /// distinguish WrongAmount vs TxNotFound vs WrongBeneficiary
+        /// without re-decoding the pre-image.
+        SettlementBondSlashed {
+            claim_id: ClaimId,
+            requester: T::AccountId,
+            watcher: T::AccountId,
+            watcher_share: u128,
+            treasury_share: u128,
+            fraud_proof: FraudProof,
+        },
+        /// Task #84 (mis-sec P1): a `release_settlement_bond` call
+        /// succeeded — the requester's reserved units are unreserved and
+        /// returned to their free balance. Emits in both the
+        /// requester-initiated and the keeper-initiated release path
+        /// (anyone can call once the delay has elapsed and the request
+        /// wasn't slashed).
+        SettlementBondReleased {
+            claim_id: ClaimId,
+            requester: T::AccountId,
+            amount: u128,
         },
     }
 
@@ -1383,6 +1586,77 @@ pub mod pallet {
         /// colluding requester can't bind one Cardano Expire tx to a
         /// different Materios intent.
         ExpiryEvidenceMismatch,
+        /// Task #84 (mis-sec P1): `release_settlement_bond` /
+        /// `slash_bad_settlement_evidence` was called on a request whose
+        /// `bond_amount == 0` — no reserved funds to act on. Requesters
+        /// must call `post_settlement_bond` first; pre-#84 records
+        /// migrated from v2 land with `bond_amount = 0` so this error
+        /// surfaces cleanly.
+        BondNotReserved,
+        /// Task #84 (mis-sec P1): `post_settlement_bond` was called a
+        /// second time against the same claim. Bonds are single-shot —
+        /// the requester picks one amount and commits. Re-bonding would
+        /// either require unreserving the prior amount (race window with
+        /// a watcher) or stacking reserves (NAV double-counting), so we
+        /// hard-reject.
+        BondAlreadyReserved,
+        /// Task #84 (mis-sec P1): `release_settlement_bond` was called
+        /// before `BondReleaseDelayBlocks` had elapsed since the matching
+        /// `attest_settle`. The delay gives the Cardano side a
+        /// reorg-survival window to surface late-arriving fraud; releasing
+        /// inside the window would let a colluding requester un-collateralise
+        /// before a watcher can prosecute.
+        BondReleaseTooEarly,
+        /// Task #84 (mis-sec P1): the watcher's `FraudProof` variant is
+        /// internally inconsistent with the stored evidence. Examples:
+        /// `WrongAmount { actual_lovelace = X }` where `X` already
+        /// matches `stored.amount_lovelace` (no actual fraud being
+        /// alleged); `WrongBeneficiary { actual_payment_hash = H }`
+        /// where `H` already matches `stored.beneficiary_addr_hash`.
+        /// `TxNotFound` is never internally inconsistent — it's always
+        /// a valid negative claim subject to the committee's M-of-N
+        /// confirmation.
+        FraudProofInvalid,
+        /// Task #84 (mis-sec P1): `slash_bad_settlement_evidence` was
+        /// posted with fewer distinct, valid M-of-N committee
+        /// signatures than the configured threshold. Surfaced
+        /// explicitly so a watcher can tell "the chain is healthy, my
+        /// bundle just lacked sigs" from "the chain rejected this
+        /// outright." Reuses the same threshold (`ensure_threshold_signatures`)
+        /// as `attest_settle` — same trust assumption.
+        FraudThresholdNotMet,
+        /// Task #84 (mis-sec P1): `post_settlement_bond` was called on
+        /// a claim whose pending request has already been attested via
+        /// `attest_settle` (claim flipped to settled, pending entry
+        /// removed). Bonds MUST be posted *before* the attest lands so
+        /// they're enforceable against the falsifiable evidence the
+        /// committee just signed.
+        RequestAlreadyAttested,
+        /// Task #84 (mis-sec P1): `release_settlement_bond` was called
+        /// on a claim whose bond was already slashed (it's in
+        /// `BondSlashedRequests`). Slashed bonds are permanently
+        /// repatriated to watcher + treasury; the requester has no
+        /// further claim on them.
+        BondSlashedNoRelease,
+        /// Task #84 (mis-sec P1): `post_settlement_bond` was called by
+        /// an origin that does not match the `requester` field on the
+        /// stored `ClaimSettlementRequests` entry. Only the original
+        /// requester can post a bond against their own request — there
+        /// is no use case for a third party bonding someone else's
+        /// claim.
+        NotRequester,
+        /// Task #84 (mis-sec P1): `post_settlement_bond` was called with
+        /// an `amount` below `Config::MinSettlementBond`. The minimum
+        /// bond floor stops a requester from posting a notional bond
+        /// (e.g., 1 unit) just to claim the audit narrative of being
+        /// "bonded" while economically not at risk.
+        BondBelowMinimum,
+        /// Task #84 (mis-sec P1): the supplied bond amount overflowed
+        /// the runtime's `Balance` type at conversion time. Surfaced
+        /// distinctly from a general arithmetic error so the requester
+        /// can tell their `u128` input simply doesn't fit the chain's
+        /// configured balance width.
+        BondAmountConversionOverflow,
     }
 
     // ---------------------------------------------------------------------
@@ -1605,6 +1879,93 @@ pub mod pallet {
                 }
                 if !truncated {
                     SettlementStorageVersion::<T>::put(2u32);
+                }
+                // Same chained-fall-through gate as v0→v1: if we
+                // truncated, hold the version at 1 so the next
+                // `on_runtime_upgrade` invocation drains the tail
+                // before v2→v3 ever starts.
+                if truncated {
+                    return total;
+                }
+            }
+
+            // ----- v2 → v3: SettlementRequestRecord gains bond_amount ---
+            //
+            // Task #84 (mis-sec P1): the on-disk shape of
+            // `SettlementRequestRecord` grew one field (`bond_amount: u128`,
+            // LAST so the SCALE prefix is additive). Pre-#84 records
+            // serialise as 4-field tuples; once the runtime loads the new
+            // pallet binary, the decoder canonicalises them to the new
+            // 5-field shape with `bond_amount: 0` automatically (additive
+            // SCALE migration — the trailing field is absent so the
+            // codec rejects, then we re-encode each row explicitly).
+            //
+            // Walk `ClaimSettlementRequests` in bounded chunks, tracking
+            // progress via a cursor `BondMigrationCursor` so a truncated
+            // run can pick up where it left off without re-processing
+            // the head. Cap is per-block, so the migration drains the
+            // tail across N blocks for any realistic pending-set size.
+            //
+            // For preprod scale (single-digit pending requests) this is
+            // a no-op past the version bump. The cap keeps a runaway
+            // pending-set on mainnet honest.
+            #[cfg(not(test))]
+            const MAX_MIGRATE_REQUESTS: usize = 1024;
+            #[cfg(test)]
+            const MAX_MIGRATE_REQUESTS: usize = 2;
+            let current = SettlementStorageVersion::<T>::get();
+            if current == 2 {
+                let mut migrated: usize = 0;
+                let mut truncated = false;
+                // Cursor of already-rewritten keys. Persisted across
+                // truncated runs so the second invocation skips the
+                // head and reaches the tail (same recovery semantic
+                // as v0→v1's skip-already-flagged pattern).
+                let mut processed = BondMigrationProgress::<T>::get();
+                let keys: alloc::vec::Vec<ClaimId> = ClaimSettlementRequests::<
+                    T,
+                >::iter_keys()
+                .collect();
+                for cid in keys {
+                    if migrated >= MAX_MIGRATE_REQUESTS {
+                        truncated = true;
+                        break;
+                    }
+                    if processed.iter().any(|k| k == &cid) {
+                        continue;
+                    }
+                    let existing = match ClaimSettlementRequests::<T>::get(cid) {
+                        Some(r) => r,
+                        None => continue, // raced away — fine
+                    };
+                    // Canonical zero-value rewrite. If a prior
+                    // `post_settlement_bond` already set the field
+                    // (impossible pre-v3, defensive for re-runs after
+                    // an upgrade cycle), preserve it.
+                    let preserved_bond = existing.bond_amount;
+                    ClaimSettlementRequests::<T>::insert(
+                        cid,
+                        SettlementRequestRecord::<T::AccountId, BlockNumberFor<T>> {
+                            requester: existing.requester,
+                            evidence: existing.evidence,
+                            settled_direct: existing.settled_direct,
+                            submitted_block: existing.submitted_block,
+                            bond_amount: preserved_bond,
+                        },
+                    );
+                    let _ = processed.try_push(cid);
+                    total = total.saturating_add(Weight::from_parts(15_000, 0));
+                    migrated = migrated.saturating_add(1);
+                }
+                // Persist progress (or clear on completion).
+                if truncated {
+                    BondMigrationProgress::<T>::put(processed);
+                    Self::deposit_event(Event::PreAuditMigrationTruncated {
+                        migrated_count: migrated as u32,
+                    });
+                } else {
+                    BondMigrationProgress::<T>::kill();
+                    SettlementStorageVersion::<T>::put(3u32);
                 }
             }
 
@@ -3001,12 +3362,23 @@ pub mod pallet {
                 Error::<T>::SettlementRequestAlreadyExists
             );
 
+            // Task #84 (mis-sec P1): bond starts at zero — opt-in via the
+            // separate `post_settlement_bond` extrinsic so we don't bump
+            // request_settle's transaction_version. A request landing on a
+            // tombstoned (`BondSlashedRequests`) claim is hard-rejected so
+            // a slashed requester can't re-pin the same claim_id.
+            ensure!(
+                !BondSlashedRequests::<T>::contains_key(claim_id),
+                Error::<T>::BondSlashedNoRelease
+            );
+
             let now = <frame_system::Pallet<T>>::block_number();
             let record = SettlementRequestRecord::<T::AccountId, BlockNumberFor<T>> {
                 requester: who.clone(),
                 evidence: attestation_evidence,
                 settled_direct,
                 submitted_block: now,
+                bond_amount: 0u128,
             };
             ClaimSettlementRequests::<T>::insert(claim_id, record);
 
@@ -3149,6 +3521,24 @@ pub mod pallet {
                 u.total_nav_ada = u.total_nav_ada.saturating_sub(amount);
             });
 
+            // Task #84 (mis-sec P1): if a bond was posted on this
+            // request, pin the attested-at block + a (requester, amount)
+            // side record so the release-delay gate + unreserve target
+            // are visible to `release_settlement_bond` after the
+            // pending `ClaimSettlementRequests` row is removed below.
+            // Storage writes are conditional on `bond_amount > 0` so the
+            // un-bonded (legacy / opt-out) path costs zero extra slots.
+            if request.bond_amount > 0 {
+                BondedClaimAttestedAt::<T>::insert(
+                    claim_id,
+                    <frame_system::Pallet<T>>::block_number(),
+                );
+                BondedClaimRequester::<T>::insert(
+                    claim_id,
+                    (request.requester.clone(), request.bond_amount),
+                );
+            }
+
             // Consume the pending request — the canonical post-state is
             // "claim settled, no pending entry."
             ClaimSettlementRequests::<T>::remove(claim_id);
@@ -3248,6 +3638,16 @@ pub mod pallet {
                         Error::<T>::SettlementRequestAlreadyExists
                     );
 
+                    // Task #84 (mis-sec P1): batch entries land
+                    // un-bonded. The watcher slash path requires a
+                    // separate `post_settlement_bond` per claim, which
+                    // is the contract for the legacy single-call shape
+                    // too. Slashed-tombstone gate: refuse if this
+                    // claim_id was previously prosecuted.
+                    ensure!(
+                        !BondSlashedRequests::<T>::contains_key(entry.claim_id),
+                        Error::<T>::BondSlashedNoRelease
+                    );
                     let record = SettlementRequestRecord::<
                         T::AccountId,
                         BlockNumberFor<T>,
@@ -3256,6 +3656,7 @@ pub mod pallet {
                         evidence: entry.evidence,
                         settled_direct: entry.settled_direct,
                         submitted_block: now,
+                        bond_amount: 0u128,
                     };
                     ClaimSettlementRequests::<T>::insert(entry.claim_id, record);
                 }
@@ -3334,6 +3735,11 @@ pub mod pallet {
                 alloc::vec::Vec::with_capacity(n);
             let mut hydrated_intent_ids: alloc::vec::Vec<IntentId> =
                 alloc::vec::Vec::with_capacity(n);
+            // Task #84 (mis-sec P1): per-entry bond amount so the batch
+            // can pin `BondedClaimAttestedAt` at attest time for entries
+            // that opted in via `post_settlement_bond`.
+            let mut hydrated_bonds: alloc::vec::Vec<u128> =
+                alloc::vec::Vec::with_capacity(n);
             for cid in claim_ids.iter() {
                 let request = ClaimSettlementRequests::<T>::get(*cid)
                     .ok_or(Error::<T>::SettlementRequestMissing)?;
@@ -3370,6 +3776,7 @@ pub mod pallet {
                 hydrated_amounts.push(claim.amount_ada);
                 hydrated_direct.push(request.settled_direct);
                 hydrated_intent_ids.push(claim.intent_id);
+                hydrated_bonds.push(request.bond_amount);
             }
 
             // ONE sig-verify pass over the canonical BSTA digest — the
@@ -3407,6 +3814,27 @@ pub mod pallet {
                             Intents::<T>::insert(intent_id, intent);
                         }
                         Self::remove_from_pending_batches(intent_id);
+                        // Task #84 (mis-sec P1): pin attested-at block +
+                        // (requester, amount) side-record for bonded
+                        // entries so the release-delay gate + unreserve
+                        // target resolve later. We re-read the pending
+                        // request to grab the requester field (cheaper
+                        // than threading it through hydrated_* vecs and
+                        // matches the single-call site's shape).
+                        if hydrated_bonds[idx] > 0 {
+                            BondedClaimAttestedAt::<T>::insert(
+                                *cid,
+                                <frame_system::Pallet<T>>::block_number(),
+                            );
+                            if let Some(pending) =
+                                ClaimSettlementRequests::<T>::get(*cid)
+                            {
+                                BondedClaimRequester::<T>::insert(
+                                    *cid,
+                                    (pending.requester, hydrated_bonds[idx]),
+                                );
+                            }
+                        }
                         ClaimSettlementRequests::<T>::remove(*cid);
                         if settled_direct {
                             direct_count = direct_count.saturating_add(1);
@@ -3689,6 +4117,385 @@ pub mod pallet {
             Self::deposit_event(Event::IntentExpired {
                 intent_id,
                 reason: ExpiryReason::PolicyExpiredOnCardano,
+            });
+            Ok(())
+        }
+
+        // -------------------------------------------------------------
+        // Task #84 (mis-sec P1) — bond + slash on settlement evidence
+        //
+        // Three new extrinsics that bolt onto the spec-220 `request_settle`
+        // + `attest_settle` pair. The bond is OPT-IN — the requester
+        // chooses to reserve `amount` of `Config::Currency` via
+        // `post_settlement_bond`. A watcher who proves the requester's
+        // evidence is fraudulent via `slash_bad_settlement_evidence`
+        // earns `SlashWatcherShareBps / 10_000` of the bond; the rest
+        // goes to the treasury. After `BondReleaseDelayBlocks` post-
+        // attestation with no slash, the requester (or any caller)
+        // releases the bond.
+        //
+        // No surface mutation on `request_settle` — the design avoids
+        // bumping `transaction_version` so in-flight keeper txs stay
+        // valid. Same shape as spec-220's B+D split: ADD new
+        // extrinsics, do not mutate old ones.
+        // -------------------------------------------------------------
+
+        /// Task #84 (mis-sec P1): the requester reserves `amount` of
+        /// `Config::Currency` against an outstanding `request_settle`
+        /// entry. The reserve is enforceable by
+        /// `slash_bad_settlement_evidence` until either
+        /// `release_settlement_bond` returns it (post-attestation,
+        /// post-delay) or a watcher prosecutes the fraud.
+        ///
+        /// Per-call invariants:
+        /// - Caller must match the request's `requester` field
+        ///   (`NotRequester`).
+        /// - Pending request must exist (`SettlementRequestMissing`).
+        /// - `amount >= Config::MinSettlementBond` (`BondBelowMinimum`).
+        /// - Request must not already be bonded
+        ///   (`BondAlreadyReserved`).
+        /// - Claim must not already be attested (`RequestAlreadyAttested`)
+        ///   — bonds MUST be posted before `attest_settle` lands.
+        /// - Claim must not be in `BondSlashedRequests`
+        ///   (`BondSlashedNoRelease`).
+        ///
+        /// On success: `Currency::reserve(who, amount)` succeeds,
+        /// `ClaimSettlementRequests[claim_id].bond_amount` is rewritten
+        /// to `amount`, and `SettlementBondPosted` is emitted.
+        #[pallet::call_index(19)]
+        #[pallet::weight((Weight::from_parts(500_000_000, 0), DispatchClass::Operational, Pays::Yes))]
+        pub fn post_settlement_bond(
+            origin: OriginFor<T>,
+            claim_id: ClaimId,
+            amount: u128,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+
+            // Slash-tombstone gate — a slashed claim cannot be re-
+            // bonded. The matching `ClaimSettlementRequests` row was
+            // removed by the slash dispatch, so this guard is the
+            // only place we surface the tombstone meaningfully (the
+            // SettlementRequestMissing path below would also fire,
+            // but BondSlashedNoRelease is the more precise error).
+            ensure!(
+                !BondSlashedRequests::<T>::contains_key(claim_id),
+                Error::<T>::BondSlashedNoRelease
+            );
+
+            let mut record = ClaimSettlementRequests::<T>::get(claim_id)
+                .ok_or(Error::<T>::SettlementRequestMissing)?;
+
+            // Caller-binding: only the original requester can bond
+            // their own request. A third party bonding someone else's
+            // request would let them lock the requester into an
+            // economic position they didn't choose.
+            ensure!(record.requester == who, Error::<T>::NotRequester);
+            // Single-shot: bonds cannot stack. The design memo §6 #9
+            // contemplates a single bond amount per request — re-bonding
+            // would either race with a watcher or double-reserve.
+            ensure!(record.bond_amount == 0, Error::<T>::BondAlreadyReserved);
+            // Minimum-bond floor.
+            ensure!(
+                amount >= T::MinSettlementBond::get(),
+                Error::<T>::BondBelowMinimum
+            );
+            // Bonds MUST land before attest_settle. Once the claim has
+            // flipped to settled (and the pending request consumed),
+            // the storage map no longer has the entry, so the
+            // SettlementRequestMissing path above handles that case;
+            // this guard catches the rarer case where the claim was
+            // attested via a race-window batch path but the pending
+            // request was *not* removed (defensive). It also matches
+            // the design memo's contract: bond → request → attest.
+            if let Some(claim) = Claims::<T>::get(claim_id) {
+                ensure!(!claim.settled, Error::<T>::RequestAlreadyAttested);
+            }
+
+            // Convert u128 → BalanceOf<T>. We use saturating coercion
+            // via `TryInto`; an overflow surfaces as
+            // `BondAmountConversionOverflow` rather than silently
+            // truncating to `Balance::max_value()`.
+            let balance: BalanceOf<T> = amount
+                .try_into()
+                .map_err(|_| Error::<T>::BondAmountConversionOverflow)?;
+
+            T::Currency::reserve(&who, balance)?;
+
+            record.bond_amount = amount;
+            ClaimSettlementRequests::<T>::insert(claim_id, record);
+
+            Self::deposit_event(Event::SettlementBondPosted {
+                claim_id,
+                requester: who,
+                amount,
+            });
+            Ok(())
+        }
+
+        /// Task #84 (mis-sec P1): the watcher posts a `FraudProof`
+        /// against an outstanding `request_settle` entry. M-of-N
+        /// committee signatures over the canonical FRAU digest attest
+        /// the watcher's claim is truthful; the reserved bond is split
+        /// `SlashWatcherShareBps / 10_000` to the watcher and the rest
+        /// to the treasury PalletId-derived account.
+        ///
+        /// Per-call invariants:
+        /// - Pending request must exist (`SettlementRequestMissing`).
+        /// - Pending request must be bonded (`BondNotReserved`).
+        /// - `fraud_proof` must be internally consistent with the
+        ///   stored evidence (`FraudProofInvalid`) — e.g., a
+        ///   `WrongAmount { actual_lovelace = X }` proof requires
+        ///   `X != stored.amount_lovelace`.
+        /// - `signatures` must clear the same M-of-N threshold
+        ///   `attest_settle` uses (`FraudThresholdNotMet`).
+        /// - `signatures` must verify against the canonical FRAU
+        ///   pre-image (`InvalidSignature` — surfaced by
+        ///   `ensure_threshold_signatures`).
+        /// - Caller binding: the watcher's own pubkey MUST appear in
+        ///   the sig bundle (`ensure_threshold_signatures` enforces).
+        ///
+        /// On success: the bond is repatriated via
+        /// `Currency::repatriate_reserved` (watcher gets
+        /// `bond * watcher_bps / 10_000`, treasury gets the rest),
+        /// `BondSlashedRequests[claim_id]` is set, the
+        /// `ClaimSettlementRequests` row is removed (so
+        /// `attest_settle` errors with `SettlementRequestMissing`),
+        /// and `SettlementBondSlashed` is emitted.
+        #[pallet::call_index(20)]
+        #[pallet::weight((Weight::from_parts(500_000_000, 0), DispatchClass::Operational, Pays::No))]
+        pub fn slash_bad_settlement_evidence(
+            origin: OriginFor<T>,
+            claim_id: ClaimId,
+            fraud_proof: FraudProof,
+            signatures: Vec<(CommitteePubkey, CommitteeSig)>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            // Cap sigs len BEFORE any verify cycle — same DoS-gate
+            // pattern as `attest_settle` (Task #75).
+            ensure!(
+                signatures.len() <= T::MaxCommittee::get() as usize,
+                Error::<T>::TooManySignatures
+            );
+
+            // Threshold pre-check so the watcher gets the explicit
+            // FraudThresholdNotMet rather than the generic
+            // InsufficientSignatures error from ensure_threshold_signatures
+            // — distinct UX for the slash path. We still let
+            // ensure_threshold_signatures do the per-sig verify and the
+            // caller-binding gate.
+            let effective_threshold = {
+                let stored = MinSignerThreshold::<T>::get();
+                let base = if stored == 0 {
+                    T::DefaultMinSignerThreshold::get()
+                } else {
+                    stored
+                };
+                base.max(1)
+            };
+            ensure!(
+                signatures.len() as u32 >= effective_threshold,
+                Error::<T>::FraudThresholdNotMet
+            );
+
+            // Hydrate the pending request.
+            let record = ClaimSettlementRequests::<T>::get(claim_id)
+                .ok_or(Error::<T>::SettlementRequestMissing)?;
+
+            // Bond-presence gate.
+            ensure!(record.bond_amount > 0, Error::<T>::BondNotReserved);
+
+            // Internal-consistency check on the fraud proof. The
+            // canonical contract: `WrongAmount` / `WrongBeneficiary`
+            // must allege a value DIFFERENT from what the requester
+            // committed to (otherwise there's no fraud being alleged).
+            // `TxNotFound` is always internally consistent — the proof
+            // is the absence of the asserted tx_hash on Cardano,
+            // which the committee's M-of-N attests.
+            match fraud_proof {
+                FraudProof::WrongAmount { actual_lovelace } => {
+                    ensure!(
+                        actual_lovelace
+                            != (record.evidence.amount_lovelace as u128),
+                        Error::<T>::FraudProofInvalid
+                    );
+                }
+                FraudProof::WrongBeneficiary { actual_payment_hash } => {
+                    ensure!(
+                        actual_payment_hash
+                            != record.evidence.beneficiary_addr_hash,
+                        Error::<T>::FraudProofInvalid
+                    );
+                }
+                FraudProof::TxNotFound => { /* always internally consistent */ }
+            }
+
+            // Build the canonical FRAU pre-image and run the M-of-N
+            // gate (caller-binding, distinct-signer, member-only,
+            // per-sig sr25519 verify) — same routine attest_settle
+            // uses.
+            let chain_id = Self::materios_chain_id_bytes();
+            let payload =
+                slash_bad_settlement_evidence_payload(&chain_id, &claim_id, &fraud_proof);
+            Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
+
+            // Compute the watcher / treasury split. We clamp the bps
+            // input into `[0, 10_000]` defensively — a misconfigured
+            // runtime that returned 12_000 would otherwise pay the
+            // watcher more than the bond. Clamp keeps the invariant
+            // `watcher_share + treasury_share == bond_amount`.
+            let raw_bps = T::SlashWatcherShareBps::get();
+            let clamped_bps = raw_bps.min(10_000u32);
+            // u128 math throughout — bond_amount is u128 by the type
+            // contract on SettlementRequestRecord.
+            let bond_u128 = record.bond_amount;
+            let watcher_share_u128: u128 = bond_u128
+                .saturating_mul(clamped_bps as u128)
+                / 10_000u128;
+            let treasury_share_u128: u128 = bond_u128
+                .saturating_sub(watcher_share_u128);
+
+            let requester = record.requester.clone();
+            let treasury_account: T::AccountId =
+                T::SettlementTreasuryPalletId::get().into_account_truncating();
+
+            // Convert u128 shares → BalanceOf<T>. We try_into both so a
+            // misconfigured runtime fails LOUDLY rather than silently
+            // truncating.
+            let watcher_balance: BalanceOf<T> = watcher_share_u128
+                .try_into()
+                .map_err(|_| Error::<T>::BondAmountConversionOverflow)?;
+            let treasury_balance: BalanceOf<T> = treasury_share_u128
+                .try_into()
+                .map_err(|_| Error::<T>::BondAmountConversionOverflow)?;
+
+            // Atomic phase: repatriate both halves under one storage
+            // layer so a partial slash doesn't leave funds in a
+            // half-reserved state.
+            frame_support::storage::with_storage_layer::<
+                (),
+                sp_runtime::DispatchError,
+                _,
+            >(|| {
+                if !watcher_balance.is_zero() {
+                    T::Currency::repatriate_reserved(
+                        &requester,
+                        &who,
+                        watcher_balance,
+                        BalanceStatus::Free,
+                    )?;
+                }
+                if !treasury_balance.is_zero() {
+                    T::Currency::repatriate_reserved(
+                        &requester,
+                        &treasury_account,
+                        treasury_balance,
+                        BalanceStatus::Free,
+                    )?;
+                }
+                Ok(())
+            })?;
+
+            // Tombstone + cleanup. Removing the pending request makes
+            // attest_settle error with SettlementRequestMissing, which
+            // is the canonical post-state per the design memo.
+            BondSlashedRequests::<T>::insert(claim_id, ());
+            ClaimSettlementRequests::<T>::remove(claim_id);
+
+            Self::deposit_event(Event::SettlementBondSlashed {
+                claim_id,
+                requester,
+                watcher: who,
+                watcher_share: watcher_share_u128,
+                treasury_share: treasury_share_u128,
+                fraud_proof,
+            });
+            Ok(())
+        }
+
+        /// Task #84 (mis-sec P1): release a posted bond. Typically the
+        /// requester calls this themselves; the dispatch is permissionless
+        /// (`ensure_signed` only) so a keeper / explorer can release on
+        /// the requester's behalf if the requester is offline.
+        ///
+        /// Per-call invariants:
+        /// - Claim must have been attested (the
+        ///   `BondedClaimAttestedAt` map carries the per-claim
+        ///   attestation block) — surfaced as `BondNotReserved` if no
+        ///   bond entry was ever pinned.
+        /// - At least `BondReleaseDelayBlocks` Materios blocks must
+        ///   have elapsed since the attest_settle landed
+        ///   (`BondReleaseTooEarly`).
+        /// - Claim must not be in `BondSlashedRequests`
+        ///   (`BondSlashedNoRelease`).
+        ///
+        /// On success: `Currency::unreserve` returns the bond to the
+        /// requester's free balance, the `BondedClaimAttestedAt` slot
+        /// is cleared, and `SettlementBondReleased` is emitted.
+        ///
+        /// Note: we look up the requester from `BondedClaimAttestedAt`
+        /// + the now-removed `ClaimSettlementRequests` — at the point
+        /// we got here, `attest_settle` already ran and consumed the
+        /// pending entry. We persist the requester identity through
+        /// the `Claim`'s `intent_id` indirection or through a
+        /// dedicated `BondedClaimRequester` map. To keep the storage
+        /// surface flat we store the bonded requester + amount in a
+        /// separate map only at attest time when the bond is present.
+        #[pallet::call_index(21)]
+        #[pallet::weight((Weight::from_parts(500_000_000, 0), DispatchClass::Operational, Pays::Yes))]
+        pub fn release_settlement_bond(
+            origin: OriginFor<T>,
+            claim_id: ClaimId,
+        ) -> DispatchResult {
+            let _caller = ensure_signed(origin)?;
+            // Slashed tombstone gate.
+            ensure!(
+                !BondSlashedRequests::<T>::contains_key(claim_id),
+                Error::<T>::BondSlashedNoRelease
+            );
+            // Resolve the attested-at block. Absence means EITHER the
+            // request was never bonded OR it was bonded but never
+            // attested OR the bond was already released. The first two
+            // cases are caller bugs (post bond + attest first); the
+            // third case is idempotency. We surface BondNotReserved
+            // uniformly — the caller can read storage to discriminate
+            // if needed.
+            let attested_at = BondedClaimAttestedAt::<T>::get(claim_id)
+                .ok_or(Error::<T>::BondNotReserved)?;
+
+            // The pending `ClaimSettlementRequests` entry has been
+            // consumed by `attest_settle`, so we keep a side-record of
+            // (requester, bond_amount) in the `BondedClaimRequester`
+            // map written at attest time. Look it up here.
+            let (requester, bond_amount) =
+                BondedClaimRequester::<T>::get(claim_id)
+                    .ok_or(Error::<T>::BondNotReserved)?;
+
+            // Release-delay gate.
+            let now = <frame_system::Pallet<T>>::block_number();
+            let now_u64: u64 = now.into();
+            let attested_u64: u64 = attested_at.into();
+            let elapsed = now_u64.saturating_sub(attested_u64);
+            let delay_u64: u64 = T::BondReleaseDelayBlocks::get().into();
+            ensure!(elapsed >= delay_u64, Error::<T>::BondReleaseTooEarly);
+
+            // Convert + unreserve. `unreserve` returns the *remainder*
+            // (i.e., 0 means full success), but we ignore that — the
+            // contract is "return everything we reserved." A nonzero
+            // remainder would mean the chain saw a slash via some other
+            // path (impossible in our pallet design; defensive only).
+            let balance: BalanceOf<T> = bond_amount
+                .try_into()
+                .map_err(|_| Error::<T>::BondAmountConversionOverflow)?;
+            let _remainder = T::Currency::unreserve(&requester, balance);
+
+            // Cleanup so a second call surfaces BondNotReserved (idempotency).
+            BondedClaimAttestedAt::<T>::remove(claim_id);
+            BondedClaimRequester::<T>::remove(claim_id);
+
+            Self::deposit_event(Event::SettlementBondReleased {
+                claim_id,
+                requester,
+                amount: bond_amount,
             });
             Ok(())
         }

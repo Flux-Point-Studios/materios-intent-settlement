@@ -85,6 +85,16 @@ pub const TAG_VCHR: &[u8; 4] = b"VCHR";
 pub const TAG_BFPR: &[u8; 4] = b"BFPR";
 pub const TAG_CMTT: &[u8; 4] = b"CMTT";
 
+/// Task #84 (mis-sec P1): domain tag for the `slash_bad_settlement_evidence`
+/// committee-signed payload. The watcher posts a `FraudProof` against an
+/// existing `ClaimSettlementRequests` entry and the M-of-N committee bundle
+/// signs over the canonical FRAU digest binding the chain-id, the claim_id,
+/// and the SCALE-encoded fraud_proof. Domain-separated from
+/// STCL/STCA/EXPP/STBA/BSTA/ABIN/RVBN/SBIN/CRDP/RVCH/INTA so a sig produced
+/// for any other pallet payload can never replay onto a slash dispatch and
+/// vice versa.
+pub const TAG_FRAU: &[u8; 4] = b"FRAU";
+
 /// Domain-tagged Blake2b-256 hash.
 ///
 /// ```text
@@ -397,6 +407,60 @@ pub struct SettlementRequestRecord<AccountId, BlockNumber> {
     /// rejects attest_settle calls older than `Config::SettlementRequestTtl`
     /// blocks via `SettlementRequestExpired`.
     pub submitted_block: BlockNumber,
+    /// Task #84 (mis-sec P1): optional bond amount reserved by the requester
+    /// via `post_settlement_bond`. Zero means "no bond posted" — pre-#84
+    /// behaviour. Nonzero means the requester has reserved this many units
+    /// of `Config::Currency` against this claim; a successful
+    /// `slash_bad_settlement_evidence` repatriates `SlashWatcherShareBps` of
+    /// it to the watcher and the rest to the treasury PalletId.
+    /// `release_settlement_bond` returns it to the requester after
+    /// `BondReleaseDelayBlocks` post-attestation.
+    ///
+    /// Field is LAST so adding it is an additive SCALE migration — old
+    /// 4-field records decode with `bond_amount: 0` after the v2→v3
+    /// `on_runtime_upgrade` walk re-encodes them with the new shape.
+    pub bond_amount: u128,
+}
+
+/// Task #84 (mis-sec P1): falsifiable claim that the requester-posted
+/// `SettlementEvidence` is fraudulent. The watcher passes one of these
+/// variants to `slash_bad_settlement_evidence`; the M-of-N committee bundle
+/// over the canonical FRAU digest attests that the watcher's claim is
+/// truthful (i.e., the committee independently observed Cardano and confirms
+/// the requester lied). The pallet *also* cross-checks the proof against the
+/// stored evidence so a watcher cannot post a "fraud proof" whose alleged
+/// `actual` matches what the requester already committed to — that is a
+/// `FraudProofInvalid` error, not a slash.
+///
+/// Variants:
+/// - `WrongAmount { actual_lovelace }`: the watcher claims the Cardano tx
+///   actually paid `actual_lovelace`, but the stored evidence committed to
+///   a different `amount_lovelace`. Internally consistent iff
+///   `actual_lovelace != stored.amount_lovelace`.
+/// - `TxNotFound`: the watcher claims the requester's `cardano_tx_hash` does
+///   not exist on Cardano at the claimed depth. Internally consistent
+///   always (the proof is the absence — committee's M-of-N is the source
+///   of truth for the negative observation, which is why we require sigs).
+/// - `WrongBeneficiary { actual_payment_hash }`: the watcher claims the
+///   Cardano tx paid a different payment-key hash than the stored
+///   `beneficiary_addr_hash`. Internally consistent iff
+///   `actual_payment_hash != stored.beneficiary_addr_hash`.
+#[derive(
+    Clone, Copy, Encode, Decode, TypeInfo, MaxEncodedLen, RuntimeDebug, PartialEq, Eq,
+)]
+pub enum FraudProof {
+    /// Stored evidence committed to `stored.amount_lovelace`; the watcher
+    /// (and the M committee co-signers) attest that the actual Cardano
+    /// payment was `actual_lovelace` instead.
+    WrongAmount { actual_lovelace: u128 },
+    /// The requester's `cardano_tx_hash` does not exist on Cardano at the
+    /// claimed depth (committee co-signers confirm the negative
+    /// observation).
+    TxNotFound,
+    /// Stored evidence committed to `stored.beneficiary_addr_hash`; the
+    /// watcher (and M committee co-signers) attest the Cardano tx actually
+    /// paid `actual_payment_hash` instead.
+    WrongBeneficiary { actual_payment_hash: [u8; 28] },
 }
 
 /// Per-entry settlement evidence for a batch `request_batch_settle` call.

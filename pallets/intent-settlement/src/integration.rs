@@ -29,7 +29,7 @@ use codec::Encode;
 use frame_support::{
     assert_ok, construct_runtime, derive_impl, parameter_types,
     traits::Hooks,
-    BoundedVec,
+    BoundedVec, PalletId,
 };
 use parity_scale_codec as codec;
 use sp_core::{sr25519, Pair, H256};
@@ -40,6 +40,7 @@ type Block = frame_system::mocking::MockBlock<Testnet>;
 construct_runtime! {
     pub enum Testnet {
         System: frame_system,
+        Balances: pallet_balances,
         IntentSettlement: pallet_intent_settlement,
     }
 }
@@ -49,6 +50,19 @@ impl frame_system::Config for Testnet {
     type Block = Block;
     type AccountId = sp_runtime::AccountId32;
     type Lookup = IdentityLookup<Self::AccountId>;
+    /// Task #84 (mis-sec P1): wire pallet_balances's AccountData.
+    type AccountData = pallet_balances::AccountData<u128>;
+}
+
+parameter_types! {
+    pub const ExistentialDeposit: u128 = 1u128;
+}
+
+#[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
+impl pallet_balances::Config for Testnet {
+    type AccountStore = System;
+    type Balance = u128;
+    type ExistentialDeposit = ExistentialDeposit;
 }
 
 parameter_types! {
@@ -79,6 +93,11 @@ parameter_types! {
     pub const TestMinFinalityDepth: u32 = 3u32;
     pub const TestSettlementRequestTtl: u32 = 100u32;
     pub const TestMainchainGenesisHash: [u8; 32] = [0x65u8; 32];
+    // Task #84 (mis-sec P1): bond + slash integration-runtime config.
+    pub const TestSlashWatcherShareBps: u32 = 5_000u32;
+    pub const TestBondReleaseDelayBlocks: u32 = 30u32;
+    pub const TestMinSettlementBond: u128 = 0u128;
+    pub const TestSettlementTreasuryPalletId: PalletId = PalletId(*b"mat/trsy");
 }
 
 /// Static committee: Alice/Bob/Charlie by sr25519 dev-key AccountId. Threshold 2.
@@ -221,6 +240,12 @@ impl pallet_intent_settlement::pallet::Config for Testnet {
     type MinFinalityDepth = TestMinFinalityDepth;
     type SettlementRequestTtl = TestSettlementRequestTtl;
     type MainchainGenesisHash = TestMainchainGenesisHash;
+    // Task #84 (mis-sec P1): bond + slash plumbing.
+    type Currency = Balances;
+    type SlashWatcherShareBps = TestSlashWatcherShareBps;
+    type BondReleaseDelayBlocks = TestBondReleaseDelayBlocks;
+    type MinSettlementBond = TestMinSettlementBond;
+    type SettlementTreasuryPalletId = TestSettlementTreasuryPalletId;
     #[cfg(feature = "runtime-benchmarks")]
     type BenchmarkHelper = IntegrationBenchmarkHelper;
     type WeightInfo = ();

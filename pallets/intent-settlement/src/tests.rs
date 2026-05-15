@@ -11,12 +11,12 @@ use codec::Encode;
 use frame_support::{
     assert_noop, assert_ok, construct_runtime, derive_impl, parameter_types,
     traits::Hooks,
-    BoundedVec,
+    BoundedVec, PalletId,
 };
 use parity_scale_codec as codec;
 use sp_core::H256;
 use sp_runtime::{
-    traits::IdentityLookup,
+    traits::{AccountIdConversion, IdentityLookup},
     BuildStorage,
 };
 
@@ -29,6 +29,7 @@ type Block = frame_system::mocking::MockBlock<Test>;
 construct_runtime! {
     pub enum Test {
         System: frame_system,
+        Balances: pallet_balances,
         IntentSettlement: pallet_intent_settlement,
     }
 }
@@ -38,6 +39,25 @@ impl frame_system::Config for Test {
     type Block = Block;
     type AccountId = u64;
     type Lookup = IdentityLookup<Self::AccountId>;
+    /// Task #84 (mis-sec P1): wire pallet_balances's AccountData so the
+    /// reservable-currency surface used by `post_settlement_bond` /
+    /// `slash_bad_settlement_evidence` / `release_settlement_bond` works
+    /// against the mock runtime.
+    type AccountData = pallet_balances::AccountData<u128>;
+}
+
+parameter_types! {
+    /// Task #84 (mis-sec P1): u128 existential deposit so pallet_balances's
+    /// derived `TestDefaultConfig`'s `ConstU64<1>` doesn't bind to the wrong
+    /// `Get` impl.
+    pub const ExistentialDeposit: u128 = 1u128;
+}
+
+#[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
+impl pallet_balances::Config for Test {
+    type AccountStore = System;
+    type Balance = u128;
+    type ExistentialDeposit = ExistentialDeposit;
 }
 
 parameter_types! {
@@ -88,6 +108,29 @@ parameter_types! {
     /// the constant fails loudly. Production runtimes plumb the actual
     /// preprod / mainnet network-magic-derived genesis hash.
     pub const TestMainchainGenesisHash: [u8; 32] = [0x65u8; 32];
+    /// Task #84 (mis-sec P1): 50% watcher / 50% treasury split — the
+    /// design-memo §6 #9 starting point. Production runtimes can bump
+    /// via governance.
+    pub const TestSlashWatcherShareBps: u32 = 5_000u32;
+    /// Task #84 (mis-sec P1): 30 blocks (= 2 × `TestMinFinalityDepth` *
+    /// scaled by 5 for ergonomics) so the
+    /// `release_settlement_bond_rejects_too_early` test can exercise the
+    /// gate without scrolling through hundreds of blocks. Production
+    /// runtimes plumb `2 * MinFinalityDepth` directly from the
+    /// `parameter_types!` block.
+    pub const TestBondReleaseDelayBlocks: u32 = 30u32;
+    /// Task #84 (mis-sec P1): zero floor keeps the bond opt-in by
+    /// default. The `pub static` form lets per-test calls bump the
+    /// floor at runtime (via `TestMinSettlementBond::set(...)`) so
+    /// `post_settlement_bond_rejects_below_min` can exercise the
+    /// `BondBelowMinimum` error without spawning a parallel runtime.
+    pub static TestMinSettlementBond: u128 = 0u128;
+    /// Task #84 (mis-sec P1): treasury PalletId — same shape as the
+    /// production runtime's `mat/trsy`. Truncated to a u64 via
+    /// `into_account_truncating`, so the treasury account in the mock
+    /// is a deterministic u64 derived from these 8 seed bytes (collision-
+    /// distinct from accounts 1/2/3/100/101 used elsewhere in the suite).
+    pub const TestSettlementTreasuryPalletId: PalletId = PalletId(*b"mat/trsy");
 }
 
 /// Issue #4 helper: our tests use `u64` AccountIds. Derive a synthetic
@@ -208,6 +251,12 @@ impl pallet_intent_settlement::pallet::Config for Test {
     type MinFinalityDepth = TestMinFinalityDepth;
     type SettlementRequestTtl = TestSettlementRequestTtl;
     type MainchainGenesisHash = TestMainchainGenesisHash;
+    // Task #84 (mis-sec P1): bond + slash plumbing.
+    type Currency = Balances;
+    type SlashWatcherShareBps = TestSlashWatcherShareBps;
+    type BondReleaseDelayBlocks = TestBondReleaseDelayBlocks;
+    type MinSettlementBond = TestMinSettlementBond;
+    type SettlementTreasuryPalletId = TestSettlementTreasuryPalletId;
     #[cfg(feature = "runtime-benchmarks")]
     type BenchmarkHelper = MockBenchmarkHelper;
     type WeightInfo = ();
@@ -5370,10 +5419,11 @@ fn task266_migration_flags_existing_settled_claims() {
         // Run the migration via the on_runtime_upgrade hook.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         // Post-migration: settled claim is flagged (idempotent — already
-        // set by legacy settle), version bumped to 2 (chained v0→v2),
-        // both cutovers scheduled.
+        // set by legacy settle), version bumped to 3 (chained v0→v1→v2→v3,
+        // adding the #84 bond_amount field migration), both cutovers
+        // scheduled.
         assert!(PreAuditSettlement::<Test>::get(claim_id));
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 2u32);
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 3u32);
         let stca_cutover =
             pallet_intent_settlement::pallet::StcaCutoverBlock::<Test>::get();
         assert!(stca_cutover > 0u64);
@@ -5382,7 +5432,7 @@ fn task266_migration_flags_existing_settled_claims() {
         assert!(expp_cutover > 0u64);
         // Idempotency: a second invocation must not double-flag.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 2u32);
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 3u32);
     });
 }
 
@@ -5445,17 +5495,18 @@ fn task266_migration_truncation_recovers_to_full_progress() {
             .filter(|cid| PreAuditSettlement::<Test>::get(*cid))
             .count();
         assert_eq!(flagged_after_2, 3, "second run drains tail to full flag set");
-        // Task #267 update: after v0→v1 completes, the same invocation
-        // chains v1→v2, so the terminal version is 2 not 1.
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 2u32,
-                   "version bumps to 2 after chained v0→v1→v2 completes");
+        // Task #84 update: after v0→v1 completes, the same invocation
+        // chains v1→v2→v3 (the bond_amount field migration), so the
+        // terminal version is 3 not 2.
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 3u32,
+                   "version bumps to 3 after chained v0→v1→v2→v3 completes");
         let cutover_after_2 = StcaCutoverBlock::<Test>::get();
         assert_eq!(cutover_after_1, cutover_after_2,
                    "STCA cutover MUST NOT slide between runs");
-        // Third run: idempotent — version already 2, early-return.
+        // Third run: idempotent — version already 3, early-return.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         assert_eq!(StcaCutoverBlock::<Test>::get(), cutover_after_2);
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 2u32);
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 3u32);
     });
 }
 
@@ -6396,11 +6447,12 @@ fn task267_migration_flags_existing_expired_intents() {
             "TTL sweep does NOT flag (only legacy expire_policy_mirror does); the migration is what catches these"
         );
         // Run the migration. Version starts at 0; this chains all the
-        // way through v0→v1→v2 in one call. Post: PreAuditExpiry
-        // flagged, version = 2.
+        // way through v0→v1→v2→v3 in one call (the #84 bond_amount
+        // field migration adds the v3 step). Post: PreAuditExpiry
+        // flagged, version = 3.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         assert!(PreAuditExpiry::<Test>::get(iid));
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 2u32);
+        assert_eq!(SettlementStorageVersion::<Test>::get(), 3u32);
         let cutover =
             pallet_intent_settlement::pallet::PolicyExpireCutoverBlock::<Test>::get();
         assert!(cutover > 0u64);
@@ -6450,6 +6502,526 @@ fn task267_attest_expire_policy_payload_rebuild_pins_chain_state() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Task #84 (mis-sec P1) — settle_claim bond + slash unit tests
+//
+// Twelve tests covering the three new extrinsics + the v2→v3 migration.
+// Layout maps to the task #84 deliverables block:
+//   - bond_v2_to_v3_migration_fills_zero
+//   - bond_v2_to_v3_truncation_recovery
+//   - post_settlement_bond_happy_path
+//   - post_settlement_bond_rejects_non_requester
+//   - post_settlement_bond_rejects_double_bond
+//   - post_settlement_bond_rejects_below_min
+//   - slash_bad_settlement_evidence_happy_path
+//   - slash_bad_settlement_evidence_rejects_insufficient_sigs
+//   - slash_bad_settlement_evidence_rejects_inconsistent_proof
+//   - slash_bad_settlement_evidence_rejects_wrong_chain_id
+//   - release_settlement_bond_happy_path
+//   - release_settlement_bond_rejects_too_early
+//   - release_settlement_bond_rejects_on_slashed
+// ---------------------------------------------------------------------------
+
+/// Helper: seed Alice's free balance high enough to support a bond. Tests
+/// use ALICE=100 (defined above) as the requester throughout the bond
+/// suite, but the helper accepts any account for symmetry.
+fn fund_account(who: u64, amount: u128) {
+    use frame_support::traits::Currency;
+    let _ = pallet_balances::Pallet::<Test>::deposit_creating(&who, amount);
+}
+
+/// Helper: set up a fresh bonded request. ALICE is the requester; she
+/// posts `request_settle` and then bonds via `post_settlement_bond` for
+/// `bond_amount` MATRA. Returns the claim_id + voucher (so caller can
+/// build evidence / fraud proofs).
+fn alice_request_and_bond(seed: u8, claim_amount: u64, bond_amount: u128) -> (ClaimId, Voucher) {
+    let (claim_id, _iid, voucher) = vouchered_claim_with_voucher(seed, claim_amount);
+    let evidence = settled_evidence_for(&voucher, 15, 12_345);
+    // ALICE submits the request_settle (she's not a committee member, but
+    // request_settle is permissionless).
+    assert_ok!(IntentSettlement::request_settle(
+        RuntimeOrigin::signed(ALICE),
+        claim_id,
+        evidence.cardano_tx_hash,
+        false,
+        evidence,
+    ));
+    fund_account(ALICE, bond_amount.saturating_mul(10));
+    assert_ok!(IntentSettlement::post_settlement_bond(
+        RuntimeOrigin::signed(ALICE),
+        claim_id,
+        bond_amount,
+    ));
+    (claim_id, voucher)
+}
+
+#[test]
+fn bond_v2_to_v3_migration_fills_zero() {
+    // Spec-N+2 OnRuntimeUpgrade v2→v3: walks ClaimSettlementRequests
+    // and re-encodes each row with bond_amount: 0. From a fresh
+    // (post-v0/v1/v2) state with two pending requests, the migration
+    // must touch both rows and bump the version to 3.
+    new_test_ext().execute_with(|| {
+        use pallet_intent_settlement::pallet::{
+            ClaimSettlementRequests, SettlementStorageVersion,
+        };
+        // Force version to 2 (skip v0→v1 + v1→v2 phases) so the test
+        // exercises the v2→v3 path in isolation. Pre-populate two
+        // pending requests directly via storage (production-shape
+        // SettlementRequestRecord with bond_amount=0).
+        SettlementStorageVersion::<Test>::put(2u32);
+        let (c1, _, v1) = vouchered_claim_with_voucher(0xB1, 100);
+        let (c2, _, v2) = vouchered_claim_with_voucher(0xB2, 200);
+        let r1 = pallet_intent_settlement::types::SettlementRequestRecord::<u64, u64> {
+            requester: ALICE,
+            evidence: settled_evidence_for(&v1, 15, 1),
+            settled_direct: false,
+            submitted_block: 1,
+            bond_amount: 0u128,
+        };
+        let r2 = pallet_intent_settlement::types::SettlementRequestRecord::<u64, u64> {
+            requester: ALICE,
+            evidence: settled_evidence_for(&v2, 15, 2),
+            settled_direct: false,
+            submitted_block: 1,
+            bond_amount: 0u128,
+        };
+        ClaimSettlementRequests::<Test>::insert(c1, r1);
+        ClaimSettlementRequests::<Test>::insert(c2, r2);
+        // Run the migration.
+        let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
+        // Both rows still have bond_amount == 0 (additive migration).
+        let row1 = ClaimSettlementRequests::<Test>::get(c1).expect("row 1 present");
+        let row2 = ClaimSettlementRequests::<Test>::get(c2).expect("row 2 present");
+        assert_eq!(row1.bond_amount, 0u128, "row 1 bond defaults to zero");
+        assert_eq!(row2.bond_amount, 0u128, "row 2 bond defaults to zero");
+        assert_eq!(
+            SettlementStorageVersion::<Test>::get(),
+            3u32,
+            "version bumps to 3 after v2→v3 walk completes"
+        );
+    });
+}
+
+#[test]
+fn bond_v2_to_v3_truncation_recovery() {
+    // Mirror of `task266_migration_truncation_recovers_to_full_progress`
+    // for the v2→v3 phase. cfg(test) caps MAX_MIGRATE_REQUESTS at 2;
+    // 3 pending requests must drive a first-run truncation, then a
+    // second run that drains the tail and bumps the version to 3.
+    new_test_ext().execute_with(|| {
+        use pallet_intent_settlement::pallet::{
+            ClaimSettlementRequests, SettlementStorageVersion,
+        };
+        SettlementStorageVersion::<Test>::put(2u32);
+        let (c1, _, v1) = vouchered_claim_with_voucher(0xB3, 100);
+        let (c2, _, v2) = vouchered_claim_with_voucher(0xB4, 100);
+        let (c3, _, v3) = vouchered_claim_with_voucher(0xB5, 100);
+        for (cid, v) in [(c1, &v1), (c2, &v2), (c3, &v3)] {
+            ClaimSettlementRequests::<Test>::insert(
+                cid,
+                pallet_intent_settlement::types::SettlementRequestRecord::<u64, u64> {
+                    requester: ALICE,
+                    evidence: settled_evidence_for(v, 15, 1),
+                    settled_direct: false,
+                    submitted_block: 1,
+                    bond_amount: 0u128,
+                },
+            );
+        }
+        // First run: hits cap (2 of 3), truncates, leaves version at 2.
+        let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
+        assert_eq!(
+            SettlementStorageVersion::<Test>::get(),
+            2u32,
+            "version stays at 2 on truncation"
+        );
+        // Second run: drains the tail, bumps to 3.
+        let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
+        assert_eq!(
+            SettlementStorageVersion::<Test>::get(),
+            3u32,
+            "version bumps to 3 after second run drains the tail"
+        );
+    });
+}
+
+#[test]
+fn post_settlement_bond_happy_path() {
+    new_test_ext().execute_with(|| {
+        use pallet_intent_settlement::pallet::ClaimSettlementRequests;
+        let (claim_id, _iid, voucher) =
+            vouchered_claim_with_voucher(0xB6, 100_000);
+        let evidence = settled_evidence_for(&voucher, 15, 1);
+        assert_ok!(IntentSettlement::request_settle(
+            RuntimeOrigin::signed(ALICE),
+            claim_id,
+            evidence.cardano_tx_hash,
+            false,
+            evidence,
+        ));
+        fund_account(ALICE, 10_000_000_000u128);
+        let reserved_before =
+            pallet_balances::Pallet::<Test>::reserved_balance(&ALICE);
+        assert_ok!(IntentSettlement::post_settlement_bond(
+            RuntimeOrigin::signed(ALICE),
+            claim_id,
+            100_000_000u128,
+        ));
+        // Bond amount recorded.
+        let row = ClaimSettlementRequests::<Test>::get(claim_id).unwrap();
+        assert_eq!(row.bond_amount, 100_000_000u128);
+        // Funds actually reserved (not just a flag flip).
+        let reserved_after =
+            pallet_balances::Pallet::<Test>::reserved_balance(&ALICE);
+        assert_eq!(reserved_after - reserved_before, 100_000_000u128);
+        // SettlementBondPosted event fired.
+        let found = System::events().into_iter().any(|er| matches!(
+            er.event,
+            RuntimeEvent::IntentSettlement(
+                pallet_intent_settlement::pallet::Event::SettlementBondPosted {
+                    claim_id: c,
+                    requester: r,
+                    amount: a,
+                }
+            ) if c == claim_id && r == ALICE && a == 100_000_000u128
+        ));
+        assert!(found, "SettlementBondPosted event must fire");
+    });
+}
+
+#[test]
+fn post_settlement_bond_rejects_non_requester() {
+    new_test_ext().execute_with(|| {
+        let (claim_id, _iid, voucher) =
+            vouchered_claim_with_voucher(0xB7, 100_000);
+        let evidence = settled_evidence_for(&voucher, 15, 1);
+        assert_ok!(IntentSettlement::request_settle(
+            RuntimeOrigin::signed(ALICE),
+            claim_id,
+            evidence.cardano_tx_hash,
+            false,
+            evidence,
+        ));
+        fund_account(BOB, 10_000_000_000u128);
+        // BOB (not ALICE) tries to bond ALICE's request.
+        assert_noop!(
+            IntentSettlement::post_settlement_bond(
+                RuntimeOrigin::signed(BOB),
+                claim_id,
+                1_000u128,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::NotRequester,
+        );
+    });
+}
+
+#[test]
+fn post_settlement_bond_rejects_double_bond() {
+    new_test_ext().execute_with(|| {
+        let (claim_id, _voucher) = alice_request_and_bond(0xB8, 100_000, 1_000u128);
+        // Second post_settlement_bond on the same claim_id MUST fail.
+        assert_noop!(
+            IntentSettlement::post_settlement_bond(
+                RuntimeOrigin::signed(ALICE),
+                claim_id,
+                500u128,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::BondAlreadyReserved,
+        );
+    });
+}
+
+#[test]
+fn post_settlement_bond_rejects_below_min() {
+    new_test_ext().execute_with(|| {
+        // Bump the floor to 1_000 via the `pub static` parameter
+        // override exposed by `TestMinSettlementBond`. Production
+        // runtimes plumb this via governance.
+        TestMinSettlementBond::set(1_000u128);
+        let (claim_id, _iid, voucher) =
+            vouchered_claim_with_voucher(0xBC, 100_000);
+        let evidence = settled_evidence_for(&voucher, 15, 1);
+        assert_ok!(IntentSettlement::request_settle(
+            RuntimeOrigin::signed(ALICE),
+            claim_id,
+            evidence.cardano_tx_hash,
+            false,
+            evidence,
+        ));
+        fund_account(ALICE, 10_000u128);
+        // amount = 100 < floor 1_000 → BondBelowMinimum.
+        assert_noop!(
+            IntentSettlement::post_settlement_bond(
+                RuntimeOrigin::signed(ALICE),
+                claim_id,
+                100u128,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::BondBelowMinimum,
+        );
+        // Reset for downstream tests so the override doesn't leak via
+        // TestExternalities reuse.
+        TestMinSettlementBond::set(0u128);
+    });
+}
+
+#[test]
+fn slash_bad_settlement_evidence_happy_path() {
+    new_test_ext().execute_with(|| {
+        use pallet_intent_settlement::pallet::{
+            BondSlashedRequests, ClaimSettlementRequests,
+        };
+        let bond: u128 = 100_000_000u128;
+        let (claim_id, voucher) = alice_request_and_bond(0xB9, 100_000, bond);
+        // Watcher: account 1 (committee member). Stored evidence has
+        // amount_lovelace = voucher.amount_ada = 100_000.
+        // WrongAmount proof claims actual_lovelace = 12_345 (which
+        // disagrees with stored). M-of-N sigs (2-of-3 from members 1
+        // and 2) over the FRAU pre-image authorise the slash.
+        let _ = voucher; // unused in this test
+        let watcher = 1u64;
+        // pallet_balances' `repatriate_reserved` requires the
+        // beneficiary account to already exist (refuses to create a
+        // new account via reserve transfer). Pre-fund the watcher +
+        // treasury with the existential deposit so the transfer
+        // semantics match the production runtime where these accounts
+        // are pre-warmed via inflation / treasury seeding.
+        fund_account(watcher, 1u128);
+        let treasury_account: u64 =
+            <TestSettlementTreasuryPalletId as sp_core::Get<PalletId>>::get()
+                .into_account_truncating();
+        fund_account(treasury_account, 1u128);
+        let _watcher_free_before =
+            pallet_balances::Pallet::<Test>::free_balance(&watcher);
+        let _treasury_free_before =
+            pallet_balances::Pallet::<Test>::free_balance(&treasury_account);
+        let proof = pallet_intent_settlement::types::FraudProof::WrongAmount {
+            actual_lovelace: 12_345u128,
+        };
+        // Build a 2-of-3 sig envelope from members 1, 2. MockSigVerifier
+        // accepts iff sig[0] == pubkey[0], so the canonical FRAU
+        // pre-image isn't exercised at the bytes level — but the
+        // caller-binding + member-only + distinct-signer logic IS.
+        let sigs = vec![mock_sig_for(1), mock_sig_for(2)];
+        assert_ok!(IntentSettlement::slash_bad_settlement_evidence(
+            RuntimeOrigin::signed(watcher),
+            claim_id,
+            proof,
+            sigs,
+        ));
+        // Bond split: 50% to watcher, 50% to treasury (per
+        // TestSlashWatcherShareBps = 5000).
+        let watcher_free_after =
+            pallet_balances::Pallet::<Test>::free_balance(&watcher);
+        let treasury_free_after =
+            pallet_balances::Pallet::<Test>::free_balance(&treasury_account);
+        assert_eq!(
+            watcher_free_after - _watcher_free_before,
+            bond / 2,
+            "watcher must receive 50% of slashed bond"
+        );
+        assert_eq!(
+            treasury_free_after - _treasury_free_before,
+            bond / 2,
+            "treasury must receive the remaining 50%"
+        );
+        // Pending request removed (so attest_settle would error with
+        // SettlementRequestMissing).
+        assert!(
+            ClaimSettlementRequests::<Test>::get(claim_id).is_none(),
+            "slash MUST remove the pending request"
+        );
+        // Tombstone set.
+        assert!(
+            BondSlashedRequests::<Test>::contains_key(claim_id),
+            "BondSlashedRequests must hold the tombstone"
+        );
+        // SettlementBondSlashed event emitted.
+        let found = System::events().into_iter().any(|er| matches!(
+            er.event,
+            RuntimeEvent::IntentSettlement(
+                pallet_intent_settlement::pallet::Event::SettlementBondSlashed {
+                    claim_id: c,
+                    requester: r,
+                    watcher: w,
+                    ..
+                }
+            ) if c == claim_id && r == ALICE && w == watcher
+        ));
+        assert!(found, "SettlementBondSlashed event must fire");
+    });
+}
+
+#[test]
+fn slash_bad_settlement_evidence_rejects_insufficient_sigs() {
+    new_test_ext().execute_with(|| {
+        let (claim_id, _voucher) = alice_request_and_bond(0xBA, 100_000, 1_000u128);
+        let proof = pallet_intent_settlement::types::FraudProof::WrongAmount {
+            actual_lovelace: 12_345u128,
+        };
+        // Threshold = 2, supply 1 sig.
+        assert_noop!(
+            IntentSettlement::slash_bad_settlement_evidence(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                proof,
+                vec![mock_sig_for(1)],
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::FraudThresholdNotMet,
+        );
+    });
+}
+
+#[test]
+fn slash_bad_settlement_evidence_rejects_inconsistent_proof() {
+    // WrongAmount.actual_lovelace == stored evidence.amount_lovelace =
+    // FraudProofInvalid. The watcher cannot "fraud-prove" the
+    // requester's own claim back at them.
+    new_test_ext().execute_with(|| {
+        let bond: u128 = 1_000u128;
+        let (claim_id, voucher) = alice_request_and_bond(0xBB, 100_000, bond);
+        // Stored amount_lovelace = voucher.amount_ada = 100_000. Build
+        // a WrongAmount proof claiming actual_lovelace = 100_000 (same).
+        let proof = pallet_intent_settlement::types::FraudProof::WrongAmount {
+            actual_lovelace: voucher.amount_ada as u128,
+        };
+        assert_noop!(
+            IntentSettlement::slash_bad_settlement_evidence(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                proof,
+                vec![mock_sig_for(1), mock_sig_for(2)],
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::FraudProofInvalid,
+        );
+    });
+}
+
+#[test]
+fn slash_bad_settlement_evidence_rejects_wrong_chain_id() {
+    // MockSigVerifier ignores the message bytes (accepts iff
+    // sig[0] == pubkey[0]), so a literal chain-id mismatch can't be
+    // exercised at the byte level in this mock. What we CAN exercise
+    // is: if the sig bundle doesn't include the caller's own pubkey,
+    // ensure_threshold_signatures rejects via InsufficientSignatures
+    // (which is the same path a real sr25519-bound chain_id mismatch
+    // would surface as). This pins the caller-binding guard that
+    // protects the slash dispatch from a non-signing watcher.
+    new_test_ext().execute_with(|| {
+        let (claim_id, _voucher) = alice_request_and_bond(0xBC, 100_000, 1_000u128);
+        let proof = pallet_intent_settlement::types::FraudProof::TxNotFound;
+        // Caller is account 1 but the sig bundle doesn't include
+        // their pubkey — caller-binding gate fires.
+        assert_noop!(
+            IntentSettlement::slash_bad_settlement_evidence(
+                RuntimeOrigin::signed(1),
+                claim_id,
+                proof,
+                vec![mock_sig_for(2), mock_sig_for(3)],
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures,
+        );
+    });
+}
+
+#[test]
+fn release_settlement_bond_happy_path() {
+    new_test_ext().execute_with(|| {
+        let bond: u128 = 1_000_000u128;
+        let (claim_id, _voucher) = alice_request_and_bond(0xBD, 100_000, bond);
+        // Attest the settlement (so the bonded-attested-at slot
+        // populates).
+        assert_ok!(IntentSettlement::attest_settle(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            mock_settle_sigs(),
+        ));
+        let reserved_before =
+            pallet_balances::Pallet::<Test>::reserved_balance(&ALICE);
+        // Advance past BondReleaseDelayBlocks.
+        let delay = TestBondReleaseDelayBlocks::get();
+        System::set_block_number(System::block_number() + delay as u64 + 1);
+        assert_ok!(IntentSettlement::release_settlement_bond(
+            RuntimeOrigin::signed(ALICE),
+            claim_id,
+        ));
+        let reserved_after =
+            pallet_balances::Pallet::<Test>::reserved_balance(&ALICE);
+        assert_eq!(
+            reserved_before - reserved_after,
+            bond,
+            "release must unreserve the full bond"
+        );
+        // SettlementBondReleased event fired.
+        let found = System::events().into_iter().any(|er| matches!(
+            er.event,
+            RuntimeEvent::IntentSettlement(
+                pallet_intent_settlement::pallet::Event::SettlementBondReleased {
+                    claim_id: c,
+                    requester: r,
+                    amount: a,
+                }
+            ) if c == claim_id && r == ALICE && a == bond
+        ));
+        assert!(found, "SettlementBondReleased event must fire");
+    });
+}
+
+#[test]
+fn release_settlement_bond_rejects_too_early() {
+    new_test_ext().execute_with(|| {
+        let (claim_id, _voucher) = alice_request_and_bond(0xBE, 100_000, 1_000u128);
+        assert_ok!(IntentSettlement::attest_settle(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            mock_settle_sigs(),
+        ));
+        // Don't advance the block — release_settlement_bond fires
+        // before the delay elapses.
+        assert_noop!(
+            IntentSettlement::release_settlement_bond(
+                RuntimeOrigin::signed(ALICE),
+                claim_id,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::BondReleaseTooEarly,
+        );
+    });
+}
+
+#[test]
+fn release_settlement_bond_rejects_on_slashed() {
+    new_test_ext().execute_with(|| {
+        let (claim_id, _voucher) = alice_request_and_bond(0xBF, 100_000, 1_000u128);
+        // Pre-fund watcher + treasury so repatriate_reserved doesn't
+        // hit DeadAccount.
+        fund_account(1u64, 1u128);
+        let treasury_account: u64 =
+            <TestSettlementTreasuryPalletId as sp_core::Get<PalletId>>::get()
+                .into_account_truncating();
+        fund_account(treasury_account, 1u128);
+        // Slash before any attest.
+        let proof = pallet_intent_settlement::types::FraudProof::WrongAmount {
+            actual_lovelace: 12_345u128,
+        };
+        assert_ok!(IntentSettlement::slash_bad_settlement_evidence(
+            RuntimeOrigin::signed(1),
+            claim_id,
+            proof,
+            vec![mock_sig_for(1), mock_sig_for(2)],
+        ));
+        // Even past the delay (which we trivially advance), release
+        // must reject because the bond was slashed.
+        System::set_block_number(System::block_number() + 1_000);
+        assert_noop!(
+            IntentSettlement::release_settlement_bond(
+                RuntimeOrigin::signed(ALICE),
+                claim_id,
+            ),
+            pallet_intent_settlement::pallet::Error::<Test>::BondSlashedNoRelease,
+        );
+    });
+}
+
 // Task #221 — Test 5: full N=256 (MaxSubmitBatch) boundary test.
 //
 // The main mock runtime caps MaxPendingBatches at 16; landing N=256 needs
@@ -6467,7 +7039,7 @@ mod max_submit_batch_boundary {
     use crate::types::*;
     use frame_support::{
         assert_ok, construct_runtime, derive_impl, parameter_types,
-        BoundedVec,
+        BoundedVec, PalletId,
     };
     use sp_core::H256;
     use sp_runtime::{traits::IdentityLookup, BuildStorage};
@@ -6477,6 +7049,7 @@ mod max_submit_batch_boundary {
     construct_runtime! {
         pub enum Test {
             System: frame_system,
+            Balances: pallet_balances,
             IntentSettlement: pallet_intent_settlement,
         }
     }
@@ -6486,6 +7059,18 @@ mod max_submit_batch_boundary {
         type Block = Block;
         type AccountId = u64;
         type Lookup = IdentityLookup<Self::AccountId>;
+        type AccountData = pallet_balances::AccountData<u128>;
+    }
+
+    parameter_types! {
+        pub const ExistentialDeposit: u128 = 1u128;
+    }
+
+    #[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
+    impl pallet_balances::Config for Test {
+        type AccountStore = System;
+        type Balance = u128;
+        type ExistentialDeposit = ExistentialDeposit;
     }
 
     parameter_types! {
@@ -6511,6 +7096,11 @@ mod max_submit_batch_boundary {
         pub const TestMinFinalityDepth: u32 = 3u32;
         pub const TestSettlementRequestTtl: u32 = 100u32;
         pub const TestMainchainGenesisHash: [u8; 32] = [0x65u8; 32];
+        // Task #84 (mis-sec P1): bond + slash config (mirrors outer mock).
+        pub const TestSlashWatcherShareBps: u32 = 5_000u32;
+        pub const TestBondReleaseDelayBlocks: u32 = 30u32;
+        pub const TestMinSettlementBond: u128 = 0u128;
+        pub const TestSettlementTreasuryPalletId: PalletId = PalletId(*b"mat/trsy");
     }
 
     fn pubkey_of(who: &u64) -> CommitteePubkey {
@@ -6570,6 +7160,12 @@ mod max_submit_batch_boundary {
         type MinFinalityDepth = TestMinFinalityDepth;
         type SettlementRequestTtl = TestSettlementRequestTtl;
         type MainchainGenesisHash = TestMainchainGenesisHash;
+        // Task #84 (mis-sec P1): bond + slash plumbing.
+        type Currency = Balances;
+        type SlashWatcherShareBps = TestSlashWatcherShareBps;
+        type BondReleaseDelayBlocks = TestBondReleaseDelayBlocks;
+        type MinSettlementBond = TestMinSettlementBond;
+        type SettlementTreasuryPalletId = TestSettlementTreasuryPalletId;
         #[cfg(feature = "runtime-benchmarks")]
         type BenchmarkHelper = NoopBenchmarkHelper;
         type WeightInfo = ();
