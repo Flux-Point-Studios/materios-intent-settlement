@@ -27,6 +27,14 @@
  *   NETWORK_MAGIC          — Cardano protocol magic; defaults from NETWORK
  *                            (preprod=1, mainnet=764824073).
  *   SETTLEMENT_VERSION     — #73 settlement-protocol semver u32. Default 1.
+ *   MAINCHAIN_GENESIS_HASH — Task #266 (mis-sec P0): 32-byte (66-hex incl.
+ *                            0x) Cardano genesis hash. Pins preprod vs
+ *                            mainnet on the new attested-settle path so
+ *                            the keeper's `SettlementEvidence` cannot land
+ *                            on the wrong network. Required.
+ *   MIN_FINALITY_DEPTH     — Task #266 (mis-sec P0): minimum Cardano-block
+ *                            depth before request_settle fires. Default 15
+ *                            (matches the runtime constant).
  *   NETWORK                — "preprod" | "mainnet" (mainnet requires ENABLE_MAINNET=1)
  *   KEEPER_STATE_PATH      — path to persisted state (default ./keeper-state.json)
  *   DRY_RUN                — "1" to skip actual Cardano submits
@@ -67,6 +75,14 @@ async function main(): Promise<void> {
     : network === "mainnet"
       ? 764824073
       : 1;
+  // Task #266 (mis-sec P0): Cardano genesis pin + finality floor for
+  // the new attested-settle pair. The genesis hash is REQUIRED — there
+  // is no sensible default because preprod and mainnet have distinct
+  // values and a misconfig could send evidence to the wrong runtime.
+  const mainchainGenesisHash = required("MAINCHAIN_GENESIS_HASH") as `0x${string}`;
+  const minFinalityDepth = process.env.MIN_FINALITY_DEPTH
+    ? Number.parseInt(process.env.MIN_FINALITY_DEPTH, 10)
+    : 15;
 
   const rpc = new MateriosRpcClient({ rpcUrl: materiosRpcUrl, signerUri: keeperMnemonic });
   await rpc.connect();
@@ -108,6 +124,8 @@ async function main(): Promise<void> {
       materiosChainId,
       networkMagic,
       settlementVersion,
+      mainchainGenesisHash,
+      minFinalityDepth,
     },
     {
       rpc,
