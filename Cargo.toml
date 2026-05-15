@@ -4,6 +4,7 @@ members = [
     "pallets/intent-settlement",
     "pallets/committee-governance",
     "pallets/oracle",
+    "pallets/perp-engine",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ sp-keyring = { git = "https://github.com/paritytech/polkadot-sdk.git", tag = "po
 pallet-intent-settlement = { path = "pallets/intent-settlement", default-features = false }
 pallet-committee-governance = { path = "pallets/committee-governance", default-features = false }
 pallet-oracle = { path = "pallets/oracle", default-features = false }
+pallet-perp-engine = { path = "pallets/perp-engine", default-features = false }
 
 # Misc
 log = { version = "0.4", default-features = false }
