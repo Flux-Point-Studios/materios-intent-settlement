@@ -422,24 +422,6 @@ fn genesis_state_empty() {
     });
 }
 
-/// Surface check: `governance_set_market` is still a stub (deferred to
-/// PR-D). `liquidate` and `settle_funding` are no longer stubs — their
-/// coverage is in the dedicated test sections below. The dispatcher
-/// origin gate is still exercised for `governance_set_market`.
-#[test]
-fn call_surface_exposed_stubs_only() {
-    new_test_ext().execute_with(|| {
-        let market_id = ada_perp_market_id();
-
-        // governance_set_market — stub, root-gated.
-        assert_ok!(PerpEngine::governance_set_market(
-            RuntimeOrigin::root(),
-            market_id,
-            default_ada_perp_market_config(),
-        ));
-    });
-}
-
 /// Pin the canonical Config defaults so PR-B can't silently drift them.
 /// Values come from design memo §9.1 (the risk-parameter table) — any
 /// drift here without a matching §9.1 update flips this test.
@@ -3855,4 +3837,438 @@ fn liquidation_bond_slashed_event_field_shape() {
             other
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// spec-227 polish — governance_set_market body + liquidate sub-rate fee
+// floor (sec-review LOW 2). Tests below pin the new dispatch surface.
+// ---------------------------------------------------------------------------
+
+/// Build a registered-form market_id (key) + matching MarketConfig for
+/// reuse across the governance_set_market test set. Uses ADA-PERP/USD
+/// as the canonical fixture — same handle the chain-side spec-226
+/// demo trade hit.
+fn governance_market_fixture() -> (MarketId, MarketConfig) {
+    (ada_perp_market_id(), default_ada_perp_market_config())
+}
+
+/// Test 1 — happy path. Root origin + valid config writes the Markets
+/// row and emits MarketRegistered with the canonical payload.
+#[test]
+fn governance_set_market_happy_path() {
+    new_test_ext().execute_with(|| {
+        let (market_id, cfg) = governance_market_fixture();
+
+        assert_ok!(PerpEngine::governance_set_market(
+            RuntimeOrigin::root(),
+            market_id.clone(),
+            cfg.clone(),
+        ));
+
+        let stored = pallet_perp_engine::pallet::Markets::<Test>::get(&market_id)
+            .expect("Markets[market_id] must be populated");
+        assert_eq!(stored, cfg, "stored config must round-trip the input bytes");
+
+        let event_seen = System::events().iter().any(|er| matches!(
+            &er.event,
+            RuntimeEvent::PerpEngine(pallet_perp_engine::Event::MarketRegistered {
+                market_id: m,
+                oracle_feed_id,
+                initial_margin_bps,
+                maintenance_margin_bps,
+                max_leverage_bps,
+                paused,
+            }) if m == &market_id
+                && oracle_feed_id == &cfg.oracle_feed_id
+                && *initial_margin_bps == cfg.initial_margin_bps
+                && *maintenance_margin_bps == cfg.maintenance_margin_bps
+                && *max_leverage_bps == cfg.max_leverage_bps
+                && *paused == cfg.paused,
+        ));
+        assert!(event_seen, "MarketRegistered event must be emitted");
+    });
+}
+
+/// Test 2 — non-root origin rejects with BadOrigin.
+#[test]
+fn governance_set_market_rejects_non_root_origin() {
+    new_test_ext().execute_with(|| {
+        let (market_id, cfg) = governance_market_fixture();
+
+        assert_noop!(
+            PerpEngine::governance_set_market(
+                RuntimeOrigin::signed(1u64),
+                market_id,
+                cfg,
+            ),
+            sp_runtime::DispatchError::BadOrigin
+        );
+    });
+}
+
+/// Test 3 — duplicate market_id rejects. v0 ships create-only; updates
+/// land via a separate timelock-gated extrinsic in v1 (§9.3).
+#[test]
+fn governance_set_market_rejects_duplicate() {
+    new_test_ext().execute_with(|| {
+        let (market_id, cfg) = governance_market_fixture();
+
+        assert_ok!(PerpEngine::governance_set_market(
+            RuntimeOrigin::root(),
+            market_id.clone(),
+            cfg.clone(),
+        ));
+
+        assert_noop!(
+            PerpEngine::governance_set_market(
+                RuntimeOrigin::root(),
+                market_id,
+                cfg,
+            ),
+            Error::<Test>::MarketAlreadyExists
+        );
+    });
+}
+
+/// Test 4 — maintenance_margin_bps >= initial_margin_bps rejects with
+/// InvalidMarketConfig (§3.8 + §9.1).
+#[test]
+fn governance_set_market_rejects_mm_ge_im() {
+    new_test_ext().execute_with(|| {
+        let (market_id, mut cfg) = governance_market_fixture();
+        cfg.maintenance_margin_bps = cfg.initial_margin_bps; // MM == IM is invalid
+
+        assert_noop!(
+            PerpEngine::governance_set_market(
+                RuntimeOrigin::root(),
+                market_id,
+                cfg,
+            ),
+            Error::<Test>::InvalidMarketConfig
+        );
+    });
+}
+
+/// Test 5 — max_leverage_bps above the Config-level cap rejects.
+#[test]
+fn governance_set_market_rejects_max_leverage_above_cap() {
+    new_test_ext().execute_with(|| {
+        let (market_id, mut cfg) = governance_market_fixture();
+        let cap = <Test as pallet_perp_engine::Config>::MaxLeverageBps::get();
+        cfg.max_leverage_bps = cap.saturating_add(1);
+
+        assert_noop!(
+            PerpEngine::governance_set_market(
+                RuntimeOrigin::root(),
+                market_id,
+                cfg,
+            ),
+            Error::<Test>::InvalidMarketConfig
+        );
+    });
+}
+
+/// Test 6 — bps fields above 10_000 reject. Pin one canonical example
+/// (liquidation_fee_bps > 10_000) — the impl validates all bps fields
+/// the same way.
+#[test]
+fn governance_set_market_rejects_bps_above_10000() {
+    new_test_ext().execute_with(|| {
+        let (market_id, mut cfg) = governance_market_fixture();
+        cfg.liquidation_fee_bps = 10_001;
+
+        assert_noop!(
+            PerpEngine::governance_set_market(
+                RuntimeOrigin::root(),
+                market_id,
+                cfg,
+            ),
+            Error::<Test>::InvalidMarketConfig
+        );
+    });
+}
+
+/// Test 7 — min_position_size_e8 == 0 rejects (dust filter must be a
+/// real positive floor or the size-bound check is a no-op).
+#[test]
+fn governance_set_market_rejects_zero_min_size() {
+    new_test_ext().execute_with(|| {
+        let (market_id, mut cfg) = governance_market_fixture();
+        cfg.min_position_size_e8 = 0;
+
+        assert_noop!(
+            PerpEngine::governance_set_market(
+                RuntimeOrigin::root(),
+                market_id,
+                cfg,
+            ),
+            Error::<Test>::InvalidMarketConfig
+        );
+    });
+}
+
+/// Test 8 — min_position_size_e8 > max_position_size_e8 rejects.
+#[test]
+fn governance_set_market_rejects_min_above_max_size() {
+    new_test_ext().execute_with(|| {
+        let (market_id, mut cfg) = governance_market_fixture();
+        cfg.min_position_size_e8 = cfg.max_position_size_e8.saturating_add(1);
+
+        assert_noop!(
+            PerpEngine::governance_set_market(
+                RuntimeOrigin::root(),
+                market_id,
+                cfg,
+            ),
+            Error::<Test>::InvalidMarketConfig
+        );
+    });
+}
+
+/// Test 9 — `cfg.id` MUST equal the `market_id` extrinsic key.
+/// Mismatched key/value would let an event scanner reading
+/// `MarketRegistered.market_id` disagree with the `Markets` storage key
+/// — same self-describing invariant that prevents storage-key drift.
+#[test]
+fn governance_set_market_rejects_market_id_key_mismatch() {
+    new_test_ext().execute_with(|| {
+        let (market_id, mut cfg) = governance_market_fixture();
+        // Build a different valid id for the cfg field.
+        cfg.id = MarketId::try_from(b"BTC-PERP/USD".to_vec())
+            .expect("12 bytes < MAX_MARKET_ID_LEN");
+
+        assert_noop!(
+            PerpEngine::governance_set_market(
+                RuntimeOrigin::root(),
+                market_id,
+                cfg,
+            ),
+            Error::<Test>::InvalidMarketConfig
+        );
+    });
+}
+
+/// Test 10 — empty oracle_feed_id rejects (no oracle binding = no
+/// mark-price source = no functional market).
+#[test]
+fn governance_set_market_rejects_empty_oracle_feed_id() {
+    new_test_ext().execute_with(|| {
+        let (market_id, mut cfg) = governance_market_fixture();
+        cfg.oracle_feed_id =
+            OracleFeedId::try_from(Vec::<u8>::new()).expect("empty fits in bound");
+
+        assert_noop!(
+            PerpEngine::governance_set_market(
+                RuntimeOrigin::root(),
+                market_id,
+                cfg,
+            ),
+            Error::<Test>::InvalidMarketConfig
+        );
+    });
+}
+
+/// Test 11 — mark_ema_window_blocks == 0 rejects (EMA window of 0 = no
+/// smoothing, divides by zero downstream).
+#[test]
+fn governance_set_market_rejects_zero_ema_window() {
+    new_test_ext().execute_with(|| {
+        let (market_id, mut cfg) = governance_market_fixture();
+        cfg.mark_ema_window_blocks = 0;
+
+        assert_noop!(
+            PerpEngine::governance_set_market(
+                RuntimeOrigin::root(),
+                market_id,
+                cfg,
+            ),
+            Error::<Test>::InvalidMarketConfig
+        );
+    });
+}
+
+/// Test 12 — funding_epoch_blocks == 0 rejects.
+#[test]
+fn governance_set_market_rejects_zero_funding_epoch() {
+    new_test_ext().execute_with(|| {
+        let (market_id, mut cfg) = governance_market_fixture();
+        cfg.funding_epoch_blocks = 0;
+
+        assert_noop!(
+            PerpEngine::governance_set_market(
+                RuntimeOrigin::root(),
+                market_id,
+                cfg,
+            ),
+            Error::<Test>::InvalidMarketConfig
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// PR-C sec-review LOW 2 — sub-rate liquidation fee floor-to-1
+// ---------------------------------------------------------------------------
+
+/// PR-C sec-review LOW 2 fix. When `fee_e18 < payout_rate_e18` the
+/// integer division `fee_e18 / payout_rate_e18` rounds to 0, robbing
+/// the keeper of payout for tiny-notional liquidations. Pin the floor
+/// at 1 base unit when `fee_e18 > 0`. Fee comes from the position's
+/// locked margin (already `.min(pos.locked_margin_e18)`) — no
+/// pot-drain risk.
+///
+/// Setup picks a min-size 10× long that goes deeply underwater on a
+/// 50% price drop. At default fixture rates the raw fee in 1e18 units
+/// is ~2.5e13, the live MATRA/USD rate is 1e18, so the legacy code
+/// would have paid the keeper 0 MOTRA despite a successful
+/// liquidation. The fix pins payout at ≥ 1 MOTRA.
+#[test]
+fn liquidate_sub_rate_fee_floors_to_one_motra() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        register_default_market();
+        // Min position size = 1_000_000 (= 0.01 contracts). At $1 mark
+        // notional = $0.01 (1e16 in 1e18 units); 10× leverage locks
+        // $0.001 (1e15). A 50% price drop pushes equity ~ -4e15
+        // (well below MM ~ 2.5e14), triggering valid liquidation.
+        let min_size: u128 =
+            default_ada_perp_market_config().min_position_size_e8;
+        credit_motra(victim, 1u128);
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(victim),
+            1u128,
+        ));
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(victim),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            min_size,
+            1_000u32, // 10× leverage
+            50u32,
+            0u128,
+        ));
+
+        fund_pot(100u128);
+        seed_keeper_bond(
+            &ada_perp_market_id(),
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        // Drop mark to $0.50 — position deeply underwater.
+        set_oracle_price(&ada_usd_feed_id(), 500_000_000_000_000_000u128);
+
+        let keeper_pre = pallet_balances::Pallet::<Test>::free_balance(&keeper);
+
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            ada_perp_market_id(),
+        ));
+
+        // Position closed (valid trigger fired the fee branch, NOT
+        // the false-trigger slash).
+        assert!(
+            pallet_perp_engine::pallet::Positions::<Test>::get(
+                &ada_perp_market_id(),
+                &victim,
+            )
+            .is_none(),
+            "valid-trigger liquidation must remove the Position",
+        );
+
+        // PositionLiquidated fired with a NON-zero fee_e18 (proves we
+        // hit the fee branch).
+        let fee_event = System::events().iter().find_map(|er| match &er.event {
+            RuntimeEvent::PerpEngine(
+                pallet_perp_engine::Event::PositionLiquidated {
+                    liquidation_fee_e18,
+                    ..
+                },
+            ) => Some(*liquidation_fee_e18),
+            _ => None,
+        });
+        let fee_e18 = fee_event.expect("PositionLiquidated must be emitted");
+        assert!(
+            fee_e18 > 0,
+            "fee_e18 must be positive for the floor branch to matter",
+        );
+        assert!(
+            fee_e18 < 1_000_000_000_000_000_000u128,
+            "fee_e18 ({}) must be < 1e18 (= payout_rate_e18) for this test \
+             to exercise the floor-to-zero edge",
+            fee_e18,
+        );
+
+        // Keeper received ≥ 1 MOTRA despite fee_e18 < payout_rate_e18.
+        // Pre-fix: keeper_post == keeper_pre (fee rounded to 0).
+        let keeper_post = pallet_balances::Pallet::<Test>::free_balance(&keeper);
+        let payout = keeper_post.saturating_sub(keeper_pre);
+        assert!(
+            payout >= 1u128,
+            "keeper payout floored to {} but must be ≥ 1 base unit \
+             when fee_e18 > 0",
+            payout,
+        );
+    });
+}
+
+/// Sister test pinning the inverse: when liquidation_fee_bps == 0 there
+/// IS no fee owed, so the keeper still gets 0 MOTRA. The floor only
+/// fires when fee_e18 > 0 — a zero-fee liquidation is a deliberate
+/// governance choice (e.g. emergency unwind), NOT a rounding artefact.
+#[test]
+fn liquidate_zero_fee_yields_zero_payout() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        // Custom config with liquidation_fee_bps = 0.
+        register_default_market();
+        let mut cfg = default_ada_perp_market_config();
+        cfg.liquidation_fee_bps = 0;
+        pallet_perp_engine::pallet::Markets::<Test>::insert(
+            &ada_perp_market_id(),
+            cfg,
+        );
+
+        credit_motra(victim, 1u128);
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(victim),
+            1u128,
+        ));
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(victim),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128, // 1.0 contract
+            1_000u32,
+            50u32,
+            0u128,
+        ));
+
+        fund_pot(100u128);
+        seed_keeper_bond(
+            &ada_perp_market_id(),
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        set_oracle_price(&ada_usd_feed_id(), 500_000_000_000_000_000u128);
+
+        let keeper_pre = pallet_balances::Pallet::<Test>::free_balance(&keeper);
+
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            ada_perp_market_id(),
+        ));
+
+        // fee_e18 == 0 path: keeper gets 0 (no floor on a no-fee
+        // liquidation).
+        let keeper_post = pallet_balances::Pallet::<Test>::free_balance(&keeper);
+        assert_eq!(
+            keeper_post, keeper_pre,
+            "zero-fee liquidation must NOT pay the keeper (no rounding floor)",
+        );
+    });
 }

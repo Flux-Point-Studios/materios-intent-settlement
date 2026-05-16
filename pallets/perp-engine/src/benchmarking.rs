@@ -156,9 +156,10 @@ mod benches {
         _(RawOrigin::Signed(caller), market_id, 500u32);
     }
 
-    /// Benchmarks the stub `governance_set_market` extrinsic. PR-B
-    /// measures config validation + try_state worsening-terms check +
-    /// Markets upsert + MarketSet event.
+    /// Benchmarks `governance_set_market`. The body measures config
+    /// validation (mm < im, bps caps, max_leverage ≤ chain cap, dust
+    /// floor, etc.) + duplicate-key check + Markets insert +
+    /// MarketRegistered event.
     #[benchmark]
     fn governance_set_market() {
         let market_id = bench_market_id();
