@@ -110,11 +110,12 @@ mod benches {
         _(RawOrigin::Signed(caller), 1_000_000_000_000_000_000u128);
     }
 
-    /// Benchmarks the stub `liquidate` extrinsic. PR-B measures the
-    /// keeper-bond reserve + Position read + mark vs MM compute +
-    /// (success path) full-close + fee split OR (fail path) bond
-    /// slash. PR-B parametrises over both paths since they have
-    /// distinct storage profiles.
+    /// Benchmarks the `liquidate` extrinsic. PR-C piece 1 (#259 §3.5):
+    /// keeper-bond gate read + Position read + mark vs MM compute +
+    /// fee transfer + bad-debt accumulator + Position remove +
+    /// PositionLiquidated event. Worst-case path measured here is the
+    /// breaker-trip case (extra Markets write); v1 will parametrise
+    /// (positive-equity vs bad-debt vs breaker-trip).
     #[benchmark]
     fn liquidate() {
         let caller: T::AccountId = whitelisted_caller();
@@ -122,24 +123,25 @@ mod benches {
         let market_id = bench_market_id();
 
         #[extrinsic_call]
-        _(
-            RawOrigin::Signed(caller),
-            target,
-            market_id,
-            Default::default(),
-        );
+        _(RawOrigin::Signed(caller), target, market_id);
     }
 
-    /// Benchmarks the stub `settle_funding` extrinsic. PR-B parametrises
-    /// over sample-count `n ∈ [1, MaxFundingSamplesPerEpoch]` because
-    /// the median sort dominates the cost at large `n`.
+    /// Benchmarks the `settle_funding` extrinsic. PR-C piece 2 (#259
+    /// §3.6 + §7.4): pull-based per-(market, target) funding settle.
+    /// Body measures funding-delta math + per-epoch clamp +
+    /// MarginAccount update + (optional) U256 snapshot bump on
+    /// funding-received + Position re-baseline + the
+    /// `FundingSettledForPosition` event. Bench setup needs an open
+    /// Position so the body exercises the full hot path — the
+    /// PR-D bench skeleton fills in (market, position) seeding.
     #[benchmark]
     fn settle_funding() {
         let caller: T::AccountId = whitelisted_caller();
+        let target: T::AccountId = whitelisted_caller();
         let market_id = bench_market_id();
 
         #[extrinsic_call]
-        _(RawOrigin::Signed(caller), market_id, 1u32);
+        _(RawOrigin::Signed(caller), market_id, target);
     }
 
     /// Benchmarks the stub `adjust_leverage` extrinsic. PR-B measures

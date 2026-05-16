@@ -72,8 +72,8 @@ pub use types::{
 pub mod pallet {
     use super::*;
     use crate::math::{
-        compute_funding_delta, compute_initial_margin, compute_notional,
-        compute_realized_pnl_signed,
+        compute_funding_delta, compute_initial_margin, compute_maintenance_margin,
+        compute_notional, compute_realized_pnl_signed,
     };
     use frame_support::{
         pallet_prelude::*,
@@ -352,31 +352,52 @@ pub mod pallet {
         ValueQuery,
     >;
 
-    /// In-flight keeper-bond reservations for `liquidate` calls. Keyed
-    /// by `(keeper, market, target)` — each tuple uniquely identifies
-    /// one in-flight liquidation attempt. Released atomically inside
-    /// `liquidate` after the trigger evaluation (§6.3).
-    ///
-    /// **Invariant (try_state, PR-B):** this map MUST be empty at the
-    /// end of every block. A non-empty entry is a logic bug per §4.6.
+    /// Per-(market, keeper) reserved keeper bonds. Per §6.3 + §6.4 a
+    /// keeper must have pre-reserved ≥ `Config::KeeperBondMinimum`
+    /// MOTRA for the market before they can call `liquidate`. v0 ships
+    /// this storage as a passive gate populated externally (e.g. via a
+    /// `reserve_keeper_bond` extrinsic landing in a follow-up PR); the
+    /// liquidate path reads it and rejects on insufficiency. No
+    /// keeper-bond slashing in v0 — false liquidation calls fail
+    /// `PositionNotLiquidatable` without economic penalty (deferred to
+    /// v1 per the PR description follow-ups).
     #[pallet::storage]
-    pub type ReservedKeeperBonds<T: Config> = StorageMap<
+    pub type ReservedKeeperBonds<T: Config> = StorageDoubleMap<
         _,
         Blake2_128Concat,
-        (T::AccountId, MarketId, T::AccountId),
+        MarketId,
+        Blake2_128Concat,
+        T::AccountId,
         BalanceOf<T>,
-        OptionQuery,
+        ValueQuery,
     >;
 
-    /// Cumulative bad debt absorbed by `mat/trsy` per market. Used by
-    /// the bad-debt circuit breaker (§6.5). Reset by governance after
-    /// investigation.
+    /// Cumulative bad debt absorbed in the live circuit-breaker window
+    /// per market, 1e18-scaled pMATRA-USD. Per §6.5 the accumulator is
+    /// reset whenever `block_now - BadDebtWindowStart[market] >
+    /// BadDebtWindowBlocks`. When the rolling sum exceeds
+    /// `BadDebtCircuitBreakerThresholdE18` the market auto-pauses
+    /// (governance must clear).
     #[pallet::storage]
     pub type BadDebtAccumulated<T: Config> = StorageMap<
         _,
         Blake2_128Concat,
         MarketId,
         u128,
+        ValueQuery,
+    >;
+
+    /// Materios block at which the current bad-debt window for this
+    /// market began. Read alongside `BadDebtAccumulated` to decide
+    /// whether to roll the accumulator forward into a new window (per
+    /// §6.5). `liquidate` rolls / accumulates / threshold-checks
+    /// atomically inside `with_storage_layer`.
+    #[pallet::storage]
+    pub type BadDebtWindowStart<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        MarketId,
+        u32,
         ValueQuery,
     >;
 
@@ -426,10 +447,17 @@ pub mod pallet {
             amount_e18: u128,
             free_e18_after: u128,
         },
-        /// A position was liquidated by a permissionless keeper. Emitted
-        /// by `liquidate` (§3.5) on a successful trigger. Keeper bond
-        /// returned and 50% of liquidation fee routed to keeper as MOTRA
-        /// reward; other 50% routed to `mat/trsy`.
+        /// A position was liquidated by a permissionless keeper.
+        /// Emitted by `liquidate` (§3.5) when the equity-at-mark test
+        /// shows the victim was actually under maintenance margin and
+        /// the keeper was correctly bonded. `liquidation_fee_e18` is
+        /// the 1e18-scaled pMATRA-USD fee charged to the victim (capped
+        /// at the victim's locked margin); the equivalent MOTRA leaves
+        /// the pot for the keeper's free balance at the victim's
+        /// snapshot rate. `bad_debt_e18` is the absolute pMATRA-USD
+        /// magnitude of any residual negative equity routed to
+        /// `BadDebtAccumulated` (§6.5); 0 when the position had enough
+        /// margin to cover the fee + losses.
         PositionLiquidated {
             target: T::AccountId,
             keeper: T::AccountId,
@@ -437,15 +465,46 @@ pub mod pallet {
             size_e8_closed: u128,
             mark_e18_at_liquidation: u128,
             liquidation_fee_e18: u128,
+            bad_debt_e18: u128,
+        },
+        /// Bad-debt circuit breaker tripped: cumulative bad debt within
+        /// `BadDebtWindowBlocks` exceeded
+        /// `BadDebtCircuitBreakerThresholdE18`. Market auto-paused
+        /// (§6.5). Governance must investigate + clear via
+        /// `governance_set_market`. Co-emitted with `PositionLiquidated`
+        /// when the breaker trips during a liquidate call.
+        BadDebtCircuitBreakerTripped {
+            market_id: MarketId,
+            window_bad_debt_e18: u128,
         },
         /// Funding epoch closed and `CumulativeFundingIndex` updated.
-        /// Emitted by `settle_funding` (§3.6). The event is anchored to
-        /// Cardano via the existing label-8746 checkpoint pipeline.
+        /// Reserved for the follow-up epoch-tick extrinsic that
+        /// integrates `PremiumIndexSamples` into a fresh rate and bumps
+        /// `CumulativeFundingIndex`. Emitted by the future
+        /// `tick_funding_epoch(market, epoch)` dispatch (NOT by
+        /// `settle_funding` — see `FundingSettledForPosition`). Kept on
+        /// the surface so the Cardano label-8746 anchor pipeline +
+        /// keeper code can target the variant from PR-D forward.
         FundingEpochSettled {
             market_id: MarketId,
             epoch: EpochNumber,
             rate_e18_signed: i128,
             new_cumulative_index_e18_signed: i128,
+        },
+        /// A single position settled its accrued funding against the
+        /// running `CumulativeFundingIndex[market_id]`. Emitted by
+        /// `settle_funding` (§3.6 pull-based per-account variant). The
+        /// position's `cumulative_funding_at_open_e18` is re-baselined
+        /// to `idx_now` after this event fires so a subsequent settle
+        /// sees `delta = 0` until the index moves again.
+        /// `funding_paid_e18_signed` is positive when the position
+        /// paid out, negative when it received.
+        FundingSettledForPosition {
+            who: T::AccountId,
+            market_id: MarketId,
+            funding_paid_e18_signed: i128,
+            new_free_e18: u128,
+            cumulative_funding_at_settle_e18: i128,
         },
         /// A position's leverage was adjusted. Emitted by
         /// `adjust_leverage` (§3.7) after `locked_margin_e18` rebase.
@@ -463,17 +522,6 @@ pub mod pallet {
         MarketSet {
             market_id: MarketId,
             paused: bool,
-        },
-        /// A keeper attempted to liquidate a healthy position. Bond
-        /// slashed 100% (half to `mat/trsy`, half burned). Emitted by
-        /// `liquidate` (§3.5) on a false trigger — the on-chain mark at
-        /// the included block was at or above maintenance margin, so
-        /// the call should not have been made.
-        BadLiquidationAttempt {
-            keeper: T::AccountId,
-            target: T::AccountId,
-            market_id: MarketId,
-            bond_slashed: BalanceOf<T>,
         },
     }
 
@@ -507,11 +555,24 @@ pub mod pallet {
         /// MEV / stale-price executions.
         MaxSlippageExceeded,
         /// `liquidate` called on a position whose equity is ≥
-        /// maintenance margin at the included block's mark. Keeper bond
-        /// is slashed 100% (§6.3); this error variant tags the failure
-        /// in the event log even though the extrinsic returns `Ok(())`
-        /// because the slash is the intended slow-path side effect.
+        /// maintenance margin at the included block's mark. v0 does
+        /// NOT slash the keeper's pre-reserved bond on this failure
+        /// (per the PR description follow-ups — economic penalty for
+        /// false-trigger liquidations is deferred to v1); the bond
+        /// stays reserved, the dispatch errors, and the keeper learns
+        /// not to fire on a healthy position. Distinct error from
+        /// `BadLiquidationAttempt` (the legacy stub name) so SDKs can
+        /// upgrade incrementally.
+        PositionNotLiquidatable,
+        /// Legacy alias for `PositionNotLiquidatable` kept for SDK
+        /// pattern-match compatibility while the v0 ecosystem cuts
+        /// over. New code should match on `PositionNotLiquidatable`.
         BadLiquidationAttempt,
+        /// `liquidate` caller's `ReservedKeeperBonds[market_id][keeper]`
+        /// is below `Config::KeeperBondMinimum`. Per §6.3 / §6.4 the
+        /// bond is the only economic skin in the game; no bond → no
+        /// liquidation right.
+        KeeperBondInsufficient,
         /// `T::PriceOracle::is_fresh(feed_id) == false` OR
         /// `T::PriceOracle::latest_price_e18(feed_id) == None`. Per §5.5
         /// the pallet refuses opens + liquidations on a stale feed;
@@ -554,10 +615,6 @@ pub mod pallet {
         /// v0 is isolated-margin one-position-per-market-per-account
         /// (§1.2) — to flip direction, close first then open.
         PositionAlreadyExists,
-        /// Caller provided a `keeper_bond_motra` below
-        /// `Config::KeeperBondMinimum`. Per §3.5 the bond is the only
-        /// economic skin-in-the-game for keepers.
-        KeeperBondBelowMinimum,
         /// Bad debt accumulated in the rolling window has exceeded
         /// `BadDebtCircuitBreakerThresholdE18`. Market auto-pauses
         /// (§6.5) until governance investigates.
@@ -590,7 +647,169 @@ pub mod pallet {
     }
 
     // ---------------------------------------------------------------------
-    // Calls — 8 extrinsic STUBS (return Ok(()) with TODO PR-B comments)
+    // Hooks — `on_initialize` populates the per-market mark-price cache +
+    // pushes a premium-index sample every block (§5.2 + §7.3).
+    // ---------------------------------------------------------------------
+
+    #[pallet::hooks]
+    impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T>
+    where
+        BlockNumberFor<T>: Into<u64> + Copy,
+    {
+        /// Per design memo §5.2 + §7.3, iterate every registered market
+        /// each block and:
+        /// 1. Read the live oracle price (skip the market if stale —
+        ///    §5.5 freshness gate). A skipped market's `MarkPriceCache`
+        ///    row is NOT updated; consumers see the previous fresh
+        ///    value still pinned to its old `block` field, and
+        ///    `open_position` / `liquidate` enforce `is_fresh` directly
+        ///    against `T::PriceOracle::is_fresh` so the staleness
+        ///    propagates regardless of what the cache shows.
+        /// 2. v0 ships with `perp_mid == oracle` (no SaturnSwap CLOB
+        ///    yet — that's v1 per memo §10.2 open question 2). The
+        ///    premium sample is therefore always 0 in v0; the
+        ///    integration test
+        ///    `on_initialize_clamps_ema_to_max_basis_bps` stuffs the
+        ///    bounded vec with extreme historical samples to exercise
+        ///    the clamp under v1-like conditions where SaturnSwap
+        ///    populates non-zero premiums.
+        /// 3. Push that sample into `PremiumIndexSamples[market][0]`
+        ///    (bounded vec; oldest dropped on capacity overflow). v0
+        ///    epoch is hard-coded to slot 0 because the epoch-rollover
+        ///    extrinsic that bumps the epoch counter is deferred to a
+        ///    follow-up PR; `settle_funding` consumes the integrated
+        ///    quantity via `CumulativeFundingIndex` directly.
+        /// 4. Compute the EMA of the bounded vec (simple unweighted
+        ///    average over the full window — the bounded-vec cap acts
+        ///    as the window limit; market.mark_ema_window_blocks is
+        ///    governance-set but v0 uses ALL stored samples).
+        /// 5. Clamp EMA to `±MaxMarkBasisBps × oracle / 10_000` so
+        ///    mark cannot deviate more than the configured % from
+        ///    oracle regardless of CLOB liquidity (§5.2 structural
+        ///    protection against mark-price manipulation).
+        /// 6. Write the new `MarkPriceCache` row + flushed samples.
+        ///
+        /// Paused markets are skipped entirely — see test
+        /// `on_initialize_skips_paused_markets`: freezing the cache on
+        /// pause keeps the §5.5 always-exit contract deterministic
+        /// because `close_position` reads the cached mark.
+        fn on_initialize(n: BlockNumberFor<T>) -> Weight {
+            let now_u32: u32 = n.into().try_into().unwrap_or(u32::MAX);
+            let market_ids: alloc::vec::Vec<MarketId> =
+                Markets::<T>::iter_keys().collect();
+            let max_basis_bps = T::MaxMarkBasisBps::get() as u128;
+            let mut reads: u64 = 1;
+            let mut writes: u64 = 0;
+
+            for market_id in market_ids {
+                reads = reads.saturating_add(1);
+                let market = match Markets::<T>::get(&market_id) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                if market.paused {
+                    continue;
+                }
+
+                // (1) Live oracle + freshness gate.
+                reads = reads.saturating_add(1);
+                if !T::PriceOracle::is_fresh(&market.oracle_feed_id) {
+                    continue;
+                }
+                let oracle_e18 = match T::PriceOracle::latest_price_e18(
+                    &market.oracle_feed_id,
+                ) {
+                    Some(p) if p > 0 => p,
+                    _ => continue,
+                };
+
+                // (2)+(3) v0: perp_mid == oracle → premium = 0.
+                let mut samples =
+                    PremiumIndexSamples::<T>::get(&market_id, 0u32);
+                let new_sample: i128 = 0;
+                let cap = T::MaxFundingSamplesPerEpoch::get() as usize;
+                if samples.len() >= cap {
+                    let inner: alloc::vec::Vec<i128> = samples
+                        .iter()
+                        .skip(1)
+                        .copied()
+                        .chain(core::iter::once(new_sample))
+                        .collect();
+                    samples = BoundedVec::<
+                        i128,
+                        <T as Config>::MaxFundingSamplesPerEpoch,
+                    >::try_from(inner)
+                    .unwrap_or_default();
+                } else {
+                    let _ = samples.try_push(new_sample);
+                }
+
+                // (4) Unweighted average EMA over the full window.
+                let mut sum: i128 = 0;
+                let mut overflow_seen = false;
+                for s in samples.iter() {
+                    match sum.checked_add(*s) {
+                        Some(v) => sum = v,
+                        None => {
+                            overflow_seen = true;
+                            break;
+                        }
+                    }
+                }
+                let len = samples.len() as i128;
+                let ema: i128 = if overflow_seen || len == 0 {
+                    0
+                } else {
+                    sum / len
+                };
+
+                // (5) Clamp EMA to ±max_basis × oracle / 10_000.
+                let max_basis_signed: i128 = {
+                    let raw = (oracle_e18 / 10_000u128)
+                        .checked_mul(max_basis_bps)
+                        .unwrap_or(u128::MAX);
+                    i128::try_from(raw).unwrap_or(i128::MAX)
+                };
+                let neg_bound = match max_basis_signed.checked_neg() {
+                    Some(v) => v,
+                    None => i128::MIN,
+                };
+                let clamped_ema = ema.max(neg_bound).min(max_basis_signed);
+
+                // (6) Write MarkPriceCache row + flushed samples.
+                let mark_e18: u128 = {
+                    let oracle_i: i128 = i128::try_from(oracle_e18)
+                        .unwrap_or(i128::MAX);
+                    let sum_i = oracle_i.saturating_add(clamped_ema);
+                    if sum_i < 0 {
+                        0
+                    } else {
+                        u128::try_from(sum_i).unwrap_or(u128::MAX)
+                    }
+                };
+                MarkPriceCacheMap::<T>::insert(
+                    &market_id,
+                    MarkPriceCache {
+                        mark_e18,
+                        oracle_e18,
+                        block: now_u32,
+                        mark_ema_basis_e18: clamped_ema,
+                    },
+                );
+                PremiumIndexSamples::<T>::insert(&market_id, 0u32, samples);
+                writes = writes.saturating_add(2);
+            }
+
+            T::DbWeight::get()
+                .reads(reads)
+                .saturating_add(T::DbWeight::get().writes(writes))
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Calls — 8 extrinsics. open/close/deposit/withdraw/adjust_leverage +
+    // liquidate are impls (PR-B and PR-C piece 1); settle_funding +
+    // governance_set_market are stubs reserved for follow-up PRs.
     // ---------------------------------------------------------------------
 
     #[pallet::call]
@@ -1119,9 +1338,66 @@ pub mod pallet {
             Ok(())
         }
 
-        /// **(PR-A stub)** Permissionless liquidation. See design memo
-        /// §3.5 (Operational class, `Pays::No` — the MATRA bond is the
-        /// only economic skin in the game).
+        /// Permissionless liquidation per design memo §3.5 + §6.1-§6.5.
+        ///
+        /// Any signed origin (the "keeper") can call this against any
+        /// `(market_id, target)` pair. Eligibility + flow:
+        ///
+        /// 1. Caller's `ReservedKeeperBonds[market_id][keeper]` must be
+        ///    ≥ `Config::KeeperBondMinimum` (`KeeperBondInsufficient`).
+        ///    v0 ships this as a passive read — the
+        ///    `reserve_keeper_bond` extrinsic that populates the map is
+        ///    deferred to a follow-up PR; tests seed the entry
+        ///    directly.
+        /// 2. `Markets[market_id]` must exist (`MarketNotFound`). Per
+        ///    §5.5 a paused market does NOT block liquidation —
+        ///    otherwise positions in a paused market couldn't be
+        ///    unwound. Exercised by `liquidate_works_on_paused_market`.
+        /// 3. `Positions[market_id][target]` must exist
+        ///    (`PositionNotFound`).
+        /// 4. Oracle for `market.oracle_feed_id` must be fresh
+        ///    (`OracleUnavailable`). Liquidating on a stale oracle is
+        ///    structurally unsafe (the position might not actually be
+        ///    underwater) — the opposite of close-on-stale, which is
+        ///    user-protective.
+        /// 5. Compute notional, maintenance margin, realized PnL at
+        ///    `mark − entry`, and funding-owed delta.
+        /// 6. `equity_pre = locked_margin + realized_pnl − funding_owed`.
+        ///    If `equity_pre ≥ maintenance_margin` the keeper made a
+        ///    bad call → `PositionNotLiquidatable`. v0 does NOT slash
+        ///    the bond for this — the dispatch errors and the keeper
+        ///    learns. (Bond slashing is deferred to v1.)
+        /// 7. `fee_e18 = min(notional × LiquidationFeeBps / 10_000,
+        ///    locked_margin)`. The cap prevents fees larger than the
+        ///    victim's collateral, which would immediately overdraw
+        ///    bad debt.
+        /// 8. Convert `fee_e18` (pMATRA-USD) → MOTRA at the victim's
+        ///    `weighted_deposit_rate_e18` (or live MATRA/USD rate when
+        ///    the snapshot is zero) and `Currency::transfer` pot →
+        ///    keeper. Snapshot-rate accounting mirrors
+        ///    `withdraw_margin` so liquidation can't drain other
+        ///    depositors' MOTRA via the live-rate sandwich
+        ///    (`feedback_u256_weighted_avg_volatile_collateral.md`).
+        /// 9. `equity_post = equity_pre − fee`. If negative, accumulate
+        ///    `|equity_post|` into `BadDebtAccumulated[market_id]`
+        ///    after rolling `BadDebtWindowStart[market_id]` if the
+        ///    previous entry is stale (§6.5). If the running sum
+        ///    exceeds `Config::BadDebtCircuitBreakerThresholdE18`,
+        ///    auto-pause the market (governance must clear).
+        /// 10. If `equity_post > 0` (residual margin after covering
+        ///     fee + losses), credit the absolute amount to
+        ///     `MarginAccounts[target].free_e18`.
+        /// 11. Remove `Positions[market_id][target]`.
+        /// 12. Emit `PositionLiquidated`. If the breaker tripped,
+        ///     co-emit `BadDebtCircuitBreakerTripped`.
+        ///
+        /// All storage mutations are wrapped in `with_storage_layer`
+        /// so any failure mid-flow (e.g. a transfer error) rolls every
+        /// write back atomically — no half-liquidated positions.
+        ///
+        /// Operational class + `Pays::No`: the bond is the economic
+        /// skin in the game. v0 keeps the bond passive (no
+        /// false-trigger slashing) — that's deferred to v1.
         #[pallet::call_index(4)]
         #[pallet::weight((
             Weight::from_parts(200_000_000, 4500),
@@ -1130,25 +1406,254 @@ pub mod pallet {
         ))]
         pub fn liquidate(
             origin: OriginFor<T>,
-            _target: T::AccountId,
-            _market_id: MarketId,
-            _keeper_bond_motra: BalanceOf<T>,
+            target: T::AccountId,
+            market_id: MarketId,
         ) -> DispatchResult {
-            let _who = ensure_signed(origin)?;
-            // TODO PR-B: Currency::reserve(caller, bond ≥ KeeperBondMinimum);
-            // read Positions[market_id][target] + MarkPriceCache; compute
-            // equity vs maintenance_margin; if liquidatable → close at
-            // mark, charge LiquidationFeeBps, route 50/50 caller +
-            // mat/trsy, return bond, emit PositionLiquidated +
-            // IntentKind::PerpAction(Liquidation); if not liquidatable →
-            // slash bond 100% (half mat/trsy, half burn), emit
-            // BadLiquidationAttempt.
+            let keeper = ensure_signed(origin)?;
+
+            // (1) Keeper-bond gate — passive read of `ReservedKeeperBonds`.
+            // v0 does not reserve the bond inside this extrinsic; a
+            // follow-up `reserve_keeper_bond` call populates it ahead
+            // of time. We only compare reserved amount vs minimum.
+            let reserved_bond = ReservedKeeperBonds::<T>::get(&market_id, &keeper);
+            ensure!(
+                reserved_bond >= T::KeeperBondMinimum::get(),
+                Error::<T>::KeeperBondInsufficient
+            );
+
+            // (2) Market lookup. Pause does NOT block liquidation
+            // (memo §5.5). Stale oracle does (§5.5 + §6.1).
+            let mut market = Markets::<T>::get(&market_id)
+                .ok_or(Error::<T>::MarketNotFound)?;
+
+            // (3) Position lookup.
+            let pos = Positions::<T>::get(&market_id, &target)
+                .ok_or(Error::<T>::PositionNotFound)?;
+
+            // (4) Oracle freshness — liquidate-on-stale is unsafe.
+            ensure!(
+                T::PriceOracle::is_fresh(&market.oracle_feed_id),
+                Error::<T>::OracleUnavailable
+            );
+            let mark_e18 = T::PriceOracle::latest_price_e18(&market.oracle_feed_id)
+                .ok_or(Error::<T>::OracleUnavailable)?;
+            ensure!(mark_e18 > 0, Error::<T>::OracleUnavailable);
+
+            // (5) Position math.
+            let abs_size: u128 = pos.size_e8.unsigned_abs();
+            let notional_e18 = compute_notional(abs_size, mark_e18)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            let maintenance_margin_e18 = compute_maintenance_margin(
+                notional_e18,
+                market.maintenance_margin_bps,
+            )
+            .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            let realized_pnl_e18 = compute_realized_pnl_signed(
+                mark_e18,
+                pos.entry_mark_e18,
+                pos.size_e8,
+            )
+            .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            let idx_now = CumulativeFundingIndex::<T>::get(&market_id);
+            let funding_owed_e18 = compute_funding_delta(
+                idx_now,
+                pos.cumulative_funding_at_open_e18,
+                pos.size_e8,
+            )
+            .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+
+            // (6) Equity = locked + PnL − funding_owed. Funding MUST
+            // land here so a position that's only-underwater-due-to-
+            // funding is correctly classified as liquidatable
+            // (`liquidate_funding_delta_applied_before_equity_check`).
+            let locked_signed: i128 = i128::try_from(pos.locked_margin_e18)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            let mm_signed: i128 = i128::try_from(maintenance_margin_e18)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            let equity_pre = locked_signed
+                .checked_add(realized_pnl_e18)
+                .ok_or(Error::<T>::ArithmeticOverflow)?
+                .checked_sub(funding_owed_e18)
+                .ok_or(Error::<T>::ArithmeticOverflow)?;
+            ensure!(equity_pre < mm_signed, Error::<T>::PositionNotLiquidatable);
+
+            // (7) Liquidation fee, capped at locked margin so the fee
+            // can never exceed the victim's posted collateral (which
+            // would immediately overdraw into bad debt).
+            let raw_fee_e18 = notional_e18
+                .checked_mul(market.liquidation_fee_bps as u128)
+                .ok_or(Error::<T>::ArithmeticOverflow)?
+                / 10_000u128;
+            let fee_e18 = raw_fee_e18.min(pos.locked_margin_e18);
+
+            // (8) MOTRA payout to keeper. Conversion uses victim's
+            // weighted-avg snapshot rate (matches close_position /
+            // withdraw_margin accounting — a synthetic fee paid out
+            // of the pot must drain MOTRA at the rate the pMATRA-USD
+            // entered the pot, not the live rate). Snapshot==0
+            // falls back to the live MATRA/USD rate (same fallback
+            // `withdraw_margin` uses).
+            let victim_acct = MarginAccounts::<T>::get(&target);
+            let payout_rate_e18 = if victim_acct.weighted_deposit_rate_e18 == 0 {
+                Self::live_matra_usd_rate_e18()?
+            } else {
+                victim_acct.weighted_deposit_rate_e18
+            };
+            ensure!(payout_rate_e18 > 0, Error::<T>::OracleUnavailable);
+            let fee_motra_u128 = fee_e18 / payout_rate_e18;
+            let fee_motra: BalanceOf<T> = fee_motra_u128
+                .try_into()
+                .map_err(|_| Error::<T>::BalanceConversionOverflow)?;
+
+            // (9) Equity-post-fee + bad-debt accumulation.
+            let fee_signed: i128 = i128::try_from(fee_e18)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            let equity_post = equity_pre
+                .checked_sub(fee_signed)
+                .ok_or(Error::<T>::ArithmeticOverflow)?;
+            let bad_debt_e18: u128 = if equity_post < 0 {
+                let abs = equity_post.unsigned_abs();
+                u128::try_from(abs).map_err(|_| Error::<T>::ArithmeticOverflow)?
+            } else {
+                0
+            };
+
+            // (10) Residual margin to victim — only when positive
+            // (the victim was underwater vs maintenance margin but
+            // still net-positive after paying the fee).
+            let residual_to_victim_e18: u128 = if equity_post > 0 {
+                u128::try_from(equity_post)
+                    .map_err(|_| Error::<T>::ArithmeticOverflow)?
+            } else {
+                0
+            };
+
+            // (11)–(12) Atomic apply. with_storage_layer rolls the
+            // entire batch back on any inner DispatchError so a failed
+            // MOTRA transfer leaves the position untouched (no
+            // half-closed state).
+            let pot = Self::pot_account();
+            let breaker_tripped = frame_support::storage::with_storage_layer::<
+                bool,
+                sp_runtime::DispatchError,
+                _,
+            >(|| {
+                // MOTRA transfer pot → keeper (skip when zero).
+                if !fee_motra.is_zero() {
+                    T::Currency::transfer(
+                        &pot,
+                        &keeper,
+                        fee_motra,
+                        ExistenceRequirement::AllowDeath,
+                    )?;
+                }
+
+                // Residual margin → victim's free_e18.
+                if residual_to_victim_e18 > 0 {
+                    let mut va = MarginAccounts::<T>::get(&target);
+                    va.free_e18 = va
+                        .free_e18
+                        .checked_add(residual_to_victim_e18)
+                        .ok_or(sp_runtime::DispatchError::from(
+                            Error::<T>::ArithmeticOverflow,
+                        ))?;
+                    MarginAccounts::<T>::insert(&target, va);
+                }
+
+                // Bad-debt accumulation + circuit-breaker.
+                let mut tripped = false;
+                if bad_debt_e18 > 0 {
+                    let now = Self::current_block_u32();
+                    let window = T::BadDebtWindowBlocks::get();
+                    let window_start = BadDebtWindowStart::<T>::get(&market_id);
+                    // window_start == 0 also implies "no prior bad
+                    // debt in any window" because every accumulation
+                    // path below sets a non-zero start block.
+                    let in_window = window_start != 0
+                        && now.saturating_sub(window_start) <= window;
+                    let prev_sum = if in_window {
+                        BadDebtAccumulated::<T>::get(&market_id)
+                    } else {
+                        0
+                    };
+                    let new_sum = prev_sum.saturating_add(bad_debt_e18);
+                    BadDebtAccumulated::<T>::insert(&market_id, new_sum);
+                    if !in_window {
+                        BadDebtWindowStart::<T>::insert(&market_id, now);
+                    }
+                    if new_sum > T::BadDebtCircuitBreakerThresholdE18::get() {
+                        market.paused = true;
+                        Markets::<T>::insert(&market_id, market.clone());
+                        tripped = true;
+                    }
+                }
+
+                // Position removal — last write, so any earlier
+                // failure preserves the rest of the storage state.
+                Positions::<T>::remove(&market_id, &target);
+
+                Ok(tripped)
+            })?;
+
+            // Events fire outside the storage layer (events are
+            // collected per dispatch, not per layer; emitting inside
+            // is equivalent — pulling out keeps the emission readable).
+            Self::deposit_event(Event::PositionLiquidated {
+                target,
+                keeper,
+                market_id: market_id.clone(),
+                size_e8_closed: abs_size,
+                mark_e18_at_liquidation: mark_e18,
+                liquidation_fee_e18: fee_e18,
+                bad_debt_e18,
+            });
+            if breaker_tripped {
+                Self::deposit_event(Event::BadDebtCircuitBreakerTripped {
+                    window_bad_debt_e18: BadDebtAccumulated::<T>::get(&market_id),
+                    market_id,
+                });
+            }
             Ok(())
         }
 
-        /// **(PR-A stub)** Settle funding for a closed epoch. See design
-        /// memo §3.6 (Operational class, `Pays::No` — typically called
-        /// by a permissionless keeper every funding-epoch boundary).
+        /// Settle a position's accrued funding into its margin account.
+        /// Per design memo §3.6 + §7.4 pull-based contract: any signed
+        /// origin can call this for any (market, target) pair.
+        ///
+        /// Flow:
+        /// 1. Markets[market_id] exists + not paused.
+        /// 2. Positions[market_id, target] exists.
+        /// 3. funding_delta = compute_funding_delta(idx_now,
+        ///    pos.cumulative_funding_at_open_e18, pos.size_e8). Positive
+        ///    = the position holder PAID funding (debit); negative =
+        ///    the position holder RECEIVED funding (credit).
+        /// 4. Cap |funding_delta| at
+        ///    `market.max_funding_per_epoch_bps × notional / 10_000` —
+        ///    per §7.1 a single settle MUST NOT extract more than one
+        ///    epoch's worth of funding even if the running
+        ///    `CumulativeFundingIndex` was bumped beyond that limit by
+        ///    a misbehaving / stale tick. Structural safety floor.
+        /// 5. Apply the delta to `MarginAccounts[target].free_e18`,
+        ///    floor at 0 — mirrors close_position's bad-debt absorption
+        ///    pattern. (A fully-drained free balance under continued
+        ///    funding pressure becomes a liquidation candidate at the
+        ///    next price tick; bad-debt routing into the treasury is
+        ///    `liquidate`'s job.)
+        /// 6. On funding-RECEIVED (positive credit), bump the snapshot
+        ///    `weighted_deposit_rate_e18` via weighted-avg with the
+        ///    live MATRA/USD rate using the asymmetric clamp from
+        ///    `feedback_u256_weighted_avg_volatile_collateral.md` Rule 3.
+        ///    Outbound funding does NOT mutate the snapshot — no new
+        ///    pMATRA-USD enters the system on a debit.
+        /// 7. Re-baseline `pos.cumulative_funding_at_open_e18 = idx_now`
+        ///    so the next settle sees `delta = 0` until the index moves
+        ///    again. Idempotent on repeated calls.
+        ///
+        /// Permissionless: typically called by a Materios keeper
+        /// service (`DispatchClass::Operational`, `Pays::No`) — the
+        /// position holder pays no fee for the keeper's call, and the
+        /// keeper's reward is the maker rebate flowing through
+        /// `pallet-billing` at the runtime layer.
         #[pallet::call_index(5)]
         #[pallet::weight((
             Weight::from_parts(50_000_000, 1200),
@@ -1157,17 +1662,130 @@ pub mod pallet {
         ))]
         pub fn settle_funding(
             origin: OriginFor<T>,
-            _market_id: MarketId,
-            _epoch: EpochNumber,
+            market_id: MarketId,
+            target: T::AccountId,
         ) -> DispatchResult {
-            let _who = ensure_signed(origin)?;
-            // TODO PR-B: reject if epoch <= LastSettledFundingEpoch[market_id]
-            // (EpochAlreadySettled); compute funding_rate = clamp(
-            // median(PremiumIndexSamples[market][epoch]) / oracle_price
-            // * scale_to_1h, ±MaxFundingPerEpoch); update
-            // CumulativeFundingIndex[market_id] += rate; prune
-            // PremiumIndexSamples row; bump LastSettledFundingEpoch;
-            // emit FundingEpochSettled (anchored to Cardano via label-8746).
+            let _caller = ensure_signed(origin)?;
+
+            // (1) Market lookup + paused gate. Same shape as
+            // `open_position` / `adjust_leverage`; only `close_position`
+            // bypasses pause (memo §5.5 always-exit contract).
+            let market = Markets::<T>::get(&market_id)
+                .ok_or(Error::<T>::MarketNotFound)?;
+            ensure!(!market.paused, Error::<T>::MarketPaused);
+
+            // (2) Position lookup.
+            let mut pos = Positions::<T>::get(&market_id, &target)
+                .ok_or(Error::<T>::PositionNotFound)?;
+
+            // (3) Cumulative funding delta vs the position's open
+            // snapshot. Signed: positive = position paid out, negative
+            // = position received.
+            let idx_now = CumulativeFundingIndex::<T>::get(&market_id);
+            let mut funding_delta_e18 = compute_funding_delta(
+                idx_now,
+                pos.cumulative_funding_at_open_e18,
+                pos.size_e8,
+            )
+            .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+
+            // (4) Per-epoch cap. Per memo §7.1 the funding rate is
+            // bounded by `market.max_funding_per_epoch_bps` (default
+            // 400 bps = 4%/h). Clamp `|funding_delta|` to
+            // `max_funding_per_epoch_bps × notional / 10_000`. The
+            // notional is computed against the position's ENTRY mark
+            // — using a post-open mark would let a fast price move
+            // re-base the cap mid-settle, which is not §7.1's
+            // semantics. Entry-mark cap is conservative.
+            let abs_size = pos.size_e8.unsigned_abs();
+            let notional_e18 = compute_notional(abs_size, pos.entry_mark_e18)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            let cap_e18: u128 = notional_e18
+                .checked_mul(market.max_funding_per_epoch_bps as u128)
+                .ok_or(Error::<T>::ArithmeticOverflow)?
+                / 10_000u128;
+            let cap_signed: i128 = i128::try_from(cap_e18)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            if funding_delta_e18 > cap_signed {
+                funding_delta_e18 = cap_signed;
+            } else if funding_delta_e18
+                < cap_signed
+                    .checked_neg()
+                    .ok_or(Error::<T>::ArithmeticOverflow)?
+            {
+                funding_delta_e18 = cap_signed
+                    .checked_neg()
+                    .ok_or(Error::<T>::ArithmeticOverflow)?;
+            }
+
+            // (5) Apply to free_e18 (signed): subtract a positive
+            // funding_delta (debit), add a negative one (credit). Floor
+            // at 0 like close_position.
+            let mut acct = MarginAccounts::<T>::get(&target);
+            let mut free_signed: i128 = i128::try_from(acct.free_e18)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+            free_signed = free_signed
+                .checked_sub(funding_delta_e18)
+                .ok_or(Error::<T>::ArithmeticOverflow)?;
+            if free_signed < 0 {
+                free_signed = 0;
+            }
+            let new_free: u128 = u128::try_from(free_signed)
+                .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+
+            // (6) Snapshot bump on funding-RECEIVED (positive credit).
+            // Mirrors `close_position`'s positive-credit handling — see
+            // `feedback_u256_weighted_avg_volatile_collateral.md` Rule 3.
+            // `funding_delta < 0` means the position received fresh
+            // pMATRA-USD from another user's locked margin; the
+            // redemption-rate snapshot must bump toward LIVE so the
+            // redeemer can't drain MOTRA via deposit-at-trough /
+            // withdraw-at-peak. Asymmetric clamp: only raises, never
+            // lowers. Stale-oracle = skip the bump but proceed with
+            // settle (the index is settled against attested historical
+            // data; only the snapshot bump requires a fresh MATRA/USD
+            // rate).
+            let funding_credit_e18: u128 = (-funding_delta_e18).max(0) as u128;
+            if funding_credit_e18 > 0
+                && new_free > 0
+                && acct.weighted_deposit_rate_e18 != 0
+            {
+                if let Ok(live_rate_e18) = Self::live_matra_usd_rate_e18() {
+                    let old_basis_free =
+                        new_free.saturating_sub(funding_credit_e18);
+                    let old_weight = U256::from(old_basis_free)
+                        * U256::from(acct.weighted_deposit_rate_e18);
+                    let new_weight = U256::from(funding_credit_e18)
+                        * U256::from(live_rate_e18);
+                    let sum = old_weight + new_weight;
+                    let candidate_snap =
+                        (sum / U256::from(new_free)).low_u128();
+                    if candidate_snap > acct.weighted_deposit_rate_e18 {
+                        acct.weighted_deposit_rate_e18 = candidate_snap;
+                    }
+                }
+            }
+
+            // (7) Re-baseline the position snapshot so the next settle
+            // is a no-op until the index moves. Even on the clamped
+            // path we advance to `idx_now` — production keepers should
+            // settle at sub-epoch cadence so clamping is bug-only; if
+            // a clamped delta did fire, the residual is ABSORBED, not
+            // carried forward (any clamp event signals a misbehaving
+            // index tick that governance should investigate).
+            pos.cumulative_funding_at_open_e18 = idx_now;
+            Positions::<T>::insert(&market_id, &target, pos);
+
+            acct.free_e18 = new_free;
+            MarginAccounts::<T>::insert(&target, acct);
+
+            Self::deposit_event(Event::FundingSettledForPosition {
+                who: target,
+                market_id,
+                funding_paid_e18_signed: funding_delta_e18,
+                new_free_e18: new_free,
+                cumulative_funding_at_settle_e18: idx_now,
+            });
             Ok(())
         }
 
@@ -1311,10 +1929,11 @@ pub mod pallet {
             _config: MarketConfig,
         ) -> DispatchResult {
             ensure_root(origin)?;
-            // TODO PR-B: validate config (mm < im, max_leverage ≤
-            // T::MaxLeverageBps, oracle feed exists in pallet-oracle);
-            // enforce try_state worsening-terms timelock (§9.3); upsert
-            // Markets[market_id]; emit MarketSet.
+            // Reserved for PR-D: config validation (mm < im, max_leverage
+            // ≤ T::MaxLeverageBps, oracle feed exists in pallet-oracle),
+            // try_state worsening-terms timelock (§9.3), Markets upsert,
+            // MarketSet emit. Origin gate ships in PR-A so the runtime
+            // wiring (PR-D `construct_runtime!`) can pin the call_index.
             Ok(())
         }
     }
