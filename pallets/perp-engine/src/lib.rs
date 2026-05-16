@@ -37,13 +37,24 @@
 //! ## Multi-PR sequence
 //!
 //! - **PR-A**: types + storage + extrinsic stubs (merged).
-//! - **PR-B (this one)**: 5/8 extrinsic impl bodies + math module +
+//! - **PR-B**: 5/8 extrinsic impl bodies + math module +
 //!   18 new behaviour tests.
 //! - **PR-C**: `liquidate` + `settle_funding` + `MarkPriceCache`
 //!   on_initialize hook + `IntentKind::PerpAction` extension on
 //!   `pallet-intent-settlement` (§8.2).
-//! - **PR-D**: wire into `materios-runtime` `construct_runtime!`, with
-//!   genesis `MarketsPaused = true` kill-switch per §next-steps.
+//! - **PR-D (this one)**: keeper-bond reserve/release extrinsics +
+//!   false-trigger slash inside `liquidate` per spec §6.3. The slash
+//!   path uses the Ok-return + emit-on-fail pattern
+//!   (`feedback_substrate_ok_return_emit_on_fail_pattern.md`):
+//!   `liquidate` returns `Ok(())` when the keeper triggered against a
+//!   healthy position so the punitive storage writes (bond decrement,
+//!   `repatriate_reserved`, `slash_reserved`) survive
+//!   `with_storage_layer`. Off-chain callers MUST scan
+//!   `triggered_events` for `LiquidationBondSlashed` to detect the
+//!   false-trigger outcome — `is_success` is wrong.
+//! - **PR-E**: wire into `materios-runtime` `construct_runtime!`, with
+//!   genesis `MarketsPaused = true` kill-switch per §next-steps, plus
+//!   spec_version bump + WASM build + ceremony.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -77,12 +88,14 @@ pub mod pallet {
     };
     use frame_support::{
         pallet_prelude::*,
-        traits::{Currency, ExistenceRequirement, ReservableCurrency},
+        traits::{tokens::BalanceStatus, Currency, ExistenceRequirement, ReservableCurrency},
         BoundedVec, PalletId,
     };
     use frame_system::pallet_prelude::*;
     use sp_core::U256;
-    use sp_runtime::traits::{AccountIdConversion, SaturatedConversion, Zero};
+    use sp_runtime::traits::{
+        AccountIdConversion, CheckedAdd, SaturatedConversion, Saturating, Zero,
+    };
 
     /// Balance alias derived from `T::Currency`. Used for MOTRA-denominated
     /// fields (margin top-ups, keeper bonds, treasury fees) — distinct
@@ -354,13 +367,15 @@ pub mod pallet {
 
     /// Per-(market, keeper) reserved keeper bonds. Per §6.3 + §6.4 a
     /// keeper must have pre-reserved ≥ `Config::KeeperBondMinimum`
-    /// MOTRA for the market before they can call `liquidate`. v0 ships
-    /// this storage as a passive gate populated externally (e.g. via a
-    /// `reserve_keeper_bond` extrinsic landing in a follow-up PR); the
-    /// liquidate path reads it and rejects on insufficiency. No
-    /// keeper-bond slashing in v0 — false liquidation calls fail
-    /// `PositionNotLiquidatable` without economic penalty (deferred to
-    /// v1 per the PR description follow-ups).
+    /// MOTRA for the market before they can call `liquidate`. Keepers
+    /// populate this map via [`pallet::Pallet::reserve_keeper_bond`]
+    /// and recover their bond via
+    /// [`pallet::Pallet::release_keeper_bond`]. The `liquidate` path
+    /// reads it as a gate AND slashes the full `KeeperBondMinimum` on
+    /// false trigger (§6.3) — 50% to `mat/trsy`, 50% burned via
+    /// `slash_reserved`. Pallet bookkeeping in this map MUST stay
+    /// `≤ T::Currency::reserved_balance(&keeper)` (the Currency trait
+    /// is source of truth for the actual reserve).
     #[pallet::storage]
     pub type ReservedKeeperBonds<T: Config> = StorageDoubleMap<
         _,
@@ -523,6 +538,55 @@ pub mod pallet {
             market_id: MarketId,
             paused: bool,
         },
+        /// A keeper reserved additional bond for a market via
+        /// `reserve_keeper_bond` (PR-D, §6.3). `amount` is the delta
+        /// just reserved; `total_reserved` is the new total
+        /// `ReservedKeeperBonds[market_id][keeper]` (delta plus any
+        /// existing bond). Pairs with `KeeperBondReleased` for SDK
+        /// keeper-state tracking. The underlying MOTRA is held by
+        /// `T::Currency::reserve`; the pallet stores the same amount
+        /// in `ReservedKeeperBonds` for accounting.
+        KeeperBondReserved {
+            keeper: T::AccountId,
+            market_id: MarketId,
+            amount: BalanceOf<T>,
+            total_reserved: BalanceOf<T>,
+        },
+        /// A keeper released bond from a market via
+        /// `release_keeper_bond` (PR-D, §6.3). `amount` is the delta
+        /// just released; `total_reserved_after` is the post-release
+        /// pallet bookkeeping in `ReservedKeeperBonds`. The
+        /// underlying MOTRA is moved to the keeper's free balance by
+        /// `T::Currency::unreserve`.
+        KeeperBondReleased {
+            keeper: T::AccountId,
+            market_id: MarketId,
+            amount: BalanceOf<T>,
+            total_reserved_after: BalanceOf<T>,
+        },
+        /// `liquidate` was called against a position whose equity is
+        /// ≥ maintenance margin (false trigger). Per spec §6.3 the
+        /// keeper's full `KeeperBondMinimum` is slashed — half
+        /// `repatriate_reserved` to the `mat/trsy` PalletId account
+        /// (treasury), half `slash_reserved` (burn via dropped
+        /// `NegativeImbalance`). This event is the off-chain caller's
+        /// ONLY signal of the false-trigger verdict — the dispatch
+        /// returns `Ok(())` so the slash writes survive
+        /// `with_storage_layer`
+        /// (`feedback_substrate_ok_return_emit_on_fail_pattern.md`).
+        /// `equity_e18_signed` + `mm_e18` are forensic: they let
+        /// off-chain reconstruct why the keeper's local computation
+        /// disagreed with the runtime.
+        LiquidationBondSlashed {
+            keeper: T::AccountId,
+            target: T::AccountId,
+            market_id: MarketId,
+            slash_amount: BalanceOf<T>,
+            treasury_share: BalanceOf<T>,
+            burn_share: BalanceOf<T>,
+            equity_e18_signed: i128,
+            mm_e18: u128,
+        },
     }
 
     // ---------------------------------------------------------------------
@@ -554,15 +618,21 @@ pub mod pallet {
         /// is tighter than the actual deviation. Protects users from
         /// MEV / stale-price executions.
         MaxSlippageExceeded,
-        /// `liquidate` called on a position whose equity is ≥
-        /// maintenance margin at the included block's mark. v0 does
-        /// NOT slash the keeper's pre-reserved bond on this failure
-        /// (per the PR description follow-ups — economic penalty for
-        /// false-trigger liquidations is deferred to v1); the bond
-        /// stays reserved, the dispatch errors, and the keeper learns
-        /// not to fire on a healthy position. Distinct error from
-        /// `BadLiquidationAttempt` (the legacy stub name) so SDKs can
-        /// upgrade incrementally.
+        /// Surfaced (as an `Error` *variant*, but never returned to the
+        /// caller) when `liquidate` is called against a position whose
+        /// equity is ≥ maintenance margin. v0 slashes the keeper bond
+        /// on this false-trigger via the Ok-return + emit-on-fail
+        /// pattern (see
+        /// `feedback_substrate_ok_return_emit_on_fail_pattern.md`):
+        /// `liquidate` returns `Ok(())` so the slash storage writes
+        /// survive `with_storage_layer`, and the off-chain caller MUST
+        /// detect the slash by scanning `triggered_events` for
+        /// `LiquidationBondSlashed`. The variant is retained so SDK
+        /// pattern-match completeness compiles and so future v1
+        /// extrinsics (e.g. a hypothetical `try_liquidate` that
+        /// returns the verdict synchronously) can surface it
+        /// directly. Distinct from `BadLiquidationAttempt` (legacy
+        /// stub name) so SDKs can upgrade incrementally.
         PositionNotLiquidatable,
         /// Legacy alias for `PositionNotLiquidatable` kept for SDK
         /// pattern-match compatibility while the v0 ecosystem cuts
@@ -644,6 +714,19 @@ pub mod pallet {
         /// with `PositionSizeBelowMin`; this variant flags an exact-zero
         /// open which carries no economic meaning.
         PositionSizeZero,
+        /// `reserve_keeper_bond` / `release_keeper_bond` called with
+        /// `amount == 0`. Zero-amount calls would emit a no-op event
+        /// and bloat the event log without economic effect — reject
+        /// at the API surface so callers fail fast.
+        ZeroAmount,
+        /// `release_keeper_bond` called with `amount > ReservedKeeperBonds[market_id][keeper]`.
+        /// The pallet's bookkeeping refuses to underflow; if the
+        /// keeper's `Currency::reserved_balance` is higher than the
+        /// pallet thinks (e.g. some other pallet shares the same
+        /// reserve account — impossible in v0 since this pallet is
+        /// the only consumer), the caller must release via that
+        /// pallet's path.
+        KeeperBondUnderflow,
     }
 
     // ---------------------------------------------------------------------
@@ -1345,10 +1428,8 @@ pub mod pallet {
         ///
         /// 1. Caller's `ReservedKeeperBonds[market_id][keeper]` must be
         ///    ≥ `Config::KeeperBondMinimum` (`KeeperBondInsufficient`).
-        ///    v0 ships this as a passive read — the
-        ///    `reserve_keeper_bond` extrinsic that populates the map is
-        ///    deferred to a follow-up PR; tests seed the entry
-        ///    directly.
+        ///    Keepers populate the bond via
+        ///    [`pallet::Pallet::reserve_keeper_bond`] before calling.
         /// 2. `Markets[market_id]` must exist (`MarketNotFound`). Per
         ///    §5.5 a paused market does NOT block liquidation —
         ///    otherwise positions in a paused market couldn't be
@@ -1364,9 +1445,13 @@ pub mod pallet {
         ///    `mark − entry`, and funding-owed delta.
         /// 6. `equity_pre = locked_margin + realized_pnl − funding_owed`.
         ///    If `equity_pre ≥ maintenance_margin` the keeper made a
-        ///    bad call → `PositionNotLiquidatable`. v0 does NOT slash
-        ///    the bond for this — the dispatch errors and the keeper
-        ///    learns. (Bond slashing is deferred to v1.)
+        ///    false-trigger call — slash the keeper's bond per §6.3
+        ///    (see below). The dispatch returns `Ok(())` with the
+        ///    `LiquidationBondSlashed` event; off-chain callers MUST
+        ///    scan `triggered_events` for that event to detect a
+        ///    false-trigger outcome, not rely on `is_success`. The
+        ///    position is NOT closed; the position holder is
+        ///    untouched.
         /// 7. `fee_e18 = min(notional × LiquidationFeeBps / 10_000,
         ///    locked_margin)`. The cap prevents fees larger than the
         ///    victim's collateral, which would immediately overdraw
@@ -1391,13 +1476,41 @@ pub mod pallet {
         /// 12. Emit `PositionLiquidated`. If the breaker tripped,
         ///     co-emit `BadDebtCircuitBreakerTripped`.
         ///
-        /// All storage mutations are wrapped in `with_storage_layer`
-        /// so any failure mid-flow (e.g. a transfer error) rolls every
-        /// write back atomically — no half-liquidated positions.
+        /// All happy-path storage mutations are wrapped in
+        /// `with_storage_layer` so any failure mid-flow (e.g. a
+        /// transfer error) rolls every write back atomically — no
+        /// half-liquidated positions.
+        ///
+        /// ## False-trigger slash flow (§6.3) — Ok-return + emit-on-fail
+        ///
+        /// When `equity_pre >= mm_signed`, the keeper called against
+        /// a HEALTHY position. v0 punishes this with a full
+        /// `KeeperBondMinimum` slash:
+        /// - 50% (`treasury_share`) → `repatriate_reserved` to the
+        ///   `mat/trsy` PalletId account (same treasury spec-225 uses).
+        /// - 50% (`burn_share`) → `slash_reserved`; the returned
+        ///   `NegativeImbalance` is dropped (burn).
+        /// - `ReservedKeeperBonds[market_id][keeper]` is decremented
+        ///   by the full `KeeperBondMinimum` via `saturating_sub`
+        ///   (the bond gate already ensured the reserve was ≥ minimum).
+        ///
+        /// The slash is wrapped in `with_storage_layer` so it rolls
+        /// back if `repatriate_reserved` fails (e.g. treasury
+        /// account ED issue) — in that case the dispatch errors
+        /// `Err(_)`. On success the dispatch returns `Ok(())` so the
+        /// strike survives the outer auto-wrap of `#[pallet::call]`.
+        /// This is the canonical Ok-return + emit-on-fail pattern
+        /// documented at
+        /// `feedback_substrate_ok_return_emit_on_fail_pattern.md`:
+        /// dispatchables that punish via storage writes MUST return
+        /// `Ok(())` so the punitive writes persist. SDK callers MUST
+        /// scan `triggered_events` for `LiquidationBondSlashed`
+        /// against their own signer to detect a false-trigger
+        /// outcome.
         ///
         /// Operational class + `Pays::No`: the bond is the economic
-        /// skin in the game. v0 keeps the bond passive (no
-        /// false-trigger slashing) — that's deferred to v1.
+        /// skin in the game; the dispatch is fee-free for the
+        /// happy-path liquidation and the false-trigger slash event.
         #[pallet::call_index(4)]
         #[pallet::weight((
             Weight::from_parts(200_000_000, 4500),
@@ -1475,7 +1588,23 @@ pub mod pallet {
                 .ok_or(Error::<T>::ArithmeticOverflow)?
                 .checked_sub(funding_owed_e18)
                 .ok_or(Error::<T>::ArithmeticOverflow)?;
-            ensure!(equity_pre < mm_signed, Error::<T>::PositionNotLiquidatable);
+
+            // (6.5) False-trigger branch (§6.3). If equity is at or
+            // above maintenance margin, the keeper called against a
+            // HEALTHY position — slash the full KeeperBondMinimum.
+            // Returns Ok(()) on success so the slash writes survive
+            // the outer #[pallet::call] storage layer
+            // (`feedback_substrate_ok_return_emit_on_fail_pattern.md`).
+            if equity_pre >= mm_signed {
+                Self::do_slash_keeper_bond_for_false_trigger(
+                    &keeper,
+                    &target,
+                    &market_id,
+                    equity_pre,
+                    maintenance_margin_e18,
+                )?;
+                return Ok(());
+            }
 
             // (7) Liquidation fee, capped at locked margin so the fee
             // can never exceed the victim's posted collateral (which
@@ -1995,11 +2124,147 @@ pub mod pallet {
             _config: MarketConfig,
         ) -> DispatchResult {
             ensure_root(origin)?;
-            // Reserved for PR-D: config validation (mm < im, max_leverage
-            // ≤ T::MaxLeverageBps, oracle feed exists in pallet-oracle),
-            // try_state worsening-terms timelock (§9.3), Markets upsert,
-            // MarketSet emit. Origin gate ships in PR-A so the runtime
-            // wiring (PR-D `construct_runtime!`) can pin the call_index.
+            // Reserved for PR-E (runtime wire-up): config validation
+            // (mm < im, max_leverage ≤ T::MaxLeverageBps, oracle feed
+            // exists in pallet-oracle), try_state worsening-terms
+            // timelock (§9.3), Markets upsert, MarketSet emit. Origin
+            // gate ships in PR-A so the runtime `construct_runtime!`
+            // can pin the call_index across the PR sequence.
+            Ok(())
+        }
+
+        /// Reserve `amount` MOTRA as a keeper bond for `market_id`.
+        /// Per spec §6.3 + §6.4 a keeper must have at least
+        /// `Config::KeeperBondMinimum` reserved on the (market, keeper)
+        /// slot before they may call `liquidate` for that market;
+        /// reserving more than the minimum is allowed (the bond
+        /// accumulates linearly — `KeeperBondReserved.amount` is the
+        /// delta, `total_reserved` is the post-call sum).
+        ///
+        /// The bond is moved from `Currency::free_balance` to
+        /// `Currency::reserved_balance` via `T::Currency::reserve`.
+        /// Insufficient free balance fails with whatever the inner
+        /// `Currency::reserve` surfaces (typically
+        /// `pallet_balances::Error::<T>::InsufficientBalance`); the
+        /// `?` propagates that as the dispatch error directly so SDK
+        /// callers see the standard Currency error rather than a
+        /// pallet-perp-engine alias.
+        ///
+        /// `amount == 0` is rejected with `ZeroAmount` to keep the
+        /// event log clean and the SDK fail-fast contract sharp.
+        ///
+        /// Pair with [`release_keeper_bond`] to recover the bond.
+        #[pallet::call_index(8)]
+        #[pallet::weight(Weight::from_parts(40_000_000, 3000))]
+        pub fn reserve_keeper_bond(
+            origin: OriginFor<T>,
+            market_id: MarketId,
+            amount: BalanceOf<T>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+
+            ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
+            ensure!(
+                Markets::<T>::contains_key(&market_id),
+                Error::<T>::MarketNotFound,
+            );
+
+            // Move free → reserved on the Currency. Surfaces the
+            // standard `pallet_balances` InsufficientBalance / KeepAlive
+            // failure modes directly via the `?`.
+            T::Currency::reserve(&who, amount)?;
+
+            // Bump pallet bookkeeping. Currency::reserve is the
+            // authoritative source; this map is the per-market split
+            // (Currency has no market dimension). checked_add catches
+            // the unrealistic case of an overflow at u128/u64 scale.
+            let total_reserved = ReservedKeeperBonds::<T>::try_mutate(
+                &market_id,
+                &who,
+                |existing| -> Result<BalanceOf<T>, Error<T>> {
+                    let new_total = existing
+                        .checked_add(&amount)
+                        .ok_or(Error::<T>::ArithmeticOverflow)?;
+                    *existing = new_total;
+                    Ok(new_total)
+                },
+            )?;
+
+            Self::deposit_event(Event::KeeperBondReserved {
+                keeper: who,
+                market_id,
+                amount,
+                total_reserved,
+            });
+            Ok(())
+        }
+
+        /// Release `amount` MOTRA of the caller's keeper bond for
+        /// `market_id`. The amount must be ≤ the keeper's current
+        /// `ReservedKeeperBonds[market_id][keeper]` else
+        /// `KeeperBondUnderflow`. `amount == 0` is rejected with
+        /// `ZeroAmount`.
+        ///
+        /// On success, `T::Currency::unreserve` moves the bond back
+        /// to free balance and the pallet bookkeeping is decremented
+        /// by the same amount. `Currency::unreserve` cannot fail
+        /// (returns leftover); we assert leftover == 0 via
+        /// `debug_assert` since the pre-check guarantees the pallet
+        /// never claims more than `Currency::reserve` actually holds
+        /// (try_state invariant).
+        ///
+        /// The released bond is usable for future
+        /// [`reserve_keeper_bond`] calls or any other free-balance
+        /// operation.
+        #[pallet::call_index(9)]
+        #[pallet::weight(Weight::from_parts(40_000_000, 3000))]
+        pub fn release_keeper_bond(
+            origin: OriginFor<T>,
+            market_id: MarketId,
+            amount: BalanceOf<T>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+
+            ensure!(!amount.is_zero(), Error::<T>::ZeroAmount);
+            ensure!(
+                Markets::<T>::contains_key(&market_id),
+                Error::<T>::MarketNotFound,
+            );
+
+            let total_after = ReservedKeeperBonds::<T>::try_mutate(
+                &market_id,
+                &who,
+                |existing| -> Result<BalanceOf<T>, Error<T>> {
+                    ensure!(*existing >= amount, Error::<T>::KeeperBondUnderflow);
+                    // saturating_sub is equivalent to checked_sub here
+                    // because the gate above ensured `existing >= amount`.
+                    let new_total = existing.saturating_sub(amount);
+                    *existing = new_total;
+                    Ok(new_total)
+                },
+            )?;
+
+            let leftover = T::Currency::unreserve(&who, amount);
+            // Pallet bookkeeping mirrors Currency::reserved_balance —
+            // see try_state invariant below. `leftover != 0` would
+            // mean the Currency reserve was lower than the pallet
+            // thought; in production this is unreachable because the
+            // pallet is the only writer to this (market, keeper) slot.
+            // debug_assert in test/dev catches drift; production
+            // continues (the user already got back as much as
+            // Currency had, the pallet map is consistent post-mutate).
+            debug_assert!(
+                leftover.is_zero(),
+                "Currency::unreserve returned non-zero leftover: \
+                 ReservedKeeperBonds drifted from Currency::reserved_balance",
+            );
+
+            Self::deposit_event(Event::KeeperBondReleased {
+                keeper: who,
+                market_id,
+                amount,
+                total_reserved_after: total_after,
+            });
             Ok(())
         }
     }
@@ -2023,6 +2288,124 @@ pub mod pallet {
         /// custody lives here (§3.3 collateral abstraction).
         pub fn pot_account() -> T::AccountId {
             T::PalletId::get().into_account_truncating()
+        }
+
+        /// `mat/trsy` PalletId-derived treasury account. Mirrors the
+        /// account spec-225 / `pallet-intent-settlement` uses for the
+        /// bond-slash treasury share. Same constant byte string so
+        /// that on preprod / mainnet the runtime resolves to the same
+        /// SS58 (`5EYCAe5i7mtxRJjC9TWQvyiQFkcSbHqiApwRzyL98TWh3Wtz` on
+        /// preprod-spec runtimes). Used by
+        /// `do_slash_keeper_bond_for_false_trigger` for the 50%
+        /// `repatriate_reserved` share of the keeper bond slash.
+        pub fn mat_trsy_account() -> T::AccountId {
+            PalletId(*b"mat/trsy").into_account_truncating()
+        }
+
+        /// Slash `KeeperBondMinimum` MOTRA from `keeper` on a
+        /// false-trigger liquidation per spec §6.3. 50% goes to the
+        /// `mat/trsy` treasury via `repatriate_reserved`; 50% is
+        /// burned via `slash_reserved` (the returned
+        /// `NegativeImbalance` is dropped). The pallet bookkeeping
+        /// `ReservedKeeperBonds[market_id][keeper]` is decremented
+        /// by the full minimum via `saturating_sub` — the keeper-bond
+        /// gate inside `liquidate` already guaranteed the reserve was
+        /// ≥ minimum, so the saturating-sub is equivalent to a
+        /// checked-sub in this call path.
+        ///
+        /// Wrapped in `with_storage_layer` so a `repatriate_reserved`
+        /// failure (e.g. treasury account below ED) rolls the partial
+        /// slash back and the dispatch errors `Err(_)`. On success
+        /// the helper emits `LiquidationBondSlashed` and the caller
+        /// returns `Ok(())` — the canonical Ok-return + emit-on-fail
+        /// pattern (`feedback_substrate_ok_return_emit_on_fail_pattern.md`).
+        ///
+        /// `equity_pre` and `mm_e18` flow into the event so off-chain
+        /// callers can diagnose WHY the keeper's local computation
+        /// disagreed with the runtime (e.g. they were one block stale
+        /// on the oracle, or had a buggy funding-delta computation).
+        pub(crate) fn do_slash_keeper_bond_for_false_trigger(
+            keeper: &T::AccountId,
+            target: &T::AccountId,
+            market_id: &MarketId,
+            equity_pre_e18_signed: i128,
+            mm_e18: u128,
+        ) -> DispatchResult {
+            let slash_amount: BalanceOf<T> = T::KeeperBondMinimum::get();
+            // Split 50/50. Integer division rounds the burn share
+            // down; treasury_share absorbs any odd-byte remainder so
+            // `treasury + burn == slash_amount` exactly. We route
+            // through u128 to avoid leaning on a `Div<u32>` impl that
+            // `BalanceOf<T>` does not universally provide (mirrors
+            // pallet-intent-settlement's slash share split).
+            let slash_u128: u128 = slash_amount.saturated_into::<u128>();
+            let burn_u128: u128 = slash_u128 / 2u128;
+            let treasury_u128: u128 = slash_u128.saturating_sub(burn_u128);
+            let burn_share: BalanceOf<T> = burn_u128
+                .try_into()
+                .map_err(|_| Error::<T>::BalanceConversionOverflow)?;
+            let treasury_share: BalanceOf<T> = treasury_u128
+                .try_into()
+                .map_err(|_| Error::<T>::BalanceConversionOverflow)?;
+            let mat_trsy = Self::mat_trsy_account();
+
+            // Atomic apply. A failed `repatriate_reserved` (treasury
+            // not endowed, ED, etc) rolls back the partial slash so
+            // the keeper is not left with a half-slashed bond.
+            frame_support::storage::with_storage_layer::<
+                (),
+                sp_runtime::DispatchError,
+                _,
+            >(|| {
+                if !treasury_share.is_zero() {
+                    T::Currency::repatriate_reserved(
+                        keeper,
+                        &mat_trsy,
+                        treasury_share,
+                        BalanceStatus::Free,
+                    )?;
+                }
+                if !burn_share.is_zero() {
+                    // `slash_reserved` returns `(NegativeImbalance,
+                    // leftover)`. Dropping the imbalance burns the
+                    // tokens (no `OnUnbalanced` handler in v0).
+                    // `leftover` would mean the reserve held less
+                    // than `burn_share`; the bond gate already
+                    // guaranteed `reserve >= KeeperBondMinimum` and
+                    // we just consumed `treasury_share` of it via
+                    // `repatriate_reserved`, so the remaining reserve
+                    // is exactly `KeeperBondMinimum - treasury_share
+                    // == burn_share` (the gate is enforced against
+                    // PALLET bookkeeping, which mirrors Currency).
+                    let (imbalance, leftover) =
+                        T::Currency::slash_reserved(keeper, burn_share);
+                    drop(imbalance);
+                    debug_assert!(
+                        leftover.is_zero(),
+                        "slash_reserved leftover: Currency reserve drifted below pallet bookkeeping",
+                    );
+                }
+
+                // Bookkeeping decrement. saturating_sub is safe — the
+                // gate enforces `existing >= KeeperBondMinimum`
+                // before this helper runs.
+                ReservedKeeperBonds::<T>::mutate(market_id, keeper, |existing| {
+                    *existing = existing.saturating_sub(slash_amount);
+                });
+                Ok(())
+            })?;
+
+            Self::deposit_event(Event::LiquidationBondSlashed {
+                keeper: keeper.clone(),
+                target: target.clone(),
+                market_id: market_id.clone(),
+                slash_amount,
+                treasury_share,
+                burn_share,
+                equity_e18_signed: equity_pre_e18_signed,
+                mm_e18,
+            });
+            Ok(())
         }
 
 
