@@ -4808,6 +4808,15 @@ pub mod pallet {
                 IntentKind::RefundCredit { .. } => {
                     Err(Error::<T>::IntentNotEligibleForExpiry.into())
                 }
+                // Task #259 §8.2: PerpAction intents are perp-engine
+                // settlement audit-trail events, not Aegis policies —
+                // they have no Cardano-side policy to resolve, so the
+                // expire/policy-resolution path is structurally
+                // inapplicable. Mirror the RefundCredit branch's
+                // semantics.
+                IntentKind::PerpAction(_) => {
+                    Err(Error::<T>::IntentNotEligibleForExpiry.into())
+                }
             }
         }
 

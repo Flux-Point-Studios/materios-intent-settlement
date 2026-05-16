@@ -416,39 +416,22 @@ fn genesis_state_empty() {
 
         // No bad debt accrued.
         assert!(pallet_perp_engine::pallet::BadDebtAccumulated::<Test>::iter().next().is_none());
+
+        // No bad-debt window timestamps.
+        assert!(pallet_perp_engine::pallet::BadDebtWindowStart::<Test>::iter().next().is_none());
     });
 }
 
-/// Surface check: stubs for `liquidate` / `settle_funding` /
-/// `governance_set_market` still return `Ok(())` (PR-B preserves them
-/// per the user's instruction). The dispatcher origin gates are
-/// still exercised.
-///
-/// `open_position`, `close_position`, `deposit_margin`, `withdraw_margin`,
-/// `adjust_leverage` have full impls now and are tested below — this
-/// test only verifies the three stub extrinsics are still callable.
+/// Surface check: `governance_set_market` is still a stub (deferred to
+/// PR-D). `liquidate` and `settle_funding` are no longer stubs — their
+/// coverage is in the dedicated test sections below. The dispatcher
+/// origin gate is still exercised for `governance_set_market`.
 #[test]
 fn call_surface_exposed_stubs_only() {
     new_test_ext().execute_with(|| {
         let market_id = ada_perp_market_id();
-        let signer = 1u64;
 
-        // (5) liquidate — stub, returns Ok.
-        assert_ok!(PerpEngine::liquidate(
-            RuntimeOrigin::signed(signer),
-            2u64,
-            market_id.clone(),
-            100u128,
-        ));
-
-        // (6) settle_funding — stub, returns Ok.
-        assert_ok!(PerpEngine::settle_funding(
-            RuntimeOrigin::signed(signer),
-            market_id.clone(),
-            1u32,
-        ));
-
-        // (8) governance_set_market — stub, root-gated.
+        // governance_set_market — stub, root-gated.
         assert_ok!(PerpEngine::governance_set_market(
             RuntimeOrigin::root(),
             market_id,
@@ -525,6 +508,9 @@ fn error_variants_distinct() {
     let epoch_done: Error<Test> = Error::EpochAlreadySettled;
     let arith: Error<Test> = Error::ArithmeticOverflow;
     let dwell: Error<Test> = Error::WithdrawDwellNotElapsed;
+    let not_liq: Error<Test> = Error::PositionNotLiquidatable;
+    let bond_low: Error<Test> = Error::KeeperBondInsufficient;
+    let breaker: Error<Test> = Error::BadDebtCircuitBreakerTripped;
 
     let variants = [
         format!("{:?}", market_not_found),
@@ -538,6 +524,9 @@ fn error_variants_distinct() {
         format!("{:?}", epoch_done),
         format!("{:?}", arith),
         format!("{:?}", dwell),
+        format!("{:?}", not_liq),
+        format!("{:?}", bond_low),
+        format!("{:?}", breaker),
     ];
 
     for (i, a) in variants.iter().enumerate() {
@@ -564,6 +553,9 @@ fn error_variants_distinct() {
     assert!(variants[8].contains("EpochAlreadySettled"));
     assert!(variants[9].contains("ArithmeticOverflow"));
     assert!(variants[10].contains("WithdrawDwellNotElapsed"));
+    assert!(variants[11].contains("PositionNotLiquidatable"));
+    assert!(variants[12].contains("KeeperBondInsufficient"));
+    assert!(variants[13].contains("BadDebtCircuitBreakerTripped"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1580,4 +1572,1595 @@ fn math_compute_notional_overflow_protected() {
             Error::<Test>::ArithmeticOverflow
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// PR-C piece 1 — liquidate (task #259 §3.5) — 16 tests
+// ---------------------------------------------------------------------------
+
+/// Seed a `ReservedKeeperBonds` entry directly. Production wires this
+/// via a future `reserve_keeper_bond` extrinsic (deferred); v0 tests
+/// + the impl read the storage as a passive gate.
+fn seed_keeper_bond(market_id: &MarketId, keeper: u64, bond: u128) {
+    pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::insert(
+        market_id,
+        keeper,
+        bond,
+    );
+}
+
+/// Fund the pallet pot with raw MOTRA so liquidate's pot → keeper
+/// transfer can clear. The deposit_margin path normally seeds the
+/// pot; tests that seed positions directly need a manual top-up.
+fn fund_pot(amount: u128) {
+    let pot = pallet_perp_engine::pallet::Pallet::<Test>::pot_account();
+    pallet_balances::Pallet::<Test>::force_set_balance(
+        RuntimeOrigin::root(),
+        pot,
+        amount,
+    )
+    .expect("force_set_balance succeeds");
+}
+
+/// Open an underwater-ready setup: register the default ADA-PERP
+/// market, deposit `motra` MOTRA via the real extrinsic (so the
+/// snapshot rate is pinned), and open a 1.0 contract position at 10×
+/// leverage (locked = 10% of notional → modest mark moves push the
+/// position into MM territory). Returns nothing; tests use the
+/// hardcoded victim=1, keeper=2.
+///
+/// Why 10× and not 1×: with 1× leverage the locked margin equals the
+/// notional, so a price drop has to wipe ~95% of the position before
+/// equity dips below the 5% MM floor — unrealistic test stimulus. 10×
+/// puts the MM-trip ~5 percentage points away from entry, which
+/// matches real-world perp parameters (memo §9.1 default leverage).
+fn open_underwater_setup(direction: PerpDirection, motra: u128) {
+    let victim = 1u64;
+    register_default_market();
+    credit_motra(victim, motra);
+    assert_ok!(PerpEngine::deposit_margin(
+        RuntimeOrigin::signed(victim),
+        motra,
+    ));
+    assert_ok!(PerpEngine::open_position(
+        RuntimeOrigin::signed(victim),
+        ada_perp_market_id(),
+        direction,
+        100_000_000u128, // 1.0 contract
+        1_000u32,         // 10× leverage → locked = 10% notional
+        50u32,
+        0u128,
+    ));
+}
+
+/// Test 1: happy-path long. Long 1.0 contract opened at $1.00 (10×
+/// → locked = $0.10, MM at new mark = 5% × notional). Mark drops to
+/// $0.50; PnL = -$0.50; equity = $0.10 − $0.50 = -$0.40 << MM.
+/// Liquidation succeeds, PositionLiquidated event fired.
+#[test]
+fn liquidate_happy_path_long_underwater() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        open_underwater_setup(PerpDirection::Long, 1u128);
+        // Pot has 1 MOTRA from the deposit; pad it so the keeper-fee
+        // MOTRA transfer is legible at integer scale.
+        fund_pot(100u128);
+        seed_keeper_bond(
+            &ada_perp_market_id(),
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        // Drop mark to $0.50.
+        set_oracle_price(&ada_usd_feed_id(), 500_000_000_000_000_000u128);
+
+        let keeper_motra_pre =
+            pallet_balances::Pallet::<Test>::free_balance(&keeper);
+
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            ada_perp_market_id(),
+        ));
+
+        // Position removed.
+        assert!(pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &victim,
+        )
+        .is_none());
+
+        // Keeper MOTRA can only go up (a successful liquidate pays
+        // the fee out of the pot to the keeper's free balance).
+        let keeper_motra_post =
+            pallet_balances::Pallet::<Test>::free_balance(&keeper);
+        assert!(keeper_motra_post >= keeper_motra_pre);
+
+        // PositionLiquidated event recorded.
+        let saw_liquidated = System::events().iter().any(|er| {
+            matches!(
+                er.event,
+                RuntimeEvent::PerpEngine(
+                    pallet_perp_engine::Event::PositionLiquidated { .. }
+                )
+            )
+        });
+        assert!(saw_liquidated, "PositionLiquidated must be emitted");
+    });
+}
+
+/// Test 2: happy-path short. Mark rises; short is underwater;
+/// liquidation succeeds.
+#[test]
+fn liquidate_happy_path_short_underwater() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        open_underwater_setup(PerpDirection::Short, 1u128);
+        fund_pot(100u128);
+        seed_keeper_bond(
+            &ada_perp_market_id(),
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        // Mark rises to $1.50 — short loses heavily.
+        set_oracle_price(&ada_usd_feed_id(), 1_500_000_000_000_000_000u128);
+
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            ada_perp_market_id(),
+        ));
+
+        assert!(pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &victim,
+        )
+        .is_none());
+    });
+}
+
+/// Test 3: healthy position → `PositionNotLiquidatable`. v0 does not
+/// slash the bond; it stays reserved.
+#[test]
+fn liquidate_rejects_healthy_position() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        open_underwater_setup(PerpDirection::Long, 1u128);
+        fund_pot(100u128);
+        let min_bond =
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get();
+        seed_keeper_bond(&ada_perp_market_id(), keeper, min_bond);
+
+        // Mark stays at $1.00 → position is healthy.
+        assert_noop!(
+            PerpEngine::liquidate(
+                RuntimeOrigin::signed(keeper),
+                victim,
+                ada_perp_market_id(),
+            ),
+            Error::<Test>::PositionNotLiquidatable
+        );
+
+        // Position still present.
+        assert!(pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &victim,
+        )
+        .is_some());
+
+        // Bond untouched (no slashing in v0).
+        let bond_after =
+            pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::get(
+                &ada_perp_market_id(),
+                &keeper,
+            );
+        assert_eq!(bond_after, min_bond);
+    });
+}
+
+/// Test 4: no `ReservedKeeperBonds` entry → `KeeperBondInsufficient`.
+#[test]
+fn liquidate_rejects_no_keeper_bond() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        open_underwater_setup(PerpDirection::Long, 1u128);
+        // No seed_keeper_bond — storage returns ValueQuery default 0.
+        set_oracle_price(&ada_usd_feed_id(), 500_000_000_000_000_000u128);
+
+        assert_noop!(
+            PerpEngine::liquidate(
+                RuntimeOrigin::signed(keeper),
+                victim,
+                ada_perp_market_id(),
+            ),
+            Error::<Test>::KeeperBondInsufficient
+        );
+    });
+}
+
+/// Test 5: bond below minimum → `KeeperBondInsufficient`.
+#[test]
+fn liquidate_rejects_underbonded_keeper() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        open_underwater_setup(PerpDirection::Long, 1u128);
+        let min =
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get();
+        seed_keeper_bond(&ada_perp_market_id(), keeper, min - 1);
+
+        set_oracle_price(&ada_usd_feed_id(), 500_000_000_000_000_000u128);
+
+        assert_noop!(
+            PerpEngine::liquidate(
+                RuntimeOrigin::signed(keeper),
+                victim,
+                ada_perp_market_id(),
+            ),
+            Error::<Test>::KeeperBondInsufficient
+        );
+    });
+}
+
+/// Test 6: missing position → `PositionNotFound`.
+#[test]
+fn liquidate_rejects_missing_position() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        register_default_market();
+        seed_keeper_bond(
+            &ada_perp_market_id(),
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        assert_noop!(
+            PerpEngine::liquidate(
+                RuntimeOrigin::signed(keeper),
+                victim,
+                ada_perp_market_id(),
+            ),
+            Error::<Test>::PositionNotFound
+        );
+    });
+}
+
+/// Test 7: stale oracle → `OracleUnavailable`. Critical safety gate:
+/// liquidate-on-stale could fire on a not-actually-underwater position.
+/// Mirror the `adjust_leverage_rejects_stale_oracle` pattern.
+#[test]
+fn liquidate_rejects_stale_oracle() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        open_underwater_setup(PerpDirection::Long, 1u128);
+        seed_keeper_bond(
+            &ada_perp_market_id(),
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        // Drop mark to "clearly underwater" AND mark stale.
+        set_oracle_price(&ada_usd_feed_id(), 500_000_000_000_000_000u128);
+        set_oracle_fresh(&ada_usd_feed_id(), false);
+
+        assert_noop!(
+            PerpEngine::liquidate(
+                RuntimeOrigin::signed(keeper),
+                victim,
+                ada_perp_market_id(),
+            ),
+            Error::<Test>::OracleUnavailable
+        );
+    });
+}
+
+/// Test 8: paused market does NOT block liquidation. Memo §5.5:
+/// pausing a market must NOT trap user funds in open positions.
+#[test]
+fn liquidate_works_on_paused_market() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        open_underwater_setup(PerpDirection::Long, 1u128);
+        fund_pot(100u128);
+        seed_keeper_bond(
+            &ada_perp_market_id(),
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        // Drop mark, then pause the market.
+        set_oracle_price(&ada_usd_feed_id(), 500_000_000_000_000_000u128);
+        let mut cfg = default_ada_perp_market_config();
+        cfg.paused = true;
+        pallet_perp_engine::pallet::Markets::<Test>::insert(
+            &ada_perp_market_id(),
+            cfg,
+        );
+
+        // Liquidation still succeeds.
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            ada_perp_market_id(),
+        ));
+        assert!(pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &victim,
+        )
+        .is_none());
+    });
+}
+
+/// Test 9: deep underwater → bad-debt accumulated. Force a huge
+/// funding owed so equity-post-fee goes negative; assert
+/// `BadDebtAccumulated[market]` is incremented by |equity|.
+#[test]
+fn liquidate_accumulates_bad_debt_when_equity_negative() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        open_underwater_setup(PerpDirection::Long, 1u128);
+        fund_pot(100u128);
+        seed_keeper_bond(
+            &ada_perp_market_id(),
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        // Force funding-owed beyond the locked margin.
+        // funding_owed = 1e8 (size) * idx / 1e8 = idx (in 1e18 scale).
+        // Set idx = 1.5e18 → funding_owed = $1.50, locked = $1 →
+        // equity = 1 - 1.5 = -0.5; bad debt.
+        pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::insert(
+            &ada_perp_market_id(),
+            1_500_000_000_000_000_000i128,
+        );
+
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            ada_perp_market_id(),
+        ));
+
+        let bd = pallet_perp_engine::pallet::BadDebtAccumulated::<Test>::get(
+            &ada_perp_market_id(),
+        );
+        assert!(
+            bd > 0,
+            "deep-underwater liquidation must accumulate bad debt; got {}",
+            bd
+        );
+        // Position gone.
+        assert!(pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &victim,
+        )
+        .is_none());
+        // Window timestamp was seeded.
+        assert!(
+            pallet_perp_engine::pallet::BadDebtWindowStart::<Test>::get(
+                &ada_perp_market_id(),
+            ) > 0
+        );
+    });
+}
+
+/// Test 10: bad debt over threshold in one tick → market auto-pauses
+/// and `BadDebtCircuitBreakerTripped` event fires.
+#[test]
+fn liquidate_trips_circuit_breaker_at_threshold() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        register_default_market();
+        let market_id = ada_perp_market_id();
+
+        // Seed a massive position with tiny locked margin so the
+        // resulting bad debt blows past the breaker threshold
+        // (TestBadDebtCircuitBreakerThresholdE18 = 1e22).
+        let pos = Position {
+            size_e8: 10_000_000_000_000_000i128, // 1e16
+            entry_mark_e18: 1_000_000_000_000_000_000u128,
+            locked_margin_e18: 1_000_000_000_000_000_000u128, // $1
+            leverage_bps: 100,
+            opened_block: 1,
+            cumulative_funding_at_open_e18: 0,
+        };
+        pallet_perp_engine::pallet::Positions::<Test>::insert(
+            &market_id, &victim, pos,
+        );
+        // Victim has a snapshot rate so the fee transfer routes via
+        // the snapshot path.
+        pallet_perp_engine::pallet::MarginAccounts::<Test>::insert(
+            &victim,
+            MarginAccount {
+                free_e18: 0,
+                last_deposit_block: 0,
+                weighted_deposit_rate_e18: 1_000_000_000_000_000_000u128,
+            },
+        );
+        // Funding inflated → enormous funding_owed → enormous bad debt.
+        pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::insert(
+            &market_id,
+            1_000_000_000_000_000_000i128,
+        );
+        fund_pot(1_000_000u128);
+        seed_keeper_bond(
+            &market_id,
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            market_id.clone(),
+        ));
+
+        // Market is now paused.
+        let m = pallet_perp_engine::pallet::Markets::<Test>::get(&market_id)
+            .expect("market still registered after breaker trip");
+        assert!(m.paused, "circuit breaker must auto-pause the market");
+
+        // BadDebtCircuitBreakerTripped event co-emitted.
+        let saw_breaker = System::events().iter().any(|er| {
+            matches!(
+                er.event,
+                RuntimeEvent::PerpEngine(
+                    pallet_perp_engine::Event::BadDebtCircuitBreakerTripped { .. }
+                )
+            )
+        });
+        assert!(
+            saw_breaker,
+            "BadDebtCircuitBreakerTripped must co-emit on threshold cross"
+        );
+    });
+}
+
+/// Test 11: fee capped at locked margin. Position has tiny locked
+/// margin and large notional → raw fee > locked. Asserted via the
+/// `liquidation_fee_e18` field on the emitted event.
+#[test]
+fn liquidate_fee_capped_at_locked_margin() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        register_default_market();
+        let market_id = ada_perp_market_id();
+
+        // notional = 1.0 * $1 = $1; raw_fee = 0.5% × $1 = $0.005.
+        // Locked = $0.001 → fee must clamp to $0.001 = 1e15.
+        let pos = Position {
+            size_e8: 100_000_000i128,
+            entry_mark_e18: 1_000_000_000_000_000_000u128,
+            locked_margin_e18: 1_000_000_000_000_000u128, // $0.001
+            leverage_bps: 100,
+            opened_block: 1,
+            cumulative_funding_at_open_e18: 0,
+        };
+        pallet_perp_engine::pallet::Positions::<Test>::insert(
+            &market_id, &victim, pos,
+        );
+        pallet_perp_engine::pallet::MarginAccounts::<Test>::insert(
+            &victim,
+            MarginAccount {
+                free_e18: 0,
+                last_deposit_block: 0,
+                weighted_deposit_rate_e18: 1_000_000_000_000_000_000u128,
+            },
+        );
+        // Force liquidatable via funding.
+        pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::insert(
+            &market_id,
+            100_000_000_000_000_000i128, // 0.1
+        );
+        fund_pot(1_000u128);
+        seed_keeper_bond(
+            &market_id,
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            market_id.clone(),
+        ));
+
+        let fee = System::events().iter().find_map(|er| match &er.event {
+            RuntimeEvent::PerpEngine(
+                pallet_perp_engine::Event::PositionLiquidated {
+                    liquidation_fee_e18,
+                    ..
+                },
+            ) => Some(*liquidation_fee_e18),
+            _ => None,
+        });
+        assert_eq!(
+            fee,
+            Some(1_000_000_000_000_000u128),
+            "fee must be capped at locked_margin"
+        );
+    });
+}
+
+/// Test 12: PositionLiquidated event carries the expected fields.
+#[test]
+fn liquidate_event_emitted_with_correct_fields() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        open_underwater_setup(PerpDirection::Long, 1u128);
+        fund_pot(1_000u128);
+        seed_keeper_bond(
+            &ada_perp_market_id(),
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+        set_oracle_price(&ada_usd_feed_id(), 500_000_000_000_000_000u128);
+
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            ada_perp_market_id(),
+        ));
+
+        let payload = System::events().iter().find_map(|er| match &er.event {
+            RuntimeEvent::PerpEngine(
+                pallet_perp_engine::Event::PositionLiquidated {
+                    target,
+                    keeper: k,
+                    market_id,
+                    size_e8_closed,
+                    mark_e18_at_liquidation,
+                    liquidation_fee_e18: _,
+                    bad_debt_e18: _,
+                },
+            ) => Some((
+                *target,
+                *k,
+                market_id.clone(),
+                *size_e8_closed,
+                *mark_e18_at_liquidation,
+            )),
+            _ => None,
+        });
+        let payload = payload.expect("PositionLiquidated emitted");
+        assert_eq!(payload.0, victim);
+        assert_eq!(payload.1, keeper);
+        assert_eq!(payload.2, ada_perp_market_id());
+        assert_eq!(payload.3, 100_000_000u128);
+        assert_eq!(payload.4, 500_000_000_000_000_000u128);
+    });
+}
+
+/// Test 13: atomicity. Force the inner MOTRA transfer to fail and
+/// verify NO storage was mutated — position still present, no bad
+/// debt accumulated, market not paused.
+#[test]
+fn liquidate_atomic_on_repatriate_failure() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        register_default_market();
+        let market_id = ada_perp_market_id();
+        // Build a sizable liquidatable position with a 1-wei snapshot
+        // rate so the fee_motra calculation is huge — and then drain
+        // the pot to 0 so the transfer fails.
+        let pos = Position {
+            size_e8: 1_000_000_000i128, // 10 contracts
+            entry_mark_e18: 1_000_000_000_000_000_000u128,
+            locked_margin_e18: 10_000_000_000_000_000_000u128, // $10
+            leverage_bps: 100,
+            opened_block: 1,
+            cumulative_funding_at_open_e18: 0,
+        };
+        pallet_perp_engine::pallet::Positions::<Test>::insert(
+            &market_id, &victim, pos,
+        );
+        pallet_perp_engine::pallet::MarginAccounts::<Test>::insert(
+            &victim,
+            MarginAccount {
+                free_e18: 0,
+                last_deposit_block: 0,
+                weighted_deposit_rate_e18: 1u128, // 1 wei rate → fee_motra ~ fee_e18
+            },
+        );
+        // Mark drops 50% → realised PnL = -$5 → liquidatable.
+        set_oracle_price(&ada_usd_feed_id(), 500_000_000_000_000_000u128);
+        fund_pot(0u128); // pot empty
+        seed_keeper_bond(
+            &market_id,
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        let res = PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            market_id.clone(),
+        );
+        assert!(res.is_err(), "transfer failure must propagate");
+
+        // Position still present (atomic rollback).
+        assert!(pallet_perp_engine::pallet::Positions::<Test>::get(
+            &market_id, &victim,
+        )
+        .is_some());
+        // No bad debt.
+        let bd = pallet_perp_engine::pallet::BadDebtAccumulated::<Test>::get(
+            &market_id,
+        );
+        assert_eq!(bd, 0);
+        // Market still not paused.
+        let m = pallet_perp_engine::pallet::Markets::<Test>::get(&market_id)
+            .unwrap();
+        assert!(!m.paused);
+    });
+}
+
+/// Test 14: positive-equity-but-underwater. Equity in (0, MM): fee
+/// paid, residual margin returns to victim's free_e18, position gone,
+/// no bad debt.
+///
+/// With 10× leverage and locked = $0.10 at entry mark $1.00:
+/// Mark $0.94 → PnL = -$0.06, equity = $0.10 - $0.06 = $0.04.
+/// MM = 5% × $0.94 = $0.047. equity ($0.04) < MM ($0.047): liquidatable.
+/// equity > 0: positive-equity path → residual to victim.
+#[test]
+fn liquidate_releases_residual_margin_to_victim_on_positive_equity() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        open_underwater_setup(PerpDirection::Long, 1u128);
+        fund_pot(1_000u128);
+        seed_keeper_bond(
+            &ada_perp_market_id(),
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        // Drop mark to $0.94 → realised PnL = -$0.06 on a 1-contract
+        // long. equity = locked $0.10 − $0.06 = $0.04. MM = 5% × $0.94
+        // = $0.047 → equity < MM (liquidatable) AND equity > 0
+        // (positive-equity residual path).
+        set_oracle_price(&ada_usd_feed_id(), 940_000_000_000_000_000u128);
+
+        let victim_free_pre =
+            pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&victim)
+                .free_e18;
+
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            ada_perp_market_id(),
+        ));
+
+        // Position gone.
+        assert!(pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &victim,
+        )
+        .is_none());
+
+        // Victim got residual margin back (equity_post = $0.04 - fee
+        // ≈ $0.04 - 0.5%×$0.94 = $0.04 - $0.0047 = $0.0353).
+        let victim_free_post =
+            pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&victim)
+                .free_e18;
+        assert!(
+            victim_free_post > victim_free_pre,
+            "positive-equity liquidation returns residual margin: \
+             pre={}, post={}",
+            victim_free_pre,
+            victim_free_post,
+        );
+
+        // No bad debt (equity was positive).
+        let bd = pallet_perp_engine::pallet::BadDebtAccumulated::<Test>::get(
+            &ada_perp_market_id(),
+        );
+        assert_eq!(bd, 0);
+    });
+}
+
+/// Test 15: funding delta is applied before the equity check. Mark
+/// unchanged → would-be healthy on raw mark math, but accumulated
+/// funding-owed pushes equity below MM. Liquidation succeeds.
+#[test]
+fn liquidate_funding_delta_applied_before_equity_check() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        open_underwater_setup(PerpDirection::Long, 1u128);
+        fund_pot(1_000u128);
+        seed_keeper_bond(
+            &ada_perp_market_id(),
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        // Mark stays $1.00 → realised PnL = 0. With 10× leverage,
+        // locked = $0.10, MM = 5% × $1 = $0.05. Without funding,
+        // equity ($0.10) > MM → healthy. idx = 0.06e18 →
+        // funding_owed = 1e8 * 0.06e18 / 1e8 = 0.06e18 = $0.06.
+        // equity = $0.10 − $0.06 = $0.04 < MM $0.05 → liquidatable.
+        pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::insert(
+            &ada_perp_market_id(),
+            60_000_000_000_000_000i128,
+        );
+
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            ada_perp_market_id(),
+        ));
+
+        assert!(pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &victim,
+        )
+        .is_none());
+    });
+}
+
+/// Sec-review regression: liquidate's positive-equity residual path
+/// must bump `weighted_deposit_rate_e18` whenever realized PnL is
+/// positive — the SAME cross-cohort pot-drain that close_position's
+/// snapshot bump fixes (see
+/// `feedback_u256_weighted_avg_volatile_collateral.md` Rule 3 +
+/// `close_position_cross_cohort_pnl_preserves_pot_solvency`).
+///
+/// Pre-fix: an underwater long with positive PnL + heavy funding-owed
+/// gets liquidated; the PnL gain rides into the victim's free_e18 at
+/// the OLD (stale, lower) snapshot. The victim later withdraws at the
+/// stale rate and drains MOTRA from other depositors' deposits at
+/// `|pnl| × (1/old_snap − 1/live_rate)` per round.
+///
+/// This test sets:
+///   - MATRA = $0.50 at deposit time → snapshot 5e17
+///   - MATRA = $1.00 at liquidation time → live_rate 1e18
+///   - ADA moves up so the long has +$0.05 realized PnL
+///   - Funding-owed of $0.11 pushes equity under MM
+///   - Liquidation leaves a positive residual that includes the
+///     positive PnL credit.
+///
+/// Post-fix invariant: victim's snapshot bumps above 5e17 toward 1e18
+/// (asymmetric clamp: only raises, never lowers).
+#[test]
+fn liquidate_residual_path_bumps_snapshot_on_positive_pnl_credit() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        register_default_market();
+        credit_motra(victim, 2_000u128);
+
+        // Deposit at MATRA = $0.50 → snapshot pinned to 5e17.
+        set_oracle_price(
+            &matra_usd_feed_id(),
+            500_000_000_000_000_000u128,
+        );
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(victim),
+            1_000u128,
+        ));
+        let acct_after_dep =
+            pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&victim);
+        assert_eq!(
+            acct_after_dep.weighted_deposit_rate_e18,
+            500_000_000_000_000_000u128,
+        );
+        let snapshot_pre_liquidate = acct_after_dep.weighted_deposit_rate_e18;
+
+        // ADA at $1.00, open long 1.0 contract at 10× → locked $0.10.
+        set_oracle_price(
+            &ada_usd_feed_id(),
+            1_000_000_000_000_000_000u128,
+        );
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(victim),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            1_000u32,
+            50u32,
+            0u128,
+        ));
+
+        // Bump MATRA live rate to $1.00 → live_rate 1e18. ADA up to
+        // $1.05 → realized PnL = 1.0 × 0.05 = +$0.05 (1e18-scaled
+        // = 5e16). Funding-owed of $0.11 (idx = 0.11e18) pushes
+        // equity_pre = locked $0.10 + PnL $0.05 − funding $0.11
+        // = $0.04, below MM = 5% × $1.05 = $0.0525.
+        set_oracle_price(
+            &matra_usd_feed_id(),
+            1_000_000_000_000_000_000u128,
+        );
+        set_oracle_price(
+            &ada_usd_feed_id(),
+            1_050_000_000_000_000_000u128,
+        );
+        pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::insert(
+            &ada_perp_market_id(),
+            110_000_000_000_000_000i128,
+        );
+
+        fund_pot(1_000u128);
+        seed_keeper_bond(
+            &ada_perp_market_id(),
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            ada_perp_market_id(),
+        ));
+
+        // Position gone, residual delivered.
+        assert!(pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &victim,
+        )
+        .is_none());
+
+        // CRITICAL ASSERTION: snapshot bumped above the deposit-time
+        // rate because positive PnL credit at live rate pulled the
+        // weighted-avg up. Without the bump the victim could
+        // withdraw the residual at MATRA=$0.50 cost basis even
+        // though the new pMATRA-USD entered when MATRA=$1.00.
+        let acct_post =
+            pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&victim);
+        assert!(
+            acct_post.weighted_deposit_rate_e18 > snapshot_pre_liquidate,
+            "snapshot MUST bump after positive-PnL liquidation residual \
+             (deposit-time={}, post-liquidate={}). Sec-review HIGH: \
+             without the bump, victim withdraws PnL gain at stale snapshot \
+             and drains pot from other depositors.",
+            snapshot_pre_liquidate,
+            acct_post.weighted_deposit_rate_e18,
+        );
+
+        // Sanity: snapshot stays at-or-below live rate when PnL credit
+        // is bounded by residual (asymmetric clamp prevents
+        // overshoot above live for honest scenarios).
+        assert!(
+            acct_post.weighted_deposit_rate_e18 <= 10_000_000_000_000_000_000u128,
+            "snapshot must remain bounded ({})",
+            acct_post.weighted_deposit_rate_e18,
+        );
+    });
+}
+
+/// Test 16: non-existent market → `MarketNotFound`. Mirrors the
+/// pattern from open_position. Bond gate is checked first (the keeper
+/// has no bond against a market that doesn't exist), so we seed the
+/// bond on the empty market_id slot to exercise the post-bond
+/// market-existence path.
+#[test]
+fn liquidate_rejects_market_not_found() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        // (do NOT register_default_market)
+        seed_keeper_bond(
+            &ada_perp_market_id(),
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        assert_noop!(
+            PerpEngine::liquidate(
+                RuntimeOrigin::signed(keeper),
+                victim,
+                ada_perp_market_id(),
+            ),
+            Error::<Test>::MarketNotFound
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// PR-C piece 2 (#259 §3.6 + §5.2 + §8.2): settle_funding + on_initialize
+// mark cache + IntentKind::PerpAction byte-pin
+// ---------------------------------------------------------------------------
+
+use frame_support::traits::Hooks;
+
+/// Helper: open a long position at default $1.00 mark on the default
+/// market and seed `free_e18` so the open succeeds. Reused by every
+/// settle_funding behaviour test.
+fn open_default_long(signer: u64, free_e18: u128, size_e8: u128) {
+    register_default_market();
+    seed_free_margin(signer, free_e18);
+    assert_ok!(PerpEngine::open_position(
+        RuntimeOrigin::signed(signer),
+        ada_perp_market_id(),
+        PerpDirection::Long,
+        size_e8,
+        100u32,
+        50u32,
+        0u128,
+    ));
+}
+
+/// Helper: open a short position at default $1.00 mark on the default
+/// market.
+fn open_default_short(signer: u64, free_e18: u128, size_e8: u128) {
+    register_default_market();
+    seed_free_margin(signer, free_e18);
+    assert_ok!(PerpEngine::open_position(
+        RuntimeOrigin::signed(signer),
+        ada_perp_market_id(),
+        PerpDirection::Short,
+        size_e8,
+        100u32,
+        50u32,
+        0u128,
+    ));
+}
+
+/// (§3.6 happy-path #1) Long position pays funding when index rose
+/// during its open window — `free_e18` is debited.
+#[test]
+fn settle_funding_happy_long_paid() {
+    new_test_ext().execute_with(|| {
+        // Open 1.0 long at $1, 1× leverage → $1 locked. Seed $2 free
+        // so the funding debit comes out of the residual $1 in free.
+        let signer = 1u64;
+        open_default_long(signer, 2_000_000_000_000_000_000u128, 100_000_000u128);
+
+        // Bump CumulativeFundingIndex above the open snapshot. Index
+        // delta of +1e16 → funding_owed = 1.0 * 1e16 / 1e8 = 1e16 in
+        // 1e18-scaled pMATRA-USD ≈ $0.01.
+        pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::insert(
+            &ada_perp_market_id(),
+            10_000_000_000_000_000i128,
+        );
+
+        let acct_before = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(acct_before.free_e18, 1_000_000_000_000_000_000u128);
+
+        // Anyone can call (permissionless); use the holder for the test.
+        assert_ok!(PerpEngine::settle_funding(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            signer,
+        ));
+
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        // Free was $1; funding debit was $0.01 → expect $0.99.
+        assert_eq!(acct.free_e18, 990_000_000_000_000_000u128);
+
+        // Position's snapshot is re-baselined so the next settle is a no-op.
+        let pos = pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &signer,
+        )
+        .unwrap();
+        assert_eq!(pos.cumulative_funding_at_open_e18, 10_000_000_000_000_000i128);
+    });
+}
+
+/// (§3.6 happy-path #2) Long position receives funding when index dropped
+/// during its open window — `free_e18` is credited and the snapshot rate
+/// bumps via weighted-avg.
+#[test]
+fn settle_funding_happy_long_received() {
+    new_test_ext().execute_with(|| {
+        // Open via deposit_margin so the snapshot rate is pinned to live
+        // MATRA/USD (1e18). Then push CumulativeFundingIndex NEGATIVE so
+        // the long position receives funding.
+        let signer = 1u64;
+        credit_motra(signer, 10_000u128);
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(signer),
+            5_000u128,
+        ));
+        register_default_market();
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            100u32,
+            50u32,
+            0u128,
+        ));
+
+        // Bump the snapshot deposit-rate floor by raising live MATRA/USD
+        // before the settle so the weighted-avg actually moves up.
+        set_oracle_price(
+            &matra_usd_feed_id(),
+            2_000_000_000_000_000_000u128, // $2.00 per MATRA
+        );
+
+        // Index delta of -1e16 → funding_received = 1.0 * 1e16 / 1e8 = 1e16.
+        pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::insert(
+            &ada_perp_market_id(),
+            -10_000_000_000_000_000i128,
+        );
+
+        let acct_before = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        let snap_before = acct_before.weighted_deposit_rate_e18;
+
+        assert_ok!(PerpEngine::settle_funding(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            signer,
+        ));
+
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        // Credit was +$0.01.
+        assert_eq!(acct.free_e18, acct_before.free_e18 + 10_000_000_000_000_000u128);
+        // Snapshot bumped UP toward the live $2 rate.
+        assert!(
+            acct.weighted_deposit_rate_e18 > snap_before,
+            "snapshot should bump toward live rate (was {}, now {})",
+            snap_before,
+            acct.weighted_deposit_rate_e18
+        );
+    });
+}
+
+/// (§3.6 happy-path #3) Short position pays funding when index dropped
+/// during its open window — signed_size < 0 * idx_delta < 0 → debit.
+#[test]
+fn settle_funding_happy_short_paid() {
+    new_test_ext().execute_with(|| {
+        let signer = 1u64;
+        open_default_short(signer, 2_000_000_000_000_000_000u128, 100_000_000u128);
+
+        // Index goes NEGATIVE → short pays.
+        pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::insert(
+            &ada_perp_market_id(),
+            -10_000_000_000_000_000i128,
+        );
+
+        let acct_before = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(acct_before.free_e18, 1_000_000_000_000_000_000u128);
+
+        assert_ok!(PerpEngine::settle_funding(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            signer,
+        ));
+
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        // Short paid $0.01.
+        assert_eq!(acct.free_e18, 990_000_000_000_000_000u128);
+    });
+}
+
+/// (§3.6 happy-path #4) Short position receives funding when index rose
+/// during its open window — signed_size < 0 * idx_delta > 0 → credit.
+#[test]
+fn settle_funding_happy_short_received() {
+    new_test_ext().execute_with(|| {
+        let signer = 1u64;
+        open_default_short(signer, 2_000_000_000_000_000_000u128, 100_000_000u128);
+
+        // Index goes POSITIVE → short receives.
+        pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::insert(
+            &ada_perp_market_id(),
+            10_000_000_000_000_000i128,
+        );
+
+        let acct_before = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+
+        assert_ok!(PerpEngine::settle_funding(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            signer,
+        ));
+
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        // Short received $0.01.
+        assert_eq!(
+            acct.free_e18,
+            acct_before.free_e18 + 10_000_000_000_000_000u128
+        );
+    });
+}
+
+/// (§3.6) Funding owed exceeds free balance — floor at 0 (bad-debt
+/// absorption pattern from close_position). Per-epoch cap also kicks
+/// in so the actual debit lands at `max_funding_per_epoch_bps × notional
+/// / 10_000`; free still floors at 0.
+#[test]
+fn settle_funding_floor_at_zero() {
+    new_test_ext().execute_with(|| {
+        let signer = 1u64;
+        open_default_long(signer, 1_000_000_000_000_000_000u128, 100_000_000u128);
+
+        let acct_before = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(acct_before.free_e18, 0);
+
+        pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::insert(
+            &ada_perp_market_id(),
+            100_000_000_000_000_000_000i128,
+        );
+
+        assert_ok!(PerpEngine::settle_funding(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            signer,
+        ));
+
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(acct.free_e18, 0);
+    });
+}
+
+/// (§3.6) Calling settle_funding twice in a row is a no-op the second
+/// time because the snapshot was re-baselined.
+#[test]
+fn settle_funding_rebaselines_snapshot() {
+    new_test_ext().execute_with(|| {
+        let signer = 1u64;
+        open_default_long(signer, 2_000_000_000_000_000_000u128, 100_000_000u128);
+
+        pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::insert(
+            &ada_perp_market_id(),
+            10_000_000_000_000_000i128,
+        );
+
+        assert_ok!(PerpEngine::settle_funding(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            signer,
+        ));
+        let after_first = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(after_first.free_e18, 990_000_000_000_000_000u128);
+
+        // Second call — snapshot now equals current index, so delta = 0.
+        assert_ok!(PerpEngine::settle_funding(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            signer,
+        ));
+        let after_second = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(after_second.free_e18, after_first.free_e18);
+    });
+}
+
+/// (§3.6) settle_funding rejects on a paused market — same gate as
+/// open / adjust_leverage. Only close_position bypasses (always-exit).
+#[test]
+fn settle_funding_rejects_paused_market() {
+    new_test_ext().execute_with(|| {
+        let signer = 1u64;
+        register_default_market();
+        seed_free_margin(signer, 1_000_000_000_000_000_000u128);
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            100u32,
+            50u32,
+            0u128,
+        ));
+
+        // Pause the market.
+        let mut cfg = default_ada_perp_market_config();
+        cfg.paused = true;
+        pallet_perp_engine::pallet::Markets::<Test>::insert(ada_perp_market_id(), cfg);
+
+        assert_noop!(
+            PerpEngine::settle_funding(
+                RuntimeOrigin::signed(signer),
+                ada_perp_market_id(),
+                signer,
+            ),
+            Error::<Test>::MarketPaused
+        );
+    });
+}
+
+/// (§3.6) settle_funding errors when the target has no open position.
+#[test]
+fn settle_funding_rejects_missing_position() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let signer = 1u64;
+        let target = 99u64;
+
+        assert_noop!(
+            PerpEngine::settle_funding(
+                RuntimeOrigin::signed(signer),
+                ada_perp_market_id(),
+                target,
+            ),
+            Error::<Test>::PositionNotFound
+        );
+    });
+}
+
+/// (§3.6 + feedback_u256_weighted_avg) On funding-received, snapshot
+/// bumps via weighted-avg with the live MATRA/USD rate (asymmetric
+/// clamp — only raises).
+#[test]
+fn settle_funding_snapshot_bump_on_received() {
+    new_test_ext().execute_with(|| {
+        let signer = 1u64;
+        credit_motra(signer, 10_000u128);
+
+        // Deposit at MATRA/USD = $1 (snapshot = 1e18).
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(signer),
+            5_000u128,
+        ));
+        register_default_market();
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            100u32,
+            50u32,
+            0u128,
+        ));
+
+        // MATRA appreciates to $2 — live rate climbs above the snapshot.
+        set_oracle_price(
+            &matra_usd_feed_id(),
+            2_000_000_000_000_000_000u128,
+        );
+
+        // Long receives funding (index dropped).
+        pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::insert(
+            &ada_perp_market_id(),
+            -10_000_000_000_000_000i128,
+        );
+
+        let snap_before = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer)
+            .weighted_deposit_rate_e18;
+
+        assert_ok!(PerpEngine::settle_funding(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            signer,
+        ));
+
+        let snap_after = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer)
+            .weighted_deposit_rate_e18;
+        assert!(
+            snap_after > snap_before,
+            "snapshot must raise on funding-received credit (before {}, after {})",
+            snap_before,
+            snap_after
+        );
+        assert!(
+            snap_after <= 2_000_000_000_000_000_000u128,
+            "snapshot must be bounded by max(old, live) — got {}",
+            snap_after
+        );
+    });
+}
+
+/// (§3.6) On funding-PAID (debit), the snapshot rate is NOT mutated —
+/// outbound funding doesn't bring fresh pMATRA-USD into the system.
+#[test]
+fn settle_funding_snapshot_unchanged_on_paid() {
+    new_test_ext().execute_with(|| {
+        let signer = 1u64;
+        credit_motra(signer, 10_000u128);
+
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(signer),
+            5_000u128,
+        ));
+        register_default_market();
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            100u32,
+            50u32,
+            0u128,
+        ));
+
+        // Move live rate so an erroneous bump would be visible. Snapshot
+        // is at $1 = 1e18 — set live to $5 to make any "snapshot follows
+        // live on debit" bug glaring.
+        set_oracle_price(
+            &matra_usd_feed_id(),
+            5_000_000_000_000_000_000u128,
+        );
+
+        // Long pays funding (index rose).
+        pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::insert(
+            &ada_perp_market_id(),
+            10_000_000_000_000_000i128,
+        );
+
+        let snap_before = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer)
+            .weighted_deposit_rate_e18;
+
+        assert_ok!(PerpEngine::settle_funding(
+            RuntimeOrigin::signed(signer),
+            ada_perp_market_id(),
+            signer,
+        ));
+
+        let snap_after = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer)
+            .weighted_deposit_rate_e18;
+        assert_eq!(
+            snap_after, snap_before,
+            "outbound funding must not move the deposit-rate snapshot"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// on_initialize mark cache (≥8) — §5.2
+// ---------------------------------------------------------------------------
+
+/// (§5.2) on_initialize populates MarkPriceCacheMap when the oracle is
+/// fresh. mark_e18 = oracle_e18 (no premium samples → EMA = 0).
+#[test]
+fn on_initialize_populates_mark_cache_for_fresh_oracle() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        set_oracle_price(
+            &ada_usd_feed_id(),
+            425_000_000_000_000_000u128,
+        );
+
+        let _w = <pallet_perp_engine::Pallet<Test> as Hooks<_>>::on_initialize(2);
+
+        let cache = pallet_perp_engine::pallet::MarkPriceCacheMap::<Test>::get(
+            &ada_perp_market_id(),
+        );
+        assert_eq!(cache.mark_e18, 425_000_000_000_000_000u128);
+        assert_eq!(cache.oracle_e18, 425_000_000_000_000_000u128);
+        assert_eq!(cache.mark_ema_basis_e18, 0);
+        assert_eq!(cache.block, 2);
+    });
+}
+
+/// (§5.2 + §5.5) on_initialize leaves the cache un-bumped when the
+/// oracle is stale.
+#[test]
+fn on_initialize_marks_stale_for_unfresh_oracle() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        set_oracle_price(&ada_usd_feed_id(), 425_000_000_000_000_000u128);
+        set_oracle_fresh(&ada_usd_feed_id(), false);
+
+        let _w = <pallet_perp_engine::Pallet<Test> as Hooks<_>>::on_initialize(5);
+
+        let cache = pallet_perp_engine::pallet::MarkPriceCacheMap::<Test>::get(
+            &ada_perp_market_id(),
+        );
+        assert_eq!(cache.block, 0);
+        assert_eq!(cache.mark_e18, 0);
+    });
+}
+
+/// (§5.2 + §7.3) The hook pushes a sample into PremiumIndexSamples[market][0].
+#[test]
+fn on_initialize_pushes_premium_sample() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        set_oracle_price(&ada_usd_feed_id(), 425_000_000_000_000_000u128);
+
+        let _w = <pallet_perp_engine::Pallet<Test> as Hooks<_>>::on_initialize(2);
+
+        let samples = pallet_perp_engine::pallet::PremiumIndexSamples::<Test>::get(
+            &ada_perp_market_id(),
+            0u32,
+        );
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0], 0i128);
+    });
+}
+
+/// (§5.2) When the bounded vec is at capacity, the oldest sample is
+/// dropped so the buffer stays bounded.
+#[test]
+fn on_initialize_drops_oldest_sample_at_capacity() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        set_oracle_price(&ada_usd_feed_id(), 425_000_000_000_000_000u128);
+
+        let cap =
+            <Test as pallet_perp_engine::Config>::MaxFundingSamplesPerEpoch::get() as u64;
+        for n in 0..(cap + 5) {
+            System::set_block_number(n + 1);
+            let _w = <pallet_perp_engine::Pallet<Test> as Hooks<_>>::on_initialize(n + 1);
+        }
+
+        let samples = pallet_perp_engine::pallet::PremiumIndexSamples::<Test>::get(
+            &ada_perp_market_id(),
+            0u32,
+        );
+        assert_eq!(samples.len(), cap as usize);
+    });
+}
+
+/// (§5.2) Extreme premium samples are clamped to ±MaxMarkBasisBps when
+/// computing mark = oracle + clamp(EMA, ±X%).
+#[test]
+fn on_initialize_clamps_ema_to_max_basis_bps() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let oracle = 1_000_000_000_000_000_000u128;
+        set_oracle_price(&ada_usd_feed_id(), oracle);
+
+        let cap =
+            <Test as pallet_perp_engine::Config>::MaxFundingSamplesPerEpoch::get() as usize;
+        let mut huge: frame_support::BoundedVec<
+            i128,
+            <Test as pallet_perp_engine::Config>::MaxFundingSamplesPerEpoch,
+        > = Default::default();
+        let extreme = 1_000_000_000_000_000_000_000i128;
+        for _ in 0..cap {
+            huge.try_push(extreme).expect("bounded vec accepts cap items");
+        }
+        pallet_perp_engine::pallet::PremiumIndexSamples::<Test>::insert(
+            &ada_perp_market_id(),
+            0u32,
+            huge,
+        );
+
+        let _w = <pallet_perp_engine::Pallet<Test> as Hooks<_>>::on_initialize(2);
+
+        let cache = pallet_perp_engine::pallet::MarkPriceCacheMap::<Test>::get(
+            &ada_perp_market_id(),
+        );
+        let max_basis_bps = <Test as pallet_perp_engine::Config>::MaxMarkBasisBps::get();
+        let max_basis = (oracle / 10_000) * (max_basis_bps as u128);
+        let expected_mark = oracle + max_basis;
+        assert_eq!(cache.mark_e18, expected_mark);
+    });
+}
+
+/// (§5.2) First block — no historical samples — mark equals oracle
+/// exactly.
+#[test]
+fn on_initialize_zero_premium_when_no_samples() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+        let oracle = 425_000_000_000_000_000u128;
+        set_oracle_price(&ada_usd_feed_id(), oracle);
+
+        let _w = <pallet_perp_engine::Pallet<Test> as Hooks<_>>::on_initialize(2);
+
+        let cache = pallet_perp_engine::pallet::MarkPriceCacheMap::<Test>::get(
+            &ada_perp_market_id(),
+        );
+        assert_eq!(cache.mark_e18, oracle);
+        assert_eq!(cache.mark_ema_basis_e18, 0);
+    });
+}
+
+/// (§5.2) Multiple markets — every active market gets its cache row
+/// updated each block.
+#[test]
+fn on_initialize_iterates_all_markets() {
+    new_test_ext().execute_with(|| {
+        register_default_market();
+
+        let btc_market = MarketId::try_from(b"BTC-PERP/USD".to_vec()).unwrap();
+        let btc_feed = OracleFeedId::try_from(b"BTC/USD".to_vec()).unwrap();
+        let mut btc_cfg = default_ada_perp_market_config();
+        btc_cfg.id = btc_market.clone();
+        btc_cfg.oracle_feed_id = btc_feed.clone();
+        pallet_perp_engine::pallet::Markets::<Test>::insert(&btc_market, btc_cfg);
+
+        set_oracle_price(&ada_usd_feed_id(), 425_000_000_000_000_000u128);
+        set_oracle_price(&btc_feed, 60_000_000_000_000_000_000_000u128);
+
+        let _w = <pallet_perp_engine::Pallet<Test> as Hooks<_>>::on_initialize(3);
+
+        let ada_cache = pallet_perp_engine::pallet::MarkPriceCacheMap::<Test>::get(
+            &ada_perp_market_id(),
+        );
+        let btc_cache =
+            pallet_perp_engine::pallet::MarkPriceCacheMap::<Test>::get(&btc_market);
+        assert_eq!(ada_cache.mark_e18, 425_000_000_000_000_000u128);
+        assert_eq!(
+            btc_cache.mark_e18,
+            60_000_000_000_000_000_000_000u128
+        );
+    });
+}
+
+/// (§5.2 + §5.5) Paused markets are SKIPPED by on_initialize. Mark cache
+/// freezes at its last fresh value, matching the §5.5 freshness contract.
+/// Justification (also in PR body): freezing the cache on pause keeps
+/// the §5.5 always-exit contract deterministic because `close_position`
+/// reads the cached mark.
+#[test]
+fn on_initialize_skips_paused_markets() {
+    new_test_ext().execute_with(|| {
+        let mut cfg = default_ada_perp_market_config();
+        cfg.paused = true;
+        pallet_perp_engine::pallet::Markets::<Test>::insert(
+            &ada_perp_market_id(),
+            cfg,
+        );
+        set_oracle_price(&ada_usd_feed_id(), 425_000_000_000_000_000u128);
+
+        let _w = <pallet_perp_engine::Pallet<Test> as Hooks<_>>::on_initialize(2);
+
+        let cache = pallet_perp_engine::pallet::MarkPriceCacheMap::<Test>::get(
+            &ada_perp_market_id(),
+        );
+        assert_eq!(cache.block, 0);
+        assert_eq!(cache.mark_e18, 0);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// IntentKind::PerpAction byte-pin (≥2) — §8.2
+// ---------------------------------------------------------------------------
+
+/// (§8.2) `IntentKind::PerpAction(PerpActionKind::*)` encodes via SCALE
+/// with a byte-pinned layout. The first byte is the `IntentKind` variant
+/// tag, the second is the `PerpActionKind` variant tag. Any drift in
+/// either enum's declaration order would re-shuffle these tags and
+/// silently misclassify intents. This test is the canary.
+#[test]
+fn intent_kind_perp_action_scale_encoding_byte_pinned() {
+    use codec::Encode;
+    use pallet_intent_settlement::types::IntentKind;
+    use pallet_intent_settlement::types::PerpActionKind as IntentPerpActionKind;
+
+    let perp_open = IntentKind::PerpAction(IntentPerpActionKind::Open);
+    let bytes_open = perp_open.encode();
+    assert_eq!(bytes_open[0], 0x03, "IntentKind::PerpAction tag must be 3");
+    assert_eq!(bytes_open[1], 0x00, "PerpActionKind::Open tag must be 0");
+
+    let perp_close = IntentKind::PerpAction(IntentPerpActionKind::Close);
+    let bytes_close = perp_close.encode();
+    assert_eq!(bytes_close[0], 0x03);
+    assert_eq!(bytes_close[1], 0x01, "PerpActionKind::Close tag must be 1");
+
+    let perp_liq = IntentKind::PerpAction(IntentPerpActionKind::Liquidation);
+    let bytes_liq = perp_liq.encode();
+    assert_eq!(bytes_liq[0], 0x03);
+    assert_eq!(bytes_liq[1], 0x02, "PerpActionKind::Liquidation tag must be 2");
+
+    let perp_adj = IntentKind::PerpAction(IntentPerpActionKind::LeverageAdjust);
+    let bytes_adj = perp_adj.encode();
+    assert_eq!(bytes_adj[0], 0x03);
+    assert_eq!(
+        bytes_adj[1], 0x03,
+        "PerpActionKind::LeverageAdjust tag must be 3"
+    );
+}
+
+/// (§8.2) Cross-pallet enum-discriminant guard. Both the local
+/// `pallet-perp-engine::types::PerpActionKind` AND the mirror in
+/// `pallet-intent-settlement::types::PerpActionKind` MUST encode to the
+/// same single-byte discriminants. Pinning explicit byte sequences for
+/// BOTH enums catches the silent drift.
+#[test]
+fn intent_kind_perp_action_variant_index_matches_source_order() {
+    use codec::Encode;
+    use pallet_intent_settlement::types::PerpActionKind as MirrorPerpActionKind;
+
+    assert_eq!(PerpActionKind::Open.encode(), vec![0x00]);
+    assert_eq!(PerpActionKind::Close.encode(), vec![0x01]);
+    assert_eq!(PerpActionKind::Liquidation.encode(), vec![0x02]);
+    assert_eq!(PerpActionKind::LeverageAdjust.encode(), vec![0x03]);
+
+    assert_eq!(MirrorPerpActionKind::Open.encode(), vec![0x00]);
+    assert_eq!(MirrorPerpActionKind::Close.encode(), vec![0x01]);
+    assert_eq!(MirrorPerpActionKind::Liquidation.encode(), vec![0x02]);
+    assert_eq!(MirrorPerpActionKind::LeverageAdjust.encode(), vec![0x03]);
 }

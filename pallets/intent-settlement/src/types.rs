@@ -128,6 +128,53 @@ pub enum IntentKind {
     },
     /// User wants their pre-funded credit back.
     RefundCredit { amount_ada: AdaLovelace },
+    /// Task #259 §8.2: a perp-engine position state change. Emitted by
+    /// `pallet-perp-engine::open_position` / `close_position` /
+    /// `adjust_leverage` / `liquidate` / `settle_funding` so the M-of-N
+    /// committee attests it on the same batch lane that already proves
+    /// at 6.63 settled-TPS on preprod, and the existing label-8746
+    /// Cardano anchor pipeline writes an L1 audit trail. The variant is
+    /// opaque to `pallet-intent-settlement` from a fairness-proof and
+    /// voucher perspective — see design memo §8.2 for the compounding-
+    /// leverage rationale.
+    ///
+    /// SCALE byte-pin: this variant MUST stay at declaration position 3
+    /// (`IntentKind` discriminants are: 0=BuyPolicy, 1=RequestPayout,
+    /// 2=RefundCredit, 3=PerpAction). The chain-side decoder routes by
+    /// this discriminant; flipping the order silently misclassifies
+    /// every perp intent. Guarded by
+    /// `intent_kind_perp_action_scale_encoding_byte_pinned` in
+    /// `pallet-perp-engine/src/tests.rs`.
+    PerpAction(PerpActionKind),
+}
+
+/// Task #259 §8.2 sub-kind of `IntentKind::PerpAction`. Mirrored
+/// byte-for-byte from `pallet-perp-engine::types::PerpActionKind` —
+/// declaration order MUST match (0=Open, 1=Close, 2=Liquidation,
+/// 3=LeverageAdjust) so the SCALE discriminant is identical across
+/// pallets and the chain-side decoder can branch on a single byte.
+///
+/// The duplicate definition (instead of importing from
+/// `pallet-perp-engine`) is intentional: `pallet-intent-settlement`
+/// MUST NOT depend on `pallet-perp-engine` because perp-engine itself
+/// depends on intent-settlement at the runtime layer, and a direct
+/// crate-graph edge would close the cycle. Both definitions are
+/// byte-pinned by the unit tests in `pallet-perp-engine/src/tests.rs`
+/// (`intent_kind_perp_action_variant_index_matches_source_order`).
+#[derive(
+    Clone, Copy, Encode, Decode, TypeInfo, MaxEncodedLen, RuntimeDebug, PartialEq, Eq,
+)]
+pub enum PerpActionKind {
+    /// `open_position` emitted this.
+    Open = 0,
+    /// `close_position` emitted this.
+    Close = 1,
+    /// `liquidate` emitted this — `Position` was closed at mark by a
+    /// keeper.
+    Liquidation = 2,
+    /// `adjust_leverage` emitted this — `Position.leverage_bps` and
+    /// `locked_margin_e18` were rebased.
+    LeverageAdjust = 3,
 }
 
 #[derive(

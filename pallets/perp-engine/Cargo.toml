@@ -24,6 +24,12 @@ sp-io = { workspace = true, features = ["std"] }
 sp-keyring = { workspace = true }
 hex-literal = { workspace = true }
 pallet-balances = { workspace = true, features = ["std"] }
+# Dev-only edge so the byte-pinned IntentKind::PerpAction unit test
+# (§8.2) can construct the cross-pallet enum. Production wires the
+# perp-engine ↔ intent-settlement seam through the runtime, NOT a
+# direct dep from perp-engine; the dev-only edge keeps the perp-engine
+# std/no_std builds free of the heavier intent-settlement graph.
+pallet-intent-settlement = { workspace = true, features = ["std"] }
 
 [features]
 default = ["std"]

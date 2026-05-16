@@ -1866,6 +1866,7 @@ dependencies = [
  "hex-literal",
  "log",
  "pallet-balances",
+ "pallet-intent-settlement",
  "parity-scale-codec",
  "scale-info",
  "sp-core",
