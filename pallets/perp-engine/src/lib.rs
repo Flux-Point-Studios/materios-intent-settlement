@@ -19,13 +19,9 @@
 //! - [`pallet::Pallet::adjust_leverage`] — §3.7, locked-margin rebase
 //!   + IM-floor invariant at current mark.
 //!
-//! Reserved for PR-C/D:
-//! - [`pallet::Pallet::liquidate`] (PR-C) — keeper-bonded permissionless
-//!   liquidation per §3.5 + §6.3.
-//! - [`pallet::Pallet::settle_funding`] (PR-C) — pull-based funding
-//!   epoch settlement per §3.6 + §7.4.
-//! - [`pallet::Pallet::governance_set_market`] (PR-D) — sudo / multisig
-//!   market creation + update per §3.8.
+//! All 10 v0 dispatch bodies are live (open / close / deposit /
+//! withdraw / adjust_leverage / liquidate / settle_funding /
+//! governance_set_market / reserve_keeper_bond / release_keeper_bond).
 //!
 //! ## Math layer
 //!
@@ -42,7 +38,7 @@
 //! - **PR-C**: `liquidate` + `settle_funding` + `MarkPriceCache`
 //!   on_initialize hook + `IntentKind::PerpAction` extension on
 //!   `pallet-intent-settlement` (§8.2).
-//! - **PR-D (this one)**: keeper-bond reserve/release extrinsics +
+//! - **PR-D**: keeper-bond reserve/release extrinsics +
 //!   false-trigger slash inside `liquidate` per spec §6.3. The slash
 //!   path uses the Ok-return + emit-on-fail pattern
 //!   (`feedback_substrate_ok_return_emit_on_fail_pattern.md`):
@@ -54,7 +50,11 @@
 //!   false-trigger outcome — `is_success` is wrong.
 //! - **PR-E**: wire into `materios-runtime` `construct_runtime!`, with
 //!   genesis `MarketsPaused = true` kill-switch per §next-steps, plus
-//!   spec_version bump + WASM build + ceremony.
+//!   spec_version bump + WASM build + ceremony (spec 225→226 live).
+//! - **spec-227 polish (this PR)**: real `governance_set_market` body
+//!   (12 validation gates + MarketRegistered event), sub-rate
+//!   liquidation fee floor-to-1 (PR-C sec-review LOW 2),
+//!   spec_version 226→227 + ceremony staging.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -530,12 +530,21 @@ pub mod pallet {
             new_leverage_bps: u32,
             new_locked_margin_e18: u128,
         },
-        /// A market was created, updated, or paused by governance.
-        /// Emitted by `governance_set_market` (§3.8). Worsening-terms
-        /// updates are timelock-delayed per §9.3; this event fires at
-        /// the moment the new config takes effect.
-        MarketSet {
+        /// A new market was registered by governance via
+        /// `governance_set_market` (§3.8). v0 ships create-only; updates
+        /// land via a separate timelock-gated extrinsic in v1 (§9.3).
+        ///
+        /// Payload pins the three risk-config knobs an indexer needs to
+        /// reconstruct the market without an extra storage read:
+        /// `initial_margin_bps`, `maintenance_margin_bps`,
+        /// `max_leverage_bps`. Full `MarketConfig` lives at
+        /// `Markets[market_id]`.
+        MarketRegistered {
             market_id: MarketId,
+            oracle_feed_id: OracleFeedId,
+            initial_margin_bps: u32,
+            maintenance_margin_bps: u32,
+            max_leverage_bps: u32,
             paused: bool,
         },
         /// A keeper reserved additional bond for a market via
@@ -685,6 +694,13 @@ pub mod pallet {
         /// v0 is isolated-margin one-position-per-market-per-account
         /// (§1.2) — to flip direction, close first then open.
         PositionAlreadyExists,
+        /// `governance_set_market` called with a `market_id` that
+        /// already has a Markets row. v0 ships create-only; updates
+        /// require the v1 timelock-gated path (§9.3 worsening-terms
+        /// protection). The duplicate-rejection is the structural gate
+        /// that makes the v0 "register once, never mutate" semantics
+        /// safe to ship without the timelock.
+        MarketAlreadyExists,
         /// Bad debt accumulated in the rolling window has exceeded
         /// `BadDebtCircuitBreakerThresholdE18`. Market auto-pauses
         /// (§6.5) until governance investigates.
@@ -890,9 +906,9 @@ pub mod pallet {
     }
 
     // ---------------------------------------------------------------------
-    // Calls — 8 extrinsics. open/close/deposit/withdraw/adjust_leverage +
-    // liquidate are impls (PR-B and PR-C piece 1); settle_funding +
-    // governance_set_market are stubs reserved for follow-up PRs.
+    // Calls — 10 extrinsics. open/close/deposit/withdraw/adjust_leverage +
+    // liquidate + settle_funding + governance_set_market + reserve_keeper_bond
+    // + release_keeper_bond. All v0 dispatch surfaces are live.
     // ---------------------------------------------------------------------
 
     #[pallet::call]
@@ -1629,7 +1645,18 @@ pub mod pallet {
                 victim_acct.weighted_deposit_rate_e18
             };
             ensure!(payout_rate_e18 > 0, Error::<T>::OracleUnavailable);
-            let fee_motra_u128 = fee_e18 / payout_rate_e18;
+            // PR-C sec-review LOW 2 — sub-rate fee floor. The integer
+            // division `fee_e18 / payout_rate_e18` rounds to 0 when
+            // `fee_e18 < payout_rate_e18`, robbing the keeper on tiny-
+            // notional liquidations. Pin a 1-base-unit floor when
+            // there's any fee at all. Fee already capped at locked
+            // margin above, so the extra unit comes from the
+            // position's collateral — no pot-drain risk.
+            let fee_motra_u128 = if fee_e18 > 0 {
+                core::cmp::max(1u128, fee_e18 / payout_rate_e18)
+            } else {
+                0u128
+            };
             let fee_motra: BalanceOf<T> = fee_motra_u128
                 .try_into()
                 .map_err(|_| Error::<T>::BalanceConversionOverflow)?;
@@ -2113,23 +2140,121 @@ pub mod pallet {
             Ok(())
         }
 
-        /// **(PR-A stub)** Sudo-set a market configuration. See design
-        /// memo §3.8 — `EnsureRoot` in v0 (sudo / 2-of-3 multisig); v1
-        /// may delegate to `pallet-collective`.
+        /// Register a NEW perp market. v0 is create-only; updates land
+        /// via a separate timelock-gated extrinsic in v1 (§9.3
+        /// worsening-terms protection). `EnsureRoot` per §3.8 — on
+        /// preprod / mainnet the runtime wires this behind the 2-of-3
+        /// sudo multisig.
+        ///
+        /// Validation gates the call before any storage write:
+        ///   - `market_id` not already registered (`MarketAlreadyExists`).
+        ///   - `config.id == market_id` (no key/value drift).
+        ///   - `config.oracle_feed_id` non-empty (no functional market
+        ///     without a mark-price source).
+        ///   - `config.maintenance_margin_bps < config.initial_margin_bps`
+        ///     (`InvalidMarketConfig`; §3.8 + §9.1).
+        ///   - `config.initial_margin_bps`, `maintenance_margin_bps`,
+        ///     `max_leverage_bps`, `max_funding_per_epoch_bps`,
+        ///     `liquidation_fee_bps`, `taker_fee_bps` ≤ 10_000 bps.
+        ///   - `config.maker_fee_bps` ∈ [-10_000, 10_000] (signed for
+        ///     rebates, but still bp-bounded).
+        ///   - `config.max_leverage_bps` ≤ `T::MaxLeverageBps::get()`
+        ///     (chain-wide hard cap).
+        ///   - `config.min_position_size_e8 > 0` AND
+        ///     `min_position_size_e8 <= max_position_size_e8`.
+        ///   - `config.mark_ema_window_blocks > 0` AND
+        ///     `config.funding_epoch_blocks > 0` (zero would divide-by-
+        ///     zero downstream).
+        ///
+        /// On success: `Markets[market_id] = config` and
+        /// `MarketRegistered { … }` fires with the indexer-relevant
+        /// risk-config knobs pinned for downstream readers.
         #[pallet::call_index(7)]
         #[pallet::weight(Weight::from_parts(80_000_000, 3000))]
         pub fn governance_set_market(
             origin: OriginFor<T>,
-            _market_id: MarketId,
-            _config: MarketConfig,
+            market_id: MarketId,
+            config: MarketConfig,
         ) -> DispatchResult {
             ensure_root(origin)?;
-            // Reserved for PR-E (runtime wire-up): config validation
-            // (mm < im, max_leverage ≤ T::MaxLeverageBps, oracle feed
-            // exists in pallet-oracle), try_state worsening-terms
-            // timelock (§9.3), Markets upsert, MarketSet emit. Origin
-            // gate ships in PR-A so the runtime `construct_runtime!`
-            // can pin the call_index across the PR sequence.
+
+            ensure!(
+                !Markets::<T>::contains_key(&market_id),
+                Error::<T>::MarketAlreadyExists
+            );
+
+            ensure!(config.id == market_id, Error::<T>::InvalidMarketConfig);
+            ensure!(
+                !config.oracle_feed_id.is_empty(),
+                Error::<T>::InvalidMarketConfig
+            );
+            ensure!(
+                config.maintenance_margin_bps < config.initial_margin_bps,
+                Error::<T>::InvalidMarketConfig
+            );
+            const BPS_DENOMINATOR: u32 = 10_000;
+            ensure!(
+                config.initial_margin_bps <= BPS_DENOMINATOR,
+                Error::<T>::InvalidMarketConfig
+            );
+            ensure!(
+                config.maintenance_margin_bps <= BPS_DENOMINATOR,
+                Error::<T>::InvalidMarketConfig
+            );
+            ensure!(
+                config.max_leverage_bps <= BPS_DENOMINATOR,
+                Error::<T>::InvalidMarketConfig
+            );
+            ensure!(
+                config.max_funding_per_epoch_bps <= BPS_DENOMINATOR,
+                Error::<T>::InvalidMarketConfig
+            );
+            ensure!(
+                config.liquidation_fee_bps <= BPS_DENOMINATOR,
+                Error::<T>::InvalidMarketConfig
+            );
+            ensure!(
+                config.taker_fee_bps <= BPS_DENOMINATOR,
+                Error::<T>::InvalidMarketConfig
+            );
+            // Signed maker fee — rebate (negative) or fee (positive),
+            // each capped at 100%. `i32::unsigned_abs` never overflows
+            // because i32::MIN > -BPS_DENOMINATOR is impossible here.
+            ensure!(
+                config.maker_fee_bps.unsigned_abs() <= BPS_DENOMINATOR,
+                Error::<T>::InvalidMarketConfig
+            );
+            ensure!(
+                config.max_leverage_bps <= T::MaxLeverageBps::get(),
+                Error::<T>::InvalidMarketConfig
+            );
+            ensure!(
+                config.min_position_size_e8 > 0,
+                Error::<T>::InvalidMarketConfig
+            );
+            ensure!(
+                config.min_position_size_e8 <= config.max_position_size_e8,
+                Error::<T>::InvalidMarketConfig
+            );
+            ensure!(
+                config.mark_ema_window_blocks > 0,
+                Error::<T>::InvalidMarketConfig
+            );
+            ensure!(
+                config.funding_epoch_blocks > 0,
+                Error::<T>::InvalidMarketConfig
+            );
+
+            let event = Event::MarketRegistered {
+                market_id: market_id.clone(),
+                oracle_feed_id: config.oracle_feed_id.clone(),
+                initial_margin_bps: config.initial_margin_bps,
+                maintenance_margin_bps: config.maintenance_margin_bps,
+                max_leverage_bps: config.max_leverage_bps,
+                paused: config.paused,
+            };
+            Markets::<T>::insert(&market_id, config);
+            Self::deposit_event(event);
             Ok(())
         }
 
