@@ -168,6 +168,39 @@ mod benches {
         _(RawOrigin::Root, market_id, config);
     }
 
+    /// Benchmarks `reserve_keeper_bond` (PR-D, #259 §6.3).
+    /// Measures: market lookup + Currency::reserve + try_mutate +
+    /// KeeperBondReserved event. Mirrors `deposit_margin`'s shape
+    /// (one extrinsic_call with a default-amount placeholder). The
+    /// production runtime bench will pre-fund the caller via a
+    /// `whitelisted_caller`-based deposit so the Currency::reserve
+    /// succeeds; here we leave the amount at Default::default() to
+    /// keep the stub minimal — the runtime-side bench picks
+    /// `KeeperBondMinimum` as the parametrised amount.
+    #[benchmark]
+    fn reserve_keeper_bond() {
+        let caller: T::AccountId = whitelisted_caller();
+        let market_id = bench_market_id();
+
+        #[extrinsic_call]
+        _(RawOrigin::Signed(caller), market_id, Default::default());
+    }
+
+    /// Benchmarks `release_keeper_bond` (PR-D, #259 §6.3).
+    /// Measures: market lookup + ReservedKeeperBonds try_mutate +
+    /// Currency::unreserve + KeeperBondReleased event. Same default-
+    /// amount placeholder as `reserve_keeper_bond`; the production
+    /// runtime bench seeds a non-zero bond pre-call via
+    /// `seed_keeper_bond`-equivalent helper.
+    #[benchmark]
+    fn release_keeper_bond() {
+        let caller: T::AccountId = whitelisted_caller();
+        let market_id = bench_market_id();
+
+        #[extrinsic_call]
+        _(RawOrigin::Signed(caller), market_id, Default::default());
+    }
+
     // NOTE: `impl_benchmark_test_suite!` intentionally omitted. The bench
     // harness assumes `T::AccountId = AccountId32` (sr25519 pubkey
     // identity in the production runtime); the test mock uses `u64`

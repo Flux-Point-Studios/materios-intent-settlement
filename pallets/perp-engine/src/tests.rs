@@ -1578,14 +1578,44 @@ fn math_compute_notional_overflow_protected() {
 // PR-C piece 1 — liquidate (task #259 §3.5) — 16 tests
 // ---------------------------------------------------------------------------
 
-/// Seed a `ReservedKeeperBonds` entry directly. Production wires this
-/// via a future `reserve_keeper_bond` extrinsic (deferred); v0 tests
-/// + the impl read the storage as a passive gate.
+/// Seed a `ReservedKeeperBonds` entry by minting MOTRA into the
+/// keeper's free balance via `deposit_creating` and then calling
+/// `Currency::reserve` to lift it into the reserve. Production wires
+/// this via `reserve_keeper_bond` (PR-D); the legacy test helper
+/// mirrors that flow so the slash path's
+/// `try_state` invariant
+/// `ReservedKeeperBonds[m][k] ≤ Currency::reserved_balance(&k)` is
+/// preserved even when tests skip the extrinsic.
 fn seed_keeper_bond(market_id: &MarketId, keeper: u64, bond: u128) {
-    pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::insert(
+    use frame_support::traits::Currency;
+    // System provider/consumer dance: `Currency::reserve` increments
+    // consumers; we need at least one provider on the account before
+    // that or `ReservedKeeperBonds` invariants in the production code
+    // path (which inc'd a provider on the `Currency::reserve` call
+    // when going free → reserved through deposit_creating) would
+    // diverge.
+    //
+    // mint `bond` via deposit_creating (this inc'd a provider when
+    // the account is fresh — first deposit). For repeated calls
+    // against the same account, deposit_creating is a no-op on the
+    // provider ref count. Reserve then succeeds because the keeper
+    // already has ≥1 provider.
+    let imbalance = <pallet_balances::Pallet<Test> as Currency<u64>>::deposit_creating(
+        &keeper, bond,
+    );
+    drop(imbalance);
+    // Explicit provider seed — defensive against the mock's frame_system
+    // not auto-bumping providers on deposit_creating for AccountStore=System.
+    let _ = frame_system::Pallet::<Test>::inc_providers(&keeper);
+    <pallet_balances::Pallet<Test> as frame_support::traits::ReservableCurrency<u64>>::reserve(
+        &keeper,
+        bond,
+    )
+    .expect("Currency::reserve succeeds — deposit_creating just credited bond");
+    pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::mutate(
         market_id,
         keeper,
-        bond,
+        |existing| *existing = existing.saturating_add(bond),
     );
 }
 
@@ -1722,10 +1752,14 @@ fn liquidate_happy_path_short_underwater() {
     });
 }
 
-/// Test 3: healthy position → `PositionNotLiquidatable`. v0 does not
-/// slash the bond; it stays reserved.
+/// Test 3 (PR-D superseded): healthy position → liquidate returns
+/// `Ok(())` but slashes the keeper bond via the Ok-return +
+/// emit-on-fail pattern. Position is NOT removed; the false-trigger
+/// is signalled via the `LiquidationBondSlashed` event. Detailed
+/// 50/50 split assertions live in
+/// `liquidate_false_trigger_slashes_bond_50_50`.
 #[test]
-fn liquidate_rejects_healthy_position() {
+fn liquidate_false_trigger_returns_ok_and_keeps_position() {
     new_test_ext().execute_with(|| {
         let victim = 1u64;
         let keeper = 2u64;
@@ -1734,31 +1768,61 @@ fn liquidate_rejects_healthy_position() {
         let min_bond =
             <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get();
         seed_keeper_bond(&ada_perp_market_id(), keeper, min_bond);
+        // mat/trsy needs to exist (ED=1) so repatriate_reserved
+        // succeeds.
+        let mat_trsy = pallet_perp_engine::pallet::Pallet::<Test>::mat_trsy_account();
+        pallet_balances::Pallet::<Test>::force_set_balance(
+            RuntimeOrigin::root(),
+            mat_trsy,
+            1u128,
+        )
+        .expect("force_set_balance succeeds");
 
         // Mark stays at $1.00 → position is healthy.
-        assert_noop!(
-            PerpEngine::liquidate(
-                RuntimeOrigin::signed(keeper),
-                victim,
-                ada_perp_market_id(),
-            ),
-            Error::<Test>::PositionNotLiquidatable
-        );
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            ada_perp_market_id(),
+        ));
 
-        // Position still present.
+        // Position still present — false-trigger does NOT close the
+        // position.
         assert!(pallet_perp_engine::pallet::Positions::<Test>::get(
             &ada_perp_market_id(),
             &victim,
         )
         .is_some());
 
-        // Bond untouched (no slashing in v0).
+        // Bond slashed to zero.
         let bond_after =
             pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::get(
                 &ada_perp_market_id(),
                 &keeper,
             );
-        assert_eq!(bond_after, min_bond);
+        assert_eq!(bond_after, 0);
+
+        // LiquidationBondSlashed emitted, PositionLiquidated NOT.
+        let saw_slashed = System::events().iter().any(|er| {
+            matches!(
+                er.event,
+                RuntimeEvent::PerpEngine(
+                    pallet_perp_engine::Event::LiquidationBondSlashed { .. }
+                )
+            )
+        });
+        let saw_liquidated = System::events().iter().any(|er| {
+            matches!(
+                er.event,
+                RuntimeEvent::PerpEngine(
+                    pallet_perp_engine::Event::PositionLiquidated { .. }
+                )
+            )
+        });
+        assert!(saw_slashed, "false-trigger must emit LiquidationBondSlashed");
+        assert!(
+            !saw_liquidated,
+            "false-trigger must NOT emit PositionLiquidated (position kept)"
+        );
     });
 }
 
@@ -3163,4 +3227,632 @@ fn intent_kind_perp_action_variant_index_matches_source_order() {
     assert_eq!(MirrorPerpActionKind::Close.encode(), vec![0x01]);
     assert_eq!(MirrorPerpActionKind::Liquidation.encode(), vec![0x02]);
     assert_eq!(MirrorPerpActionKind::LeverageAdjust.encode(), vec![0x03]);
+}
+
+// ---------------------------------------------------------------------------
+// PR-D: reserve_keeper_bond / release_keeper_bond + false-trigger slash
+// (#259 spec §6.3) — 15 tests
+// ---------------------------------------------------------------------------
+
+/// Helper: pre-fund `mat/trsy` to the existential deposit so
+/// `repatriate_reserved` succeeds on the slash path. Production funds
+/// this via the runtime genesis treasury endowment (task #295); the
+/// test runtime starts mat/trsy empty.
+fn endow_mat_trsy(min_balance: u128) {
+    use frame_support::traits::Currency;
+    let mat_trsy = pallet_perp_engine::pallet::Pallet::<Test>::mat_trsy_account();
+    let imbalance = <pallet_balances::Pallet<Test> as Currency<u64>>::deposit_creating(
+        &mat_trsy,
+        min_balance,
+    );
+    drop(imbalance);
+}
+
+/// Helper: credit a keeper with raw MOTRA free balance ready for
+/// `reserve_keeper_bond`. Uses `deposit_creating` so the
+/// provider/consumer references mirror what `Currency::transfer`
+/// would produce for a normal user funding a wallet.
+fn fund_keeper(keeper: u64, amount: u128) {
+    use frame_support::traits::Currency;
+    let imbalance = <pallet_balances::Pallet<Test> as Currency<u64>>::deposit_creating(
+        &keeper, amount,
+    );
+    drop(imbalance);
+}
+
+/// PR-D Test 1: `reserve_keeper_bond` happy path.
+#[test]
+fn reserve_keeper_bond_happy_path() {
+    new_test_ext().execute_with(|| {
+        let keeper = 7u64;
+        register_default_market();
+        fund_keeper(keeper, 500u128);
+        let _ = frame_system::Pallet::<Test>::inc_providers(&keeper);
+
+        assert_ok!(PerpEngine::reserve_keeper_bond(
+            RuntimeOrigin::signed(keeper),
+            ada_perp_market_id(),
+            100u128,
+        ));
+
+        // Pallet bookkeeping reflects the reserve.
+        let bond = pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::get(
+            &ada_perp_market_id(),
+            &keeper,
+        );
+        assert_eq!(bond, 100u128);
+        // Currency moved free → reserved.
+        assert_eq!(
+            <pallet_balances::Pallet<Test> as frame_support::traits::ReservableCurrency<u64>>::reserved_balance(&keeper),
+            100u128,
+        );
+        assert_eq!(pallet_balances::Pallet::<Test>::free_balance(&keeper), 400u128);
+
+        // Event payload.
+        let event_matches = System::events().iter().any(|er| matches!(
+            &er.event,
+            RuntimeEvent::PerpEngine(pallet_perp_engine::Event::KeeperBondReserved {
+                keeper: k, market_id: m, amount, total_reserved,
+            }) if *k == keeper
+                && m == &ada_perp_market_id()
+                && *amount == 100u128
+                && *total_reserved == 100u128,
+        ));
+        assert!(event_matches, "KeeperBondReserved event must be emitted");
+    });
+}
+
+/// PR-D Test 2: `reserve_keeper_bond` rejects amount=0.
+#[test]
+fn reserve_keeper_bond_zero_amount_rejects() {
+    new_test_ext().execute_with(|| {
+        let keeper = 7u64;
+        register_default_market();
+        fund_keeper(keeper, 500u128);
+
+        assert_noop!(
+            PerpEngine::reserve_keeper_bond(
+                RuntimeOrigin::signed(keeper),
+                ada_perp_market_id(),
+                0u128,
+            ),
+            Error::<Test>::ZeroAmount
+        );
+    });
+}
+
+/// PR-D Test 3: `reserve_keeper_bond` rejects unknown market.
+#[test]
+fn reserve_keeper_bond_unknown_market_rejects() {
+    new_test_ext().execute_with(|| {
+        let keeper = 7u64;
+        fund_keeper(keeper, 500u128);
+
+        // No `register_default_market()` — Markets[m] is None.
+        assert_noop!(
+            PerpEngine::reserve_keeper_bond(
+                RuntimeOrigin::signed(keeper),
+                ada_perp_market_id(),
+                100u128,
+            ),
+            Error::<Test>::MarketNotFound
+        );
+    });
+}
+
+/// PR-D Test 4: `reserve_keeper_bond` surfaces InsufficientBalance from
+/// the inner `Currency::reserve` (pallet-balances). Pinned against
+/// `pallet_balances::Error::<Test>::InsufficientBalance` to catch any
+/// future flow-through change.
+#[test]
+fn reserve_keeper_bond_insufficient_balance_rejects() {
+    new_test_ext().execute_with(|| {
+        let keeper = 7u64;
+        register_default_market();
+        fund_keeper(keeper, 10u128);
+        let _ = frame_system::Pallet::<Test>::inc_providers(&keeper);
+
+        assert_noop!(
+            PerpEngine::reserve_keeper_bond(
+                RuntimeOrigin::signed(keeper),
+                ada_perp_market_id(),
+                100u128,
+            ),
+            pallet_balances::Error::<Test>::InsufficientBalance
+        );
+    });
+}
+
+/// PR-D Test 5: Two reserve calls aggregate; KeeperBondReserved
+/// reports correct `amount` (delta) and `total_reserved` on each.
+#[test]
+fn reserve_keeper_bond_aggregates_across_calls() {
+    new_test_ext().execute_with(|| {
+        let keeper = 7u64;
+        register_default_market();
+        fund_keeper(keeper, 500u128);
+        let _ = frame_system::Pallet::<Test>::inc_providers(&keeper);
+
+        assert_ok!(PerpEngine::reserve_keeper_bond(
+            RuntimeOrigin::signed(keeper),
+            ada_perp_market_id(),
+            100u128,
+        ));
+        assert_ok!(PerpEngine::reserve_keeper_bond(
+            RuntimeOrigin::signed(keeper),
+            ada_perp_market_id(),
+            50u128,
+        ));
+
+        // Pallet bookkeeping shows the sum.
+        let bond = pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::get(
+            &ada_perp_market_id(),
+            &keeper,
+        );
+        assert_eq!(bond, 150u128);
+        assert_eq!(
+            <pallet_balances::Pallet<Test> as frame_support::traits::ReservableCurrency<u64>>::reserved_balance(&keeper),
+            150u128,
+        );
+
+        // Second event carried `total_reserved == 150` and
+        // `amount == 50`.
+        let second_event_ok = System::events().iter().rev().find_map(|er| {
+            if let RuntimeEvent::PerpEngine(
+                pallet_perp_engine::Event::KeeperBondReserved {
+                    amount, total_reserved, ..
+                },
+            ) = &er.event
+            {
+                Some((*amount, *total_reserved))
+            } else {
+                None
+            }
+        });
+        assert_eq!(second_event_ok, Some((50u128, 150u128)));
+    });
+}
+
+/// PR-D Test 6: `release_keeper_bond` happy path — release full reserve.
+#[test]
+fn release_keeper_bond_happy_path() {
+    new_test_ext().execute_with(|| {
+        let keeper = 7u64;
+        register_default_market();
+        fund_keeper(keeper, 500u128);
+        let _ = frame_system::Pallet::<Test>::inc_providers(&keeper);
+
+        assert_ok!(PerpEngine::reserve_keeper_bond(
+            RuntimeOrigin::signed(keeper),
+            ada_perp_market_id(),
+            100u128,
+        ));
+        assert_ok!(PerpEngine::release_keeper_bond(
+            RuntimeOrigin::signed(keeper),
+            ada_perp_market_id(),
+            100u128,
+        ));
+
+        let bond = pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::get(
+            &ada_perp_market_id(),
+            &keeper,
+        );
+        assert_eq!(bond, 0u128);
+        assert_eq!(
+            <pallet_balances::Pallet<Test> as frame_support::traits::ReservableCurrency<u64>>::reserved_balance(&keeper),
+            0u128,
+        );
+        assert_eq!(pallet_balances::Pallet::<Test>::free_balance(&keeper), 500u128);
+
+        let saw_release = System::events().iter().any(|er| matches!(
+            &er.event,
+            RuntimeEvent::PerpEngine(pallet_perp_engine::Event::KeeperBondReleased {
+                amount, total_reserved_after, ..
+            }) if *amount == 100u128 && *total_reserved_after == 0u128,
+        ));
+        assert!(saw_release, "KeeperBondReleased event must be emitted");
+    });
+}
+
+/// PR-D Test 7: Partial release leaves the rest reserved.
+#[test]
+fn release_keeper_bond_partial() {
+    new_test_ext().execute_with(|| {
+        let keeper = 7u64;
+        register_default_market();
+        fund_keeper(keeper, 500u128);
+        let _ = frame_system::Pallet::<Test>::inc_providers(&keeper);
+
+        assert_ok!(PerpEngine::reserve_keeper_bond(
+            RuntimeOrigin::signed(keeper),
+            ada_perp_market_id(),
+            200u128,
+        ));
+        assert_ok!(PerpEngine::release_keeper_bond(
+            RuntimeOrigin::signed(keeper),
+            ada_perp_market_id(),
+            50u128,
+        ));
+
+        let bond = pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::get(
+            &ada_perp_market_id(),
+            &keeper,
+        );
+        assert_eq!(bond, 150u128);
+        assert_eq!(
+            <pallet_balances::Pallet<Test> as frame_support::traits::ReservableCurrency<u64>>::reserved_balance(&keeper),
+            150u128,
+        );
+    });
+}
+
+/// PR-D Test 8: Release more than reserved → KeeperBondUnderflow.
+#[test]
+fn release_keeper_bond_more_than_reserved_rejects() {
+    new_test_ext().execute_with(|| {
+        let keeper = 7u64;
+        register_default_market();
+        fund_keeper(keeper, 500u128);
+        let _ = frame_system::Pallet::<Test>::inc_providers(&keeper);
+
+        assert_ok!(PerpEngine::reserve_keeper_bond(
+            RuntimeOrigin::signed(keeper),
+            ada_perp_market_id(),
+            100u128,
+        ));
+        assert_noop!(
+            PerpEngine::release_keeper_bond(
+                RuntimeOrigin::signed(keeper),
+                ada_perp_market_id(),
+                200u128,
+            ),
+            Error::<Test>::KeeperBondUnderflow
+        );
+
+        // State unchanged.
+        let bond = pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::get(
+            &ada_perp_market_id(),
+            &keeper,
+        );
+        assert_eq!(bond, 100u128);
+    });
+}
+
+/// PR-D Test 9: `release_keeper_bond` rejects amount=0.
+#[test]
+fn release_keeper_bond_zero_amount_rejects() {
+    new_test_ext().execute_with(|| {
+        let keeper = 7u64;
+        register_default_market();
+
+        assert_noop!(
+            PerpEngine::release_keeper_bond(
+                RuntimeOrigin::signed(keeper),
+                ada_perp_market_id(),
+                0u128,
+            ),
+            Error::<Test>::ZeroAmount
+        );
+    });
+}
+
+/// PR-D Test 10: `release_keeper_bond` rejects unknown market.
+#[test]
+fn release_keeper_bond_unknown_market_rejects() {
+    new_test_ext().execute_with(|| {
+        let keeper = 7u64;
+        // No register_default_market.
+        assert_noop!(
+            PerpEngine::release_keeper_bond(
+                RuntimeOrigin::signed(keeper),
+                ada_perp_market_id(),
+                100u128,
+            ),
+            Error::<Test>::MarketNotFound
+        );
+    });
+}
+
+/// PR-D Test 11: liquidate against a HEALTHY position slashes the bond
+/// 50/50 (treasury / burn) — full assertions on event, mat/trsy
+/// balance, total token supply, and ReservedKeeperBonds decrement.
+#[test]
+fn liquidate_false_trigger_slashes_bond_50_50() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        open_underwater_setup(PerpDirection::Long, 1u128);
+        fund_pot(100u128);
+        let min_bond =
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get();
+        // Seed > minimum to prove we slash exactly KeeperBondMinimum, not the full reserve.
+        seed_keeper_bond(&ada_perp_market_id(), keeper, min_bond + 50u128);
+        endow_mat_trsy(1u128);
+
+        // Mark stays at $1.00 → position is healthy (long opens at $1).
+        let total_issuance_pre = pallet_balances::Pallet::<Test>::total_issuance();
+        let mat_trsy = pallet_perp_engine::pallet::Pallet::<Test>::mat_trsy_account();
+        let mat_trsy_pre = pallet_balances::Pallet::<Test>::free_balance(&mat_trsy);
+
+        // The dispatch returns Ok(()) — the slash is the verdict.
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            ada_perp_market_id(),
+        ));
+
+        // Find the LiquidationBondSlashed event.
+        let slash = System::events().iter().find_map(|er| match &er.event {
+            RuntimeEvent::PerpEngine(
+                pallet_perp_engine::Event::LiquidationBondSlashed {
+                    keeper: k,
+                    target,
+                    market_id,
+                    slash_amount,
+                    treasury_share,
+                    burn_share,
+                    equity_e18_signed,
+                    mm_e18,
+                },
+            ) => Some((
+                *k,
+                *target,
+                market_id.clone(),
+                *slash_amount,
+                *treasury_share,
+                *burn_share,
+                *equity_e18_signed,
+                *mm_e18,
+            )),
+            _ => None,
+        });
+        let s = slash.expect("LiquidationBondSlashed must be emitted");
+        assert_eq!(s.0, keeper);
+        assert_eq!(s.1, victim);
+        assert_eq!(s.2, ada_perp_market_id());
+        assert_eq!(s.3, min_bond, "full KeeperBondMinimum slashed");
+        // 50/50 split with treasury_share absorbing odd-byte remainder
+        // (min_bond=100 → burn=50, treasury=50).
+        assert_eq!(s.4, min_bond / 2u128, "treasury_share = half");
+        assert_eq!(s.5, min_bond / 2u128, "burn_share = other half");
+        assert_eq!(s.4 + s.5, min_bond, "treasury + burn == slash_amount");
+        // equity_e18_signed should be positive (healthy = above MM)
+        // and mm_e18 should be 5% × notional ($1 × 5% = $0.05 = 5e16).
+        assert!(s.6 >= 0, "healthy position has non-negative equity");
+        assert_eq!(s.7, 50_000_000_000_000_000u128, "MM = 5% × $1 notional");
+
+        // ReservedKeeperBonds decremented by KeeperBondMinimum.
+        let bond_after = pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::get(
+            &ada_perp_market_id(),
+            &keeper,
+        );
+        assert_eq!(bond_after, 50u128, "150 - 100 = 50 remaining");
+
+        // mat/trsy free balance grew by treasury_share.
+        let mat_trsy_post = pallet_balances::Pallet::<Test>::free_balance(&mat_trsy);
+        assert_eq!(
+            mat_trsy_post - mat_trsy_pre,
+            min_bond / 2u128,
+            "treasury share moved to mat/trsy",
+        );
+
+        // Total issuance DECREASED by burn_share (NegativeImbalance dropped).
+        let total_issuance_post = pallet_balances::Pallet::<Test>::total_issuance();
+        assert_eq!(
+            total_issuance_pre - total_issuance_post,
+            min_bond / 2u128,
+            "burn_share decremented total supply",
+        );
+
+        // Position is NOT removed (this was a false trigger).
+        assert!(pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &victim,
+        )
+        .is_some());
+
+        // No PositionLiquidated event.
+        let saw_liquidated = System::events().iter().any(|er| matches!(
+            &er.event,
+            RuntimeEvent::PerpEngine(pallet_perp_engine::Event::PositionLiquidated { .. }),
+        ));
+        assert!(
+            !saw_liquidated,
+            "false-trigger must NOT emit PositionLiquidated",
+        );
+    });
+}
+
+/// PR-D Test 12: regression — happy path liquidation still works (no
+/// LiquidationBondSlashed event, PositionLiquidated fires, position
+/// gone).
+#[test]
+fn liquidate_valid_trigger_still_works() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        open_underwater_setup(PerpDirection::Long, 1u128);
+        fund_pot(100u128);
+        seed_keeper_bond(
+            &ada_perp_market_id(),
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        // Drop mark to $0.50 → genuinely underwater.
+        set_oracle_price(&ada_usd_feed_id(), 500_000_000_000_000_000u128);
+
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            ada_perp_market_id(),
+        ));
+
+        // PositionLiquidated yes, LiquidationBondSlashed no.
+        let saw_liquidated = System::events().iter().any(|er| matches!(
+            &er.event,
+            RuntimeEvent::PerpEngine(pallet_perp_engine::Event::PositionLiquidated { .. }),
+        ));
+        let saw_slashed = System::events().iter().any(|er| matches!(
+            &er.event,
+            RuntimeEvent::PerpEngine(pallet_perp_engine::Event::LiquidationBondSlashed { .. }),
+        ));
+        assert!(saw_liquidated, "valid-trigger must emit PositionLiquidated");
+        assert!(
+            !saw_slashed,
+            "valid-trigger must NOT emit LiquidationBondSlashed",
+        );
+
+        // Position removed.
+        assert!(pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &victim,
+        )
+        .is_none());
+    });
+}
+
+/// PR-D Test 13: bond gate fires BEFORE the slash. If reserved bond is
+/// below `KeeperBondMinimum`, liquidate of a HEALTHY position fails
+/// with `KeeperBondInsufficient` — no slash, no bond change.
+#[test]
+fn liquidate_false_trigger_with_bond_gate_below_min() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        open_underwater_setup(PerpDirection::Long, 1u128);
+        // NO seed_keeper_bond — bond = 0.
+        // Position is healthy at $1.00 mark.
+        let bond_pre = pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::get(
+            &ada_perp_market_id(),
+            &keeper,
+        );
+
+        assert_noop!(
+            PerpEngine::liquidate(
+                RuntimeOrigin::signed(keeper),
+                victim,
+                ada_perp_market_id(),
+            ),
+            Error::<Test>::KeeperBondInsufficient
+        );
+
+        // Bond unchanged (was 0, still 0).
+        let bond_post = pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::get(
+            &ada_perp_market_id(),
+            &keeper,
+        );
+        assert_eq!(bond_pre, bond_post);
+
+        // No slash event.
+        let saw_slashed = System::events().iter().any(|er| matches!(
+            &er.event,
+            RuntimeEvent::PerpEngine(pallet_perp_engine::Event::LiquidationBondSlashed { .. }),
+        ));
+        assert!(!saw_slashed, "bond gate must fire before slash");
+    });
+}
+
+/// PR-D Test 14: state-coherence of the false-trigger slash. The
+/// `with_storage_layer` wrapper in `do_slash_keeper_bond_for_false_trigger`
+/// guarantees atomicity (either all three writes — Currency reserve
+/// drop, mat/trsy credit, pallet bookkeeping decrement — commit, or
+/// none do). The test runtime can't easily synthesise a
+/// `repatriate_reserved` failure (ED=1, treasury_share=50: the
+/// destination account is auto-created on first credit), so this
+/// test exercises the GREEN path and pins the post-condition
+/// coherence: ΔReservedKeeperBonds == ΔCurrency::reserved_balance ==
+/// KeeperBondMinimum. Any partial commit (bond decrement without
+/// Currency drop, or vice versa) would fail this assertion. The
+/// `with_storage_layer` wrapper itself is byte-pinned by inspection
+/// of `do_slash_keeper_bond_for_false_trigger` source.
+///
+/// Failure-path atomicity would need a runtime that lets us inject a
+/// `repatriate_reserved` failure mid-flow — deferred to the
+/// runtime-side bench harness in PR-E where we can construct a
+/// Currency that returns `Err` on the second `repatriate_reserved`
+/// inside one storage layer.
+#[test]
+fn liquidate_false_trigger_atomic_state_coherence() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        open_underwater_setup(PerpDirection::Long, 1u128);
+        let min_bond =
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get();
+        seed_keeper_bond(&ada_perp_market_id(), keeper, min_bond);
+
+        let bond_pre = pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::get(
+            &ada_perp_market_id(),
+            &keeper,
+        );
+        let reserved_pre = <pallet_balances::Pallet<Test> as frame_support::traits::ReservableCurrency<u64>>::reserved_balance(&keeper);
+
+        // Healthy position at $1 → slash fires.
+        let res = PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            ada_perp_market_id(),
+        );
+        assert!(res.is_ok(), "false-trigger returns Ok per Ok-return pattern");
+
+        let bond_post = pallet_perp_engine::pallet::ReservedKeeperBonds::<Test>::get(
+            &ada_perp_market_id(),
+            &keeper,
+        );
+        let reserved_post = <pallet_balances::Pallet<Test> as frame_support::traits::ReservableCurrency<u64>>::reserved_balance(&keeper);
+        // Coherent slash: both pallet bookkeeping AND Currency reserve
+        // decreased by EXACTLY the same amount — no partial commit.
+        assert_eq!(bond_pre - bond_post, min_bond);
+        assert_eq!(reserved_pre - reserved_post, min_bond);
+    });
+}
+
+/// PR-D Test 15: `LiquidationBondSlashed` event SCALE encoding
+/// round-trips. Pins the field order + type widths for SDK callers
+/// scanning `triggered_events` for the false-trigger verdict.
+#[test]
+fn liquidation_bond_slashed_event_field_shape() {
+    use codec::{Decode, Encode};
+
+    let original = pallet_perp_engine::Event::<Test>::LiquidationBondSlashed {
+        keeper: 7u64,
+        target: 1u64,
+        market_id: ada_perp_market_id(),
+        slash_amount: 100u128,
+        treasury_share: 50u128,
+        burn_share: 50u128,
+        equity_e18_signed: 60_000_000_000_000_000i128,
+        mm_e18: 50_000_000_000_000_000u128,
+    };
+    let bytes = original.encode();
+    let decoded =
+        pallet_perp_engine::Event::<Test>::decode(&mut &bytes[..])
+            .expect("LiquidationBondSlashed round-trips through SCALE");
+
+    match decoded {
+        pallet_perp_engine::Event::LiquidationBondSlashed {
+            keeper,
+            target,
+            market_id,
+            slash_amount,
+            treasury_share,
+            burn_share,
+            equity_e18_signed,
+            mm_e18,
+        } => {
+            assert_eq!(keeper, 7u64);
+            assert_eq!(target, 1u64);
+            assert_eq!(market_id, ada_perp_market_id());
+            assert_eq!(slash_amount, 100u128);
+            assert_eq!(treasury_share, 50u128);
+            assert_eq!(burn_share, 50u128);
+            assert_eq!(equity_e18_signed, 60_000_000_000_000_000i128);
+            assert_eq!(mm_e18, 50_000_000_000_000_000u128);
+        }
+        other => panic!(
+            "Decoded variant must be LiquidationBondSlashed, got {:?}",
+            other
+        ),
+    }
 }
