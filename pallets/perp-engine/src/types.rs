@@ -204,6 +204,18 @@ pub struct MarginAccount {
     /// (§3.4) — same pattern as `request_credit_refund` in
     /// `pallet-intent-settlement`.
     pub last_deposit_block: u32,
+    /// Size-weighted average MATRA/USD rate (1e18-scaled, pMATRA-USD per
+    /// MOTRA) across all of the account's outstanding deposits, computed
+    /// at deposit time. Pinned here so `withdraw_margin` can clamp the
+    /// MOTRA payout to `max(live_rate, weighted_deposit_rate)` —
+    /// preventing the live-rate sandwich arb (deposit-at-peak,
+    /// withdraw-at-trough) that would drain the pot of MOTRA paid in by
+    /// other depositors. Initialised to 0 — the first deposit seeds it.
+    /// A `weighted_deposit_rate_e18 == 0` value at withdraw time means
+    /// "no remaining deposit-rate basis" (e.g. account drained to 0 and
+    /// only PnL credits remain); in that case withdraw uses the live
+    /// rate as the conservative ceiling.
+    pub weighted_deposit_rate_e18: u128,
 }
 
 // ---------------------------------------------------------------------------
