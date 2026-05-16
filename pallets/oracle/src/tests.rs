@@ -139,6 +139,10 @@ impl pallet_oracle::Config for Test {
     type MaxStaleSlots = TestMaxStaleSlots;
     type MaxFutureSlots = TestMaxFutureSlots;
     type AttestorRegistry = MockAttestorRegistry;
+    // Tests sign with real `sp_keyring::Sr25519Keyring` keypairs, so the
+    // mock uses the production `Sr25519Verifier` impl. The forged-sig and
+    // invalid-sig test paths depend on real verification firing.
+    type SigVerifier = pallet_oracle::pallet::Sr25519Verifier;
 }
 
 fn new_test_ext() -> sp_io::TestExternalities {

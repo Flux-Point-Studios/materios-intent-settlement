@@ -11,7 +11,9 @@
 //!   2. pubkey ∈ `Attestors[pair_id]`,
 //!   3. `decimals <= 18`,
 //!   4. sr25519 sig over the canonical PRIC preimage
-//!      (`types::submit_price_payload`) via `sp_io::crypto::sr25519_verify`,
+//!      (`types::submit_price_payload`) via `T::SigVerifier::verify`,
+//!      production-wired to `Sr25519Verifier` (which delegates to
+//!      `sp_io::crypto::sr25519_verify`),
 //!   5. idempotency: `AttestorSubmitted[(pair, slot, pubkey)]` not set,
 //!   6. freshness: `slot_observed >= current_slot - MaxStaleSlots`,
 //!   7. anti-front-run: `slot_observed <= current_slot + MaxFutureSlots`,
@@ -114,6 +116,16 @@ pub mod pallet {
         /// In v1 production this is wired to a per-pair `Attestors` storage
         /// lookup; in tests we substitute a `MockAttestorRegistry`.
         type AttestorRegistry: IsAttestorFor<Self::AccountId>;
+
+        /// Pluggable sr25519 sig verifier over the canonical PRIC preimage.
+        /// Production runtimes wire `Sr25519Verifier` (host-fn-backed);
+        /// `runtime-benchmarks` builds wire `BenchAllowAnyVerifier` so the
+        /// frame-benchmarking harness can drive `submit_price` with dummy
+        /// signatures (`pair.sign(..)` is only available with the
+        /// `full_crypto` feature, which is std-gated — the WASM
+        /// runtime-benchmarks build is no-std). Mirrors the
+        /// `pallet-intent-settlement::SigVerifier` pattern landed in #43.
+        type SigVerifier: VerifyAttestorSignature;
     }
 
     /// Per-pair attestor membership predicate. Mirrors the
@@ -124,6 +136,45 @@ pub mod pallet {
         fn is_attestor(pair_id: &PairId, who: &AccountId) -> bool;
         fn pubkey_of(who: &AccountId) -> AttestorPubkey;
         fn threshold_for(pair_id: &PairId) -> u32;
+    }
+
+    /// Abstraction for verifying an sr25519 signature over the canonical
+    /// PRIC preimage. The trait keeps the production runtime + the
+    /// runtime-benchmarks bench wired through the same call site without
+    /// pulling `pair.sign(..)` (which needs std + `full_crypto`) into the
+    /// no-std WASM runtime-benchmarks build path.
+    pub trait VerifyAttestorSignature {
+        fn verify(pubkey: &AttestorPubkey, sig: &AttestorSig, msg: &[u8]) -> bool;
+    }
+
+    /// Production verifier: delegates to sr25519 via the `sp_io::crypto`
+    /// host function. Wired by `materios-runtime` for every non-bench
+    /// build.
+    pub struct Sr25519Verifier;
+    impl VerifyAttestorSignature for Sr25519Verifier {
+        fn verify(pubkey: &AttestorPubkey, sig: &AttestorSig, msg: &[u8]) -> bool {
+            let pk = sp_core::sr25519::Public::from_raw(*pubkey);
+            let sg = sp_core::sr25519::Signature::from_raw(*sig);
+            sp_io::crypto::sr25519_verify(&sg, msg, &pk)
+        }
+    }
+
+    /// Bench-only verifier that accepts ANY signature. Compiled only under
+    /// `feature = "runtime-benchmarks"` so it CANNOT be wired into a
+    /// production binary by accident — the runtime's `type SigVerifier`
+    /// flips to this struct via a `cfg(feature = "runtime-benchmarks")`
+    /// guard in `runtime/src/lib.rs`. With sig-verify bypassed the bench
+    /// measures storage cost + median sort + bundle clear; downstream
+    /// runtimes RE-ADD a fixed `sr25519_verify` weight charge (~50M
+    /// ref_time) in `weights.rs` to account for the production sig-verify
+    /// cost — same pattern as `pallet-intent-settlement::BenchAllowAnyVerifier`.
+    #[cfg(feature = "runtime-benchmarks")]
+    pub struct BenchAllowAnyVerifier;
+    #[cfg(feature = "runtime-benchmarks")]
+    impl VerifyAttestorSignature for BenchAllowAnyVerifier {
+        fn verify(_pubkey: &AttestorPubkey, _sig: &AttestorSig, _msg: &[u8]) -> bool {
+            true
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -332,8 +383,11 @@ pub mod pallet {
         /// 4. `Attestors[pair_id].contains(&pubkey)` —
         ///    `Error::NotAttestor` otherwise. `Attestors[pair_id]` empty →
         ///    `Error::UnknownPair`.
-        /// 5. `sp_io::crypto::sr25519_verify(sig, PRIC_digest, pubkey)` —
-        ///    `Error::InvalidSignature` otherwise.
+        /// 5. `T::SigVerifier::verify(pubkey, sig, PRIC_digest)` —
+        ///    `Error::InvalidSignature` otherwise. Production wires
+        ///    `Sr25519Verifier` which delegates to
+        ///    `sp_io::crypto::sr25519_verify`; `runtime-benchmarks`
+        ///    builds wire `BenchAllowAnyVerifier` (see trait docs).
         /// 6. `AttestorSubmitted[(pair_id, slot_observed, pubkey)]` not set
         ///    — `Error::AlreadySubmitted` otherwise.
         /// 7. Freshness: current_block.saturating_sub(slot_observed) <=
@@ -395,15 +449,20 @@ pub mod pallet {
             ensure!(!roster.is_empty(), Error::<T>::UnknownPair);
             ensure!(roster.contains(&pubkey), Error::<T>::NotAttestor);
 
-            // (4) sr25519 sig verify over the canonical PRIC payload
+            // (4) sr25519 sig verify over the canonical PRIC payload.
+            // Pluggable via `T::SigVerifier` — production wires
+            // `Sr25519Verifier` (host-fn), runtime-benchmarks wires
+            // `BenchAllowAnyVerifier`. The Sr25519Verifier impl preserves
+            // the byte-exact `sp_io::crypto::sr25519_verify(sig, digest,
+            // pubkey)` contract this pallet documented at PR-#35; the
+            // pluggable indirection is purely so the bench can run under
+            // no-std WASM.
             let chain_id = T::MateriosChainId::get();
             let digest = types::submit_price_payload(
                 &chain_id, &pair_id, price, decimals, slot_observed,
             );
-            let pk = sp_core::sr25519::Public::from_raw(pubkey);
-            let sg = sp_core::sr25519::Signature::from_raw(sig);
             ensure!(
-                sp_io::crypto::sr25519_verify(&sg, &digest, &pk),
+                T::SigVerifier::verify(&pubkey, &sig, &digest),
                 Error::<T>::InvalidSignature
             );
 
