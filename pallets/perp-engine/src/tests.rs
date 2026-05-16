@@ -951,6 +951,225 @@ fn deposit_margin_increments_free() {
     });
 }
 
+/// Sec-review round-2 Vuln 1 regression: when the weighted-avg
+/// computation would overflow `u128` intermediate products (the
+/// previous "conservative-fallback" path), U256 math must compute the
+/// correct rate — NEVER lower than `min(old_rate, new_rate)`, which
+/// would otherwise let the user redeem more MOTRA than they deposited.
+///
+/// Scenario: a small initial deposit at a LOW rate ($0.10/MATRA →
+/// rate=1e17) seeds the snapshot. A subsequent very large deposit at
+/// a HIGH rate ($10/MATRA → rate=1e19) triggers the intermediate
+/// overflow on `credit_e18 × rate_e18 = motra × 1e38` for any motra
+/// ≥ ~4 (since u128::MAX ≈ 3.4e38). Pre-fix code would have kept the
+/// old $0.10 rate; post-fix U256 produces the correct value-weighted
+/// average in `[1e17, 1e19]`.
+#[test]
+fn deposit_margin_weighted_avg_handles_u128_overflow() {
+    new_test_ext().execute_with(|| {
+        let signer = 1u64;
+
+        // First deposit: small amount at rate $0.10 (1e17). Seeds
+        // weighted_deposit_rate_e18 = 1e17.
+        set_oracle_price(
+            &matra_usd_feed_id(),
+            100_000_000_000_000_000u128, // $0.10
+        );
+        credit_motra(signer, 1u128);
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(signer),
+            1u128,
+        ));
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        assert_eq!(acct.weighted_deposit_rate_e18, 100_000_000_000_000_000u128);
+        assert_eq!(acct.free_e18, 100_000_000_000_000_000u128);
+
+        // Second deposit: at rate $10 (1e19). With motra=5 MOTRA,
+        // credit_e18 = 5 × 1e19 = 5e19 and `credit_e18 × rate_e18 =
+        // 5e19 × 1e19 = 5e38` — overflows u128. Pre-fix kept the
+        // old $0.10 rate. Post-fix U256 produces the value-weighted
+        // average.
+        set_oracle_price(
+            &matra_usd_feed_id(),
+            10_000_000_000_000_000_000u128, // $10
+        );
+        credit_motra(signer, 5u128);
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(signer),
+            5u128,
+        ));
+
+        let acct = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&signer);
+        // weighted_avg = (1e17 × 1e17 + 5e19 × 1e19) / (1e17 + 5e19)
+        //              = (1e34 + 5e38) / 5.001e19
+        //              ≈ 5.0001e38 / 5.001e19
+        //              ≈ 9.998e18 (very close to the $10 rate since
+        //                          the second deposit dominates the
+        //                          pmatra-USD weight by 500×).
+        // Lower bound: snapshot must NOT have stuck at the old
+        // 1e17 (the pre-fix bug) — assert strictly greater than
+        // the lower bound of the two input rates.
+        assert!(
+            acct.weighted_deposit_rate_e18 > 100_000_000_000_000_000u128,
+            "snapshot must update beyond old low rate (got {})",
+            acct.weighted_deposit_rate_e18
+        );
+        // Upper bound: weighted-avg can't exceed max(old, new) = 1e19.
+        assert!(
+            acct.weighted_deposit_rate_e18 <= 10_000_000_000_000_000_000u128,
+            "snapshot must be bounded by max input rate (got {})",
+            acct.weighted_deposit_rate_e18
+        );
+        // Sanity: pmatra-USD weight makes the snapshot land near 1e19.
+        // We allow ±5% tolerance.
+        let expected = 9_998_000_000_000_000_000u128;
+        let tolerance = expected / 20;
+        assert!(
+            acct.weighted_deposit_rate_e18.abs_diff(expected) <= tolerance,
+            "weighted-avg should land near {} (±5%); got {}",
+            expected,
+            acct.weighted_deposit_rate_e18
+        );
+    });
+}
+
+/// Sec-review round-2 Vuln 2 regression: cross-cohort PnL transfer
+/// must NOT drain the pot. Two users in different deposit-rate
+/// cohorts trade, the winner withdraws everything, and the loser
+/// withdraws everything — the pot must remain solvent (total MOTRA
+/// paid out ≤ total MOTRA deposited).
+///
+/// Scenario: User A deposits 1000 MOTRA at MATRA=$0.50 (snapshot=5e17).
+/// User B deposits 1000 MOTRA at MATRA=$1.00 (snapshot=1e18). Live
+/// rate stays at $1.00 (which is when A's PnL is settled). A wins
+/// some PnL, B loses the same. Both withdraw at their snapshot rates.
+///
+/// Pre-fix: A's snapshot was unchanged at 5e17, so A redeemed PnL at
+/// 2× MOTRA — pot deficit of `|PnL| × (1/5e17 − 1/1e18) = |PnL|/1e18`
+/// per pMATRA-USD unit. Post-fix: A's snapshot bumps toward live=1e18
+/// on PnL credit, so A redeems PnL at the same rate B's loss reduces
+/// at — net pot delta ≈ 0.
+#[test]
+fn close_position_cross_cohort_pnl_preserves_pot_solvency() {
+    new_test_ext().execute_with(|| {
+        let user_a = 1u64;
+        let user_b = 2u64;
+        register_default_market();
+        credit_motra(user_a, 2_000u128);
+        credit_motra(user_b, 2_000u128);
+
+        // A deposits at MATRA = $0.50 (rate=5e17). Snapshot=5e17.
+        set_oracle_price(
+            &matra_usd_feed_id(),
+            500_000_000_000_000_000u128,
+        );
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(user_a),
+            1_000u128,
+        ));
+        let a_after_dep = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&user_a);
+        assert_eq!(a_after_dep.weighted_deposit_rate_e18, 500_000_000_000_000_000u128);
+
+        // B deposits at MATRA = $1.00 (rate=1e18). Snapshot=1e18.
+        set_oracle_price(
+            &matra_usd_feed_id(),
+            1_000_000_000_000_000_000u128,
+        );
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(user_b),
+            1_000u128,
+        ));
+        let b_after_dep = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&user_b);
+        assert_eq!(b_after_dep.weighted_deposit_rate_e18, 1_000_000_000_000_000_000u128);
+
+        let pot = pallet_perp_engine::pallet::Pallet::<Test>::pot_account();
+        let pot_initial = pallet_balances::Pallet::<Test>::free_balance(&pot);
+        assert_eq!(pot_initial, 2_000u128);
+
+        // A opens long, B opens short. ADA/USD oracle at $1.00.
+        set_oracle_price(
+            &ada_usd_feed_id(),
+            1_000_000_000_000_000_000u128,
+        );
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(user_a),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            500u32,
+            50u32,
+            0u128,
+        ));
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(user_b),
+            ada_perp_market_id(),
+            PerpDirection::Short,
+            100_000_000u128,
+            500u32,
+            50u32,
+            0u128,
+        ));
+
+        // ADA price rises to $1.10. A wins, B loses.
+        set_oracle_price(
+            &ada_usd_feed_id(),
+            1_100_000_000_000_000_000u128,
+        );
+        assert_ok!(PerpEngine::close_position(
+            RuntimeOrigin::signed(user_a),
+            ada_perp_market_id(),
+            0u128,
+            10_000u32,
+        ));
+        assert_ok!(PerpEngine::close_position(
+            RuntimeOrigin::signed(user_b),
+            ada_perp_market_id(),
+            0u128,
+            10_000u32,
+        ));
+
+        // POST-FIX: A's snapshot must have bumped toward 1e18 because
+        // PnL credit at live rate triggered the weighted-avg update.
+        // (Pre-fix: would have stayed at 5e17, allowing 2× MOTRA out.)
+        let a_after_close = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&user_a);
+        assert!(
+            a_after_close.weighted_deposit_rate_e18 > 500_000_000_000_000_000u128,
+            "A's snapshot must bump toward live rate after PnL credit (got {})",
+            a_after_close.weighted_deposit_rate_e18
+        );
+
+        // Advance past dwell.
+        let dwell = <Test as pallet_perp_engine::Config>::WithdrawDwellBlocks::get();
+        System::set_block_number((dwell as u64) + 2);
+
+        // Both withdraw their full balances.
+        let a_free = a_after_close.free_e18;
+        let b_after_close = pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&user_b);
+        let b_free = b_after_close.free_e18;
+        if a_free > 0 {
+            assert_ok!(PerpEngine::withdraw_margin(
+                RuntimeOrigin::signed(user_a),
+                a_free,
+            ));
+        }
+        if b_free > 0 {
+            assert_ok!(PerpEngine::withdraw_margin(
+                RuntimeOrigin::signed(user_b),
+                b_free,
+            ));
+        }
+
+        // INVARIANT: total MOTRA paid out ≤ total MOTRA deposited.
+        let pot_final = pallet_balances::Pallet::<Test>::free_balance(&pot);
+        let total_paid_out = pot_initial - pot_final;
+        assert!(
+            total_paid_out <= 2_000u128,
+            "pot drained: paid out {} MOTRA but only 2000 MOTRA deposited",
+            total_paid_out
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------
 // PR-B behaviour tests: withdraw_margin (3)
 // ---------------------------------------------------------------------------

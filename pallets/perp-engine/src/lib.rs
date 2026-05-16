@@ -81,6 +81,7 @@ pub mod pallet {
         BoundedVec, PalletId,
     };
     use frame_system::pallet_prelude::*;
+    use sp_core::U256;
     use sp_runtime::traits::{AccountIdConversion, SaturatedConversion, Zero};
 
     /// Balance alias derived from `T::Currency`. Used for MOTRA-denominated
@@ -870,8 +871,65 @@ pub mod pallet {
             if free_signed < 0 {
                 free_signed = 0;
             }
-            acct.free_e18 = u128::try_from(free_signed)
+            let new_free = u128::try_from(free_signed)
                 .map_err(|_| Error::<T>::ArithmeticOverflow)?;
+
+            // Sec-review round-2 Vuln 2 (cross-cohort PnL drift):
+            // Realized-PnL gain + funding-received are new system-level
+            // pMATRA-USD entering this user's free balance from another
+            // user's locked margin. Without a snapshot update, the
+            // winner can redeem this credit at THEIR (potentially
+            // lower) deposit rate while the loser's pMATRA-USD claim
+            // was reduced at the LOSER's higher rate — netting a pot
+            // deficit of `|credit| × (1/winner − 1/loser)` per trade.
+            //
+            // Fix: bump the snapshot via weighted-avg with the live
+            // MATRA/USD rate as the cost basis of the positive non-
+            // release credit. Skip on stale oracle (closes must still
+            // proceed per §5.5 so users can always exit). Apply an
+            // asymmetric clamp — never LOWER the snapshot, because a
+            // lower snapshot grows the user's MOTRA claim and is
+            // never the conservative direction for pot solvency.
+            //
+            // The non-release credit = PnL gain (positive PnL only) +
+            // funding received (negative funding_paid only). Losses
+            // and outbound funding don't bring new pMATRA-USD into
+            // the system, so they don't trigger a rate update.
+            let pnl_credit_e18: u128 = realised_pnl_e18.max(0) as u128;
+            let funding_credit_e18: u128 = (-funding_paid_e18).max(0) as u128;
+            let positive_non_release_credit_e18: u128 =
+                pnl_credit_e18.saturating_add(funding_credit_e18);
+            if positive_non_release_credit_e18 > 0
+                && new_free > 0
+                && acct.weighted_deposit_rate_e18 != 0
+            {
+                if let Ok(live_rate_e18) = Self::live_matra_usd_rate_e18() {
+                    // `old_basis_free` = the user's pre-credit free
+                    // balance carrying the old snapshot rate.
+                    // saturating_sub handles the edge case where net
+                    // losses zeroed `new_free` despite a positive
+                    // credit (massive funding-debit absorbed everything
+                    // but a small PnL gain) — old_basis falls to 0 and
+                    // the weighted-avg collapses to `live_rate_e18`,
+                    // which then bumps the snapshot if higher.
+                    let old_basis_free =
+                        new_free.saturating_sub(positive_non_release_credit_e18);
+                    let old_weight = U256::from(old_basis_free)
+                        * U256::from(acct.weighted_deposit_rate_e18);
+                    let new_weight = U256::from(positive_non_release_credit_e18)
+                        * U256::from(live_rate_e18);
+                    let sum = old_weight + new_weight;
+                    let candidate_snap = (sum / U256::from(new_free)).low_u128();
+                    // asymmetric clamp: only persist if it raises the snapshot.
+                    if candidate_snap > acct.weighted_deposit_rate_e18 {
+                        acct.weighted_deposit_rate_e18 = candidate_snap;
+                    }
+                }
+                // else: stale oracle → no snapshot update, close still
+                // proceeds (memo §5.5 always-exit contract).
+            }
+
+            acct.free_e18 = new_free;
             MarginAccounts::<T>::insert(&who, acct);
 
             if close_abs == abs_current {
@@ -1349,14 +1407,22 @@ pub mod pallet {
                 ExistenceRequirement::AllowDeath,
             )?;
 
-            // (4) Update the weighted-avg deposit rate. On overflow of
-            // the intermediate `old_free * old_rate` or `credit_e18 *
-            // rate_e18` we leave the old rate unchanged — the next
-            // withdrawal will use the old rate, which is a STRICTLY
-            // CONSERVATIVE basis (no greater than what the user would
-            // get under a recomputed weighted avg in u256 precision).
-            // For the very-first deposit (or after a full drain) the
-            // old rate is 0; we seed with the new rate directly.
+            // (4) Update the weighted-avg deposit rate via U256-precision
+            // arithmetic. The intermediate products `old_free × old_rate`
+            // and `credit_e18 × new_rate` would each overflow `u128`
+            // whenever `motra ≥ u128::MAX / rate²` — trivially reachable
+            // at any non-trivial MATRA price (e.g. ≥4 MOTRA at $10/MATRA).
+            // Sec-review round-2 found the prior overflow-fallback
+            // ("keep old rate") was NOT conservative when `old_rate <
+            // new_rate`: keeping the lower rate gave the user more
+            // MOTRA per pMATRA-USD on withdraw, draining the pot. U256
+            // eliminates the overflow path: each product fits in 256
+            // bits (`u128 × u128 ≤ 2^256`); their sum fits because
+            // `2 × (u128::MAX)² < U256::MAX`. The final quotient is
+            // bounded by `max(old_rate, new_rate) ≤ u128::MAX`, so the
+            // truncation back to u128 via `.low_u128()` is lossless.
+            // First deposit (or post-full-drain) seeds the snapshot
+            // with the new rate directly.
             let mut acct = MarginAccounts::<T>::get(who);
             let new_free = acct
                 .free_e18
@@ -1366,18 +1432,18 @@ pub mod pallet {
             if acct.weighted_deposit_rate_e18 == 0 || acct.free_e18 == 0 {
                 // Fresh basis — seed with the new rate.
                 acct.weighted_deposit_rate_e18 = rate_e18;
-            } else if let (Some(old_weight), Some(new_weight)) = (
-                acct.free_e18.checked_mul(acct.weighted_deposit_rate_e18),
-                credit_e18.checked_mul(rate_e18),
-            ) {
-                if let Some(sum) = old_weight.checked_add(new_weight) {
-                    // weighted avg = sum / new_free. new_free > 0 here
-                    // because credit_e18 > 0 (motra_u128 > 0, rate_e18 > 0).
-                    acct.weighted_deposit_rate_e18 = sum / new_free;
-                }
-                // else: overflow on sum, leave rate unchanged (conservative).
+            } else {
+                // weighted avg = (old_free × old_rate + credit × new_rate) / new_free
+                // new_free > 0 here because credit_e18 > 0
+                // (motra_u128 > 0 by the is_zero early-return,
+                // rate_e18 > 0 by live_matra_usd_rate_e18's ensure).
+                let old_weight = U256::from(acct.free_e18)
+                    * U256::from(acct.weighted_deposit_rate_e18);
+                let new_weight = U256::from(credit_e18) * U256::from(rate_e18);
+                let sum = old_weight + new_weight;
+                acct.weighted_deposit_rate_e18 =
+                    (sum / U256::from(new_free)).low_u128();
             }
-            // else: overflow on either weight, leave rate unchanged (conservative).
 
             // (5)+(6) Credit free + bump dwell.
             acct.free_e18 = new_free;
