@@ -2313,6 +2313,135 @@ fn liquidate_funding_delta_applied_before_equity_check() {
     });
 }
 
+/// Sec-review regression: liquidate's positive-equity residual path
+/// must bump `weighted_deposit_rate_e18` whenever realized PnL is
+/// positive — the SAME cross-cohort pot-drain that close_position's
+/// snapshot bump fixes (see
+/// `feedback_u256_weighted_avg_volatile_collateral.md` Rule 3 +
+/// `close_position_cross_cohort_pnl_preserves_pot_solvency`).
+///
+/// Pre-fix: an underwater long with positive PnL + heavy funding-owed
+/// gets liquidated; the PnL gain rides into the victim's free_e18 at
+/// the OLD (stale, lower) snapshot. The victim later withdraws at the
+/// stale rate and drains MOTRA from other depositors' deposits at
+/// `|pnl| × (1/old_snap − 1/live_rate)` per round.
+///
+/// This test sets:
+///   - MATRA = $0.50 at deposit time → snapshot 5e17
+///   - MATRA = $1.00 at liquidation time → live_rate 1e18
+///   - ADA moves up so the long has +$0.05 realized PnL
+///   - Funding-owed of $0.11 pushes equity under MM
+///   - Liquidation leaves a positive residual that includes the
+///     positive PnL credit.
+///
+/// Post-fix invariant: victim's snapshot bumps above 5e17 toward 1e18
+/// (asymmetric clamp: only raises, never lowers).
+#[test]
+fn liquidate_residual_path_bumps_snapshot_on_positive_pnl_credit() {
+    new_test_ext().execute_with(|| {
+        let victim = 1u64;
+        let keeper = 2u64;
+        register_default_market();
+        credit_motra(victim, 2_000u128);
+
+        // Deposit at MATRA = $0.50 → snapshot pinned to 5e17.
+        set_oracle_price(
+            &matra_usd_feed_id(),
+            500_000_000_000_000_000u128,
+        );
+        assert_ok!(PerpEngine::deposit_margin(
+            RuntimeOrigin::signed(victim),
+            1_000u128,
+        ));
+        let acct_after_dep =
+            pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&victim);
+        assert_eq!(
+            acct_after_dep.weighted_deposit_rate_e18,
+            500_000_000_000_000_000u128,
+        );
+        let snapshot_pre_liquidate = acct_after_dep.weighted_deposit_rate_e18;
+
+        // ADA at $1.00, open long 1.0 contract at 10× → locked $0.10.
+        set_oracle_price(
+            &ada_usd_feed_id(),
+            1_000_000_000_000_000_000u128,
+        );
+        assert_ok!(PerpEngine::open_position(
+            RuntimeOrigin::signed(victim),
+            ada_perp_market_id(),
+            PerpDirection::Long,
+            100_000_000u128,
+            1_000u32,
+            50u32,
+            0u128,
+        ));
+
+        // Bump MATRA live rate to $1.00 → live_rate 1e18. ADA up to
+        // $1.05 → realized PnL = 1.0 × 0.05 = +$0.05 (1e18-scaled
+        // = 5e16). Funding-owed of $0.11 (idx = 0.11e18) pushes
+        // equity_pre = locked $0.10 + PnL $0.05 − funding $0.11
+        // = $0.04, below MM = 5% × $1.05 = $0.0525.
+        set_oracle_price(
+            &matra_usd_feed_id(),
+            1_000_000_000_000_000_000u128,
+        );
+        set_oracle_price(
+            &ada_usd_feed_id(),
+            1_050_000_000_000_000_000u128,
+        );
+        pallet_perp_engine::pallet::CumulativeFundingIndex::<Test>::insert(
+            &ada_perp_market_id(),
+            110_000_000_000_000_000i128,
+        );
+
+        fund_pot(1_000u128);
+        seed_keeper_bond(
+            &ada_perp_market_id(),
+            keeper,
+            <Test as pallet_perp_engine::Config>::KeeperBondMinimum::get(),
+        );
+
+        assert_ok!(PerpEngine::liquidate(
+            RuntimeOrigin::signed(keeper),
+            victim,
+            ada_perp_market_id(),
+        ));
+
+        // Position gone, residual delivered.
+        assert!(pallet_perp_engine::pallet::Positions::<Test>::get(
+            &ada_perp_market_id(),
+            &victim,
+        )
+        .is_none());
+
+        // CRITICAL ASSERTION: snapshot bumped above the deposit-time
+        // rate because positive PnL credit at live rate pulled the
+        // weighted-avg up. Without the bump the victim could
+        // withdraw the residual at MATRA=$0.50 cost basis even
+        // though the new pMATRA-USD entered when MATRA=$1.00.
+        let acct_post =
+            pallet_perp_engine::pallet::MarginAccounts::<Test>::get(&victim);
+        assert!(
+            acct_post.weighted_deposit_rate_e18 > snapshot_pre_liquidate,
+            "snapshot MUST bump after positive-PnL liquidation residual \
+             (deposit-time={}, post-liquidate={}). Sec-review HIGH: \
+             without the bump, victim withdraws PnL gain at stale snapshot \
+             and drains pot from other depositors.",
+            snapshot_pre_liquidate,
+            acct_post.weighted_deposit_rate_e18,
+        );
+
+        // Sanity: snapshot stays at-or-below live rate when PnL credit
+        // is bounded by residual (asymmetric clamp prevents
+        // overshoot above live for honest scenarios).
+        assert!(
+            acct_post.weighted_deposit_rate_e18 <= 10_000_000_000_000_000_000u128,
+            "snapshot must remain bounded ({})",
+            acct_post.weighted_deposit_rate_e18,
+        );
+    });
+}
+
 /// Test 16: non-existent market → `MarketNotFound`. Mirrors the
 /// pattern from open_position. Bond gate is checked first (the keeper
 /// has no bond against a market that doesn't exist), so we seed the

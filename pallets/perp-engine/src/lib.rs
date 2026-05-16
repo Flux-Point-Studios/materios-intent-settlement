@@ -1548,15 +1548,81 @@ pub mod pallet {
                     )?;
                 }
 
-                // Residual margin → victim's free_e18.
+                // Residual margin → victim's free_e18. Mirrors
+                // close_position's snapshot-bump block (feedback_u256_
+                // weighted_avg_volatile_collateral.md Rule 3): when the
+                // residual contains positive PnL credit OR funding-
+                // received credit, those are NEW pMATRA-USD entering
+                // the victim's account at the CURRENT live MATRA/USD
+                // rate, not the victim's deposit-time snapshot. Without
+                // the bump the victim could withdraw the residual at a
+                // stale (lower) snapshot and drain MOTRA from other
+                // depositors' deposits at
+                //   `|credit| × (1/old_snap − 1/live_rate)`
+                // per liquidation cycle.
                 if residual_to_victim_e18 > 0 {
                     let mut va = MarginAccounts::<T>::get(&target);
-                    va.free_e18 = va
+                    let new_free = va
                         .free_e18
                         .checked_add(residual_to_victim_e18)
                         .ok_or(sp_runtime::DispatchError::from(
                             Error::<T>::ArithmeticOverflow,
                         ))?;
+
+                    // Non-release credit = PnL gain (positive PnL only)
+                    // + funding received (negative funding_owed only).
+                    // Losses / outbound funding never bring new
+                    // pMATRA-USD into the account, so they don't
+                    // trigger a snapshot update.
+                    let pnl_credit_e18: u128 =
+                        realized_pnl_e18.max(0) as u128;
+                    let funding_credit_e18: u128 =
+                        (-funding_owed_e18).max(0) as u128;
+                    let positive_non_release_credit_e18: u128 =
+                        pnl_credit_e18.saturating_add(funding_credit_e18);
+
+                    if positive_non_release_credit_e18 > 0
+                        && new_free > 0
+                        && va.weighted_deposit_rate_e18 != 0
+                    {
+                        // Use the live oracle rate (NOT victim's
+                        // snapshot) as the basis for the new
+                        // pMATRA-USD. Stale oracle → no bump (skip
+                        // the update; the residual still proceeds —
+                        // memo §5.5 always-exit contract). Same
+                        // fail-open semantics as close_position.
+                        if let Ok(live_rate_e18) =
+                            Self::live_matra_usd_rate_e18()
+                        {
+                            // saturating_sub handles the edge case
+                            // where the funding debit + fee absorbed
+                            // most of the credit and old_basis_free
+                            // collapses to 0 — the weighted-avg then
+                            // pulls the snapshot to live_rate, which
+                            // the asymmetric clamp below persists if
+                            // it's higher than the old snapshot.
+                            let old_basis_free = new_free.saturating_sub(
+                                positive_non_release_credit_e18,
+                            );
+                            let old_weight = U256::from(old_basis_free)
+                                * U256::from(va.weighted_deposit_rate_e18);
+                            let new_weight =
+                                U256::from(positive_non_release_credit_e18)
+                                    * U256::from(live_rate_e18);
+                            let sum = old_weight + new_weight;
+                            let candidate_snap =
+                                (sum / U256::from(new_free)).low_u128();
+                            // Asymmetric clamp: only raise the
+                            // snapshot. A downward update is never
+                            // pot-conservative — a lower snapshot
+                            // grows the user's MOTRA claim.
+                            if candidate_snap > va.weighted_deposit_rate_e18 {
+                                va.weighted_deposit_rate_e18 = candidate_snap;
+                            }
+                        }
+                    }
+
+                    va.free_e18 = new_free;
                     MarginAccounts::<T>::insert(&target, va);
                 }
 
