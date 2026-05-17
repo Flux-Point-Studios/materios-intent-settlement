@@ -37,7 +37,7 @@ EXIT STATUS:
   0  success — 3 attestors in roster, (optional) synthetic price set
   1  preflight fail (wrong spec, multisig key mismatch, etc.)
   2  ceremony fail (sig rejected, multisig timepoint mismatch, etc.)
-"""
+
 REFERENCE CEREMONY — ADAPT TO YOUR OWN CHAIN.
 
 See `ceremony.py` in this directory for the full caveat. The SS58s
