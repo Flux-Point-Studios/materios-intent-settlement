@@ -45,8 +45,9 @@ pub mod pallet {
     use scale_info::TypeInfo;
     use sp_runtime::RuntimeDebug;
 
-    pub type CommitteePubkey = [u8; 32];
-    pub type BlockNumber = u32;
+    // `CommitteePubkey` and `BlockNumber` are defined once in `types.rs`
+    // and pulled in via `use super::*;` above. Re-defining them here
+    // produces an ambiguous-glob-re-export warning at the crate root.
 
     /// Concrete in-pallet schedule type (generic over `T: Config` so it picks
     /// up `T::MaxRotationEvents` without needing its own Get-bound type

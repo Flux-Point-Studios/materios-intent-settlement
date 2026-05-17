@@ -1,7 +1,7 @@
 //! # `pallet-oracle` — Materios Oracle Network (MON) Phase 1
 //!
 //! Task #268. Design memo:
-//! `/home/deci/work/mon-phase1-aegis-extend-design.md`.
+//! `docs/design/mon-phase1-aegis-extend-design.md`.
 //!
 //! ## What ships in this impl PR
 //!

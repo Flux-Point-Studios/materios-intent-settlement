@@ -20,8 +20,13 @@
 #     no fresh pre-fund required for spec-227.
 #
 # Outputs:
-#   /home/deci/materios-preprod/runtime-overrides/materios_runtime.compact.compressed.wasm.spec227
-#   /tmp/materios-runtime-spec227.blake2_256.txt
+#   ${WASM_DST_DIR}/materios_runtime.compact.compressed.wasm.spec227
+#   ${HASH_OUT_DIR}/materios-runtime-spec227.blake2_256.txt
+#
+# Configuration (all env-var-overridable; defaults are example paths):
+#   REPO         — path to the materios-runtime / partnerchain checkout to build from
+#   WASM_DST_DIR — directory where the compiled WASM gets staged
+#   HASH_OUT_DIR — directory where the blake2_256 code_hash file gets written
 #
 # Companion script:
 #   ceremony.py    — consumes both outputs above
@@ -30,12 +35,14 @@
 
 set -euo pipefail
 
-REPO="${REPO:-/home/deci/work/materios-task180/partnerchain-oracle-wire/partnerchain}"
+REPO="${REPO:-${HOME}/work/materios-runtime}"
+WASM_DST_DIR="${WASM_DST_DIR:-${HOME}/materios-preprod/runtime-overrides}"
+HASH_OUT_DIR="${HASH_OUT_DIR:-/tmp}"
 TARGET_SPEC=227
 PRIOR_SPEC=226
 WASM_SRC="${REPO}/target/release/wbuild/materios-runtime/materios_runtime.compact.compressed.wasm"
-WASM_DST=/home/deci/materios-preprod/runtime-overrides/materios_runtime.compact.compressed.wasm.spec227
-HASH_OUT=/tmp/materios-runtime-spec227.blake2_256.txt
+WASM_DST="${WASM_DST_DIR}/materios_runtime.compact.compressed.wasm.spec${TARGET_SPEC}"
+HASH_OUT="${HASH_OUT_DIR}/materios-runtime-spec${TARGET_SPEC}.blake2_256.txt"
 
 echo "=== build-wasm.sh: spec-227 (perp-engine polish) ==="
 echo "repo:        ${REPO}"
