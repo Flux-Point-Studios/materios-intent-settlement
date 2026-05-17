@@ -1,7 +1,7 @@
 //! Shared type definitions for `pallet-oracle` (MON Phase 1, task #268).
 //!
 //! The canonical hash preimage in [`submit_price_payload`] is authoritative
-//! per the design memo at `/home/deci/work/mon-phase1-aegis-extend-design.md`
+//! per the design memo at `docs/design/mon-phase1-aegis-extend-design.md`
 //! §1. Aegis publishers and downstream verifiers must reproduce these exact
 //! bytes (domain tag + chain_id + pair_id + price + decimals + slot) and the
 //! exact `blake2_256` over them.

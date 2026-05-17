@@ -1,7 +1,7 @@
 //! Shared type definitions for `pallet-perp-engine` v0 (task #259).
 //!
 //! The authoritative reference is the design memo at
-//! `/home/deci/work/perp-engine-v0-spec.md` — particularly §3
+//! `docs/design/perp-engine-v0-spec.md` — particularly §3
 //! (extrinsic surface) and §4 (storage layout). Every type below is
 //! pinned to the memo's exact shape so the impl PR can drop dispatch
 //! bodies in without touching the storage layout.

@@ -159,7 +159,7 @@ fn new_test_ext() -> sp_io::TestExternalities {
 // ---------------------------------------------------------------------------
 
 /// `sha256("ADA/USD")` — computed once in
-/// `/home/deci/work/mon-phase1-aegis-extend-design.md` §1 and asserted
+/// `docs/design/mon-phase1-aegis-extend-design.md` §1 and asserted
 /// byte-exact here so every implementation (Python, Aiken, Rust) sees the
 /// same `PairId`.
 const ADA_USD_PAIR_ID: PairId =
@@ -172,7 +172,7 @@ const TEST_CHAIN_ID: [u8; 32] = [0x73u8; 32];
 
 /// Pinned PRIC digest for `(ADA/USD, price=425_000_000, decimals=9,
 /// slot=173709)`. Pre-computed in
-/// `/home/deci/work/mon-phase1-aegis-extend-design.md` §1 (test vector
+/// `docs/design/mon-phase1-aegis-extend-design.md` §1 (test vector
 /// table) via:
 ///
 /// ```python
@@ -245,7 +245,7 @@ fn pric_payload_byte_exact() {
         digest, PINNED_PRIC_DIGEST,
         "PRIC payload digest drifted from pinned fixture — Aegis publisher \
          and Aiken validators will diverge. See design memo §1 test vector \
-         table at /home/deci/work/mon-phase1-aegis-extend-design.md."
+         table at docs/design/mon-phase1-aegis-extend-design.md."
     );
 }
 

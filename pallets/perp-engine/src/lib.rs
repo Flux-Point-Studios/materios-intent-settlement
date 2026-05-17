@@ -1,7 +1,7 @@
 //! # `pallet-perp-engine` — Materios Perp Engine v0
 //!
 //! Task #259. Design memo:
-//! `/home/deci/work/perp-engine-v0-spec.md` (720 lines, locked).
+//! `docs/design/perp-engine-v0-spec.md` (720 lines, locked).
 //!
 //! ## Scope (PR-B impl)
 //!

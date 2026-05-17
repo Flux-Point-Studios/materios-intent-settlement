@@ -37,10 +37,18 @@ EXIT STATUS:
   0  success — 3 attestors in roster, (optional) synthetic price set
   1  preflight fail (wrong spec, multisig key mismatch, etc.)
   2  ceremony fail (sig rejected, multisig timepoint mismatch, etc.)
+
+REFERENCE CEREMONY — ADAPT TO YOUR OWN CHAIN.
+
+See `ceremony.py` in this directory for the full caveat. The SS58s
+below are FPS-operated PUBLIC multisig keys; the corresponding mnemonics
+are NEVER in this repo. Override every constant via env-vars when
+running on your own chain.
 """
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from hashlib import sha256
@@ -50,19 +58,29 @@ from substrateinterface import SubstrateInterface, Keypair
 from scalecodec.utils.ss58 import ss58_decode
 
 
-DEFAULT_RPC_URL = "ws://127.0.0.1:9945"
+DEFAULT_RPC_URL = os.environ.get("MATERIOS_RPC_URL", "ws://127.0.0.1:9945")
 
+# Public SS58 addresses of the FPS 2-of-3 sudo multisig and its signers
+# (override via MATERIOS_SUDO_MULTISIG / MATERIOS_SUDO_SIGNERS).
 NATE_SS58 = "5E25rtEBkk8UXbAGPWsiwi82pmUtdmrFSCv7wQekSnSVpiZf"
 K2_SS58 = "5DcwRUB9FBS7PQdTdkFtvj4ssc2FPVpxgumZsWjLMmhvzrTa"
 K3_SS58 = "5HNAgGdHwaJQyCuZVQEHavQLb25XT3aYXcDBCGLe9hbpFiP2"
-MULTISIG_ACCOUNT = "5D1AnhuDNuvHbRzMeLGt235BMMcNSaB4wAad6us55xLGxUfM"
+MULTISIG_ACCOUNT = os.environ.get(
+    "MATERIOS_SUDO_MULTISIG",
+    "5D1AnhuDNuvHbRzMeLGt235BMMcNSaB4wAad6us55xLGxUfM",
+)
 
 # 500M ref_time / 50K proof_size — same envelope as spec-222 attestor
 # registration ceremonies; sudo + multisig wrappers fit comfortably.
 AS_MULTI_WEIGHT = {"ref_time": 500_000_000, "proof_size": 50_000}
 
+# Mnemonic table file — same format as ceremony.py. Lives in your local
+# secret store, NOT this repository. Override via env-var.
 MEMORY_FILE = Path(
-    "/home/deci/.claude/projects/-home-deci/memory/reference_multisig_sudo.md"
+    os.environ.get(
+        "MATERIOS_MNEMONIC_FILE",
+        str(Path.home() / ".materios" / "multisig-mnemonics.md"),
+    )
 )
 
 # The 3 attestor sr25519 pubkeys for MATRA/USD. Each pubkey's matching

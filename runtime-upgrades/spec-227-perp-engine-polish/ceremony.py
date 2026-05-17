@@ -33,16 +33,27 @@ Sequence (same shape as spec-220/221/222/223/224/225/226):
           variant exists, MarketAlreadyExists error variant exists,
           Markets[ADA-PERP/USD] intact (no migration wipe).
 
-Path constants:
-  WASM_PATH      /home/deci/materios-preprod/runtime-overrides/...spec227
-  CODE_HASH_FILE /tmp/materios-runtime-spec227.blake2_256.txt
-  TARGET_SPEC    227
+REFERENCE CEREMONY — ADAPT TO YOUR OWN CHAIN.
 
-Multisig pattern identical to spec-226 (same 5D1Anh… 2-of-3 sudo
-multisig: Nate / K2 / K3).
+This file is the literal ceremony that Flux Point Studios ran to ship
+spec-227 on Materios preprod. It is shipped as a worked example of a
+2-of-3 multisig sudo runtime upgrade. To run an analogous ceremony on
+your own chain you must override every constant in the "Configuration"
+block below — the SS58s embedded here are FPS-operated keys and the
+mnemonic loader expects a specific local file format.
+
+Configuration (env-var-overridable; no defaults are runnable as-is):
+  MATERIOS_RPC_URL           ws://127.0.0.1:9945                   (override per node)
+  MATERIOS_WASM_PATH         path to the compiled runtime WASM     (must exist)
+  MATERIOS_CODE_HASH_FILE    path to the blake2_256 hash file      (must exist)
+  MATERIOS_MNEMONIC_FILE     markdown table | role | `mnemonic` |  (required)
+  MATERIOS_SUDO_MULTISIG     SS58 of the multisig sudo account
+  MATERIOS_SUDO_SIGNERS      comma-sep SS58s of all signers, sorted lexicographically
+  MATERIOS_SUDO_THRESHOLD    threshold N of M
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 import time
@@ -51,21 +62,44 @@ from pathlib import Path
 from substrateinterface import SubstrateInterface, Keypair
 from scalecodec.utils.ss58 import ss58_decode
 
-RPC_URL = "ws://127.0.0.1:9945"
-WASM_PATH = "/home/deci/materios-preprod/runtime-overrides/materios_runtime.compact.compressed.wasm.spec227"
-CODE_HASH_FILE = "/tmp/materios-runtime-spec227.blake2_256.txt"
+RPC_URL = os.environ.get("MATERIOS_RPC_URL", "ws://127.0.0.1:9945")
+WASM_PATH = os.environ.get(
+    "MATERIOS_WASM_PATH",
+    str(Path.home() / "materios-preprod/runtime-overrides/materios_runtime.compact.compressed.wasm.spec227"),
+)
+CODE_HASH_FILE = os.environ.get(
+    "MATERIOS_CODE_HASH_FILE",
+    "/tmp/materios-runtime-spec227.blake2_256.txt",
+)
 TARGET_SPEC = 227
 PRIOR_SPEC = 226
 
 AS_MULTI_WEIGHT = {"ref_time": 500_000_000, "proof_size": 50_000}
 
+# The four SS58s below are the FPS-operated 2-of-3 sudo multisig + its
+# component signer addresses, captured here so the postflight scope
+# check against `Sudo.Key` is meaningful when this script is run by
+# FPS. They are PUBLIC addresses derived from public keys — the
+# corresponding mnemonics are NOT in this repo. External operators
+# override via MATERIOS_SUDO_MULTISIG + MATERIOS_SUDO_SIGNERS.
 NATE_SS58 = "5E25rtEBkk8UXbAGPWsiwi82pmUtdmrFSCv7wQekSnSVpiZf"
 K2_SS58 = "5DcwRUB9FBS7PQdTdkFtvj4ssc2FPVpxgumZsWjLMmhvzrTa"
 K3_SS58 = "5HNAgGdHwaJQyCuZVQEHavQLb25XT3aYXcDBCGLe9hbpFiP2"
-MULTISIG_ACCOUNT = "5D1AnhuDNuvHbRzMeLGt235BMMcNSaB4wAad6us55xLGxUfM"
+MULTISIG_ACCOUNT = os.environ.get(
+    "MATERIOS_SUDO_MULTISIG",
+    "5D1AnhuDNuvHbRzMeLGt235BMMcNSaB4wAad6us55xLGxUfM",
+)
 
+# Mnemonic table file. Format: a markdown table whose rows look like
+#   | <role> | `<bip39 mnemonic>` |
+# where <role> matches the strings passed to load_mnemonic() ("Nate",
+# "K2", "K3"). This file path is NEVER inside this repository — it lives
+# in your local secret store. The script fails fast if it can't read it.
 MEMORY_FILE = Path(
-    "/home/deci/.claude/projects/-home-deci/memory/reference_multisig_sudo.md"
+    os.environ.get(
+        "MATERIOS_MNEMONIC_FILE",
+        str(Path.home() / ".materios" / "multisig-mnemonics.md"),
+    )
 )
 
 # The spec-226 demo trade registered ADA-PERP/USD via
