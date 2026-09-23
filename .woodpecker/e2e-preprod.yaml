@@ -1,0 +1,26 @@
+when:
+  - event: [push, pull_request]
+    branch: main
+  - event: manual
+
+steps:
+  # pnpm comes from corepack, which reads packageManager (pnpm@9.12.0) from
+  # the root package.json.
+  - name: unit
+    image: node:20-bookworm
+    directory: e2e
+    commands:
+      - corepack enable
+      # e2e/ is not a member of the root pnpm workspace; --ignore-workspace
+      # keeps pnpm from installing the parent workspace instead.
+      - pnpm install --ignore-workspace --frozen-lockfile || pnpm install --ignore-workspace
+      - pnpm typecheck
+      - pnpm test:coverage
+
+  - name: setup-idempotent
+    image: node:20-bookworm
+    directory: e2e
+    commands:
+      - corepack enable
+      - ./scripts/setup-preprod.sh
+      - ./scripts/setup-preprod.sh
