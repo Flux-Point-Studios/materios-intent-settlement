@@ -46,7 +46,7 @@ cd materios-intent-settlement
 cargo test --workspace          # 381 tests, ~10 min cold / ~30s warm
 ```
 
-CI also runs `cargo check --workspace`, `cargo fmt --check`, and the e2e unit suite on every PR — see `.github/workflows/`.
+CI ([Woodpecker](https://ci.fluxpointstudios.com)) also runs `cargo check --workspace`, `cargo fmt --check`, and the e2e unit suite on every PR — see `.woodpecker/`.
 
 ### Talk to the live chain (TypeScript)
 
@@ -156,7 +156,8 @@ docs/
   test-vectors.json        — canonical SCALE/CBOR payload fixtures
   design/                  — 3 locked design memos
 runtime-upgrades/          — reference multisig-sudo ceremony scripts
-.github/workflows/         — rust.yml (check+test) + e2e-preprod.yml
+.woodpecker/               — rust.yaml (check+test+fmt) + e2e-preprod.yaml (e2e unit + setup)
+.github/workflows/         — e2e-preprod.yml (opt-in live preprod run)
 ```
 
 ## License

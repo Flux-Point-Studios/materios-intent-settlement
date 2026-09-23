@@ -1,10 +1,10 @@
 name: e2e-preprod
 
+# The unit tests and the setup-preprod.sh idempotency check run on Woodpecker
+# (.woodpecker/e2e-preprod.yaml). Only the opt-in live run stays here: it is
+# dispatched cross-repo via repository_dispatch and submits extrinsics to
+# Materios preprod.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   # Allow the aegis-parametric-insurance-dev repo (Team B) to dispatch
   # an E2E run when their Aiken validators redeploy to preprod.
   repository_dispatch:
@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       live:
-        description: 'If "true", execute the full E2E against preprod. Else just unit-tests.'
+        description: 'If "true", execute the full E2E against preprod.'
         required: false
         default: 'false'
 
@@ -22,73 +22,6 @@ concurrency:
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────
-  # Always-on: unit tests + coverage gate (≥80%) for Team D helpers.
-  # ──────────────────────────────────────────────────────────────────────
-  unit:
-    name: unit tests + coverage (≥80%)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: e2e
-    steps:
-      # Third-party actions pinned to full commit SHAs (defender-in-depth vs.
-      # tag hijack). Rotate via `gh api /repos/<org>/<repo>/git/ref/tags/v<N>`.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1 as of 2026-04-24
-
-      # pnpm version is taken from root package.json's `packageManager` field
-      # (pnpm@9.12.0). Do NOT also pass `with: version:` — action-setup@v4.3+
-      # errors on conflict (ERR_PNPM_BAD_PM_VERSION).
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0 as of 2026-04-24
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 as of 2026-04-24
-        with:
-          node-version: 20
-          cache: pnpm
-          cache-dependency-path: e2e/pnpm-lock.yaml
-
-      # e2e/ is a standalone pnpm project with its own lockfile — it is NOT
-      # a member of the root pnpm-workspace.yaml (which only covers sdk + keeper).
-      # --ignore-workspace stops pnpm from climbing up and installing the
-      # parent workspace instead of e2e's own deps (which leaves e2e/node_modules
-      # empty and breaks typecheck with "Cannot find type definition file for 'node'").
-      - name: install
-        run: pnpm install --ignore-workspace --frozen-lockfile || pnpm install --ignore-workspace
-
-      - name: typecheck
-        run: pnpm typecheck
-
-      - name: unit tests + coverage
-        run: pnpm test:coverage
-
-      - name: upload coverage
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2 as of 2026-04-24
-        with:
-          name: coverage-${{ github.run_id }}
-          path: e2e/coverage/
-          retention-days: 14
-
-  # ──────────────────────────────────────────────────────────────────────
-  # Setup-script idempotency test.
-  # ──────────────────────────────────────────────────────────────────────
-  setup-idempotent:
-    name: setup-preprod.sh is idempotent
-    runs-on: ubuntu-latest
-    needs: unit
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1 as of 2026-04-24
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0 as of 2026-04-24
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 as of 2026-04-24
-        with:
-          node-version: 20
-          cache: pnpm
-          cache-dependency-path: e2e/pnpm-lock.yaml
-      - name: first run
-        run: cd e2e && ./scripts/setup-preprod.sh
-      - name: second run (must not error)
-        run: cd e2e && ./scripts/setup-preprod.sh
-
-  # ──────────────────────────────────────────────────────────────────────
   # Live preprod run — opt-in only (workflow_dispatch with live=true,
   # or repository_dispatch from Team B). Does NOT run on every PR to
   # avoid rate-limiting the Materios preprod RPC.
@@ -96,7 +29,6 @@ jobs:
   live:
     name: live preprod E2E (opt-in)
     runs-on: ubuntu-latest
-    needs: [unit, setup-idempotent]
     if: >-
       github.event_name == 'repository_dispatch' ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.live == 'true')

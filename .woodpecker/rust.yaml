@@ -1,0 +1,26 @@
+when:
+  - event: [push, pull_request]
+    branch: main
+
+steps:
+  # Image tag matches rust-toolchain.toml, so rustup resolves the pinned
+  # toolchain without downloading it.
+  - name: check-test
+    image: rust:1.85.0-bookworm
+    depends_on: []
+    commands:
+      - rustup show active-toolchain
+      - rustup component add rustfmt clippy
+      - apt-get update
+      - apt-get install -y --no-install-recommends clang libclang-dev pkg-config libssl-dev protobuf-compiler
+      - cargo check --workspace --all-targets
+      - cargo test --workspace --no-fail-fast
+
+  # Advisory, as in the GitHub workflow (continue-on-error).
+  - name: fmt
+    image: rust:1.85.0-bookworm
+    depends_on: []
+    failure: ignore
+    commands:
+      - rustup component add rustfmt
+      - cargo fmt --all -- --check
