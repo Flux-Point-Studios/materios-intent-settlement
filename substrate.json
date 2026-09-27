@@ -4,7 +4,7 @@
     {
       "id": "intent-settlement-pallet",
       "name": "Intent settlement pallet",
-      "desc": "Batched intent settlement on Materios: submit, match and atomically settle signed trading intents with bonded execution.",
+      "desc": "Intent settlement on Materios: policy and refund intents go through committee attestation, vouchers, settlement or expiry, with settlement bonds and slashing.",
       "kind": "pallet",
       "paths": [
         "pallets/intent-settlement"
@@ -37,13 +37,14 @@
     {
       "id": "is-keeper",
       "name": "Settlement keeper",
-      "desc": "Off-chain keeper that watches for matchable intents and submits the settling extrinsics.",
+      "desc": "Off-chain keeper that turns voucher batches into Cardano payout transactions, waits for confirmation and files the settlement back to Materios.",
       "kind": "agent",
       "paths": [
         "keeper"
       ],
       "consumes": [
-        "intent-settlement-pallet"
+        "intent-settlement-pallet",
+        "is-sdk"
       ],
       "status": "live"
     },
