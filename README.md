@@ -11,7 +11,7 @@ Three production Substrate pallets that together form a permissionless-keeper, M
 | Crate | LoC | Surface | What it does |
 |---|---:|---|---|
 | `pallets/intent-settlement` | 8.9k | 22 extrinsics | Intent → attest → voucher → settle → bond → slash pipeline. Both legacy single-shot (`settle_claim`) and split B+D (`request_settle` + `attest_settle` + bond/slash) paths live. |
-| `pallets/perp-engine` | 3.5k | 10 extrinsics | **Retired, not wired into the Materios runtime.** Oracle-marked perpetual futures: deposit/withdraw margin, open/close positions, adjust leverage, permissionless `liquidate`, pull-based `settle_funding`, governance-gated market registration, bonded keeper slot. |
+| `pallets/perp-engine` | 3.5k | 10 extrinsics | **Retired: the Materios runtime drops it in Flux-Point-Studios/materios#52.** Oracle-marked perpetual futures: deposit/withdraw margin, open/close positions, adjust leverage, permissionless `liquidate`, pull-based `settle_funding`, governance-gated market registration, bonded keeper slot. |
 | `pallets/oracle` | 1.1k | 2 extrinsics | M-of-N attested median price oracle. `register_attestor` (governance) + `submit_price` (attestor). Monotonic slot gate, configurable quorum, freshness window. |
 | `pallets/committee-governance` | 0.5k | 8 extrinsics | Cardano-mirrored committee + threshold + key rotation. Timelocked proposals, optional mirror-to-Cardano for SPO-based audit. |
 
@@ -19,7 +19,7 @@ Plus:
 - **`sdk/`** (~5.3k LoC TS) — `IntentSettlementClient` with builders, canonical SCALE/CBOR payload hashing, CIP-0019 Cardano address helpers, fee helpers, network configs. Targets `polkadot-stable2409-4`.
 - **`keeper/`** (~4.4k LoC TS) — committee-operated relayer: voucher signature verifier, Cardano-side mint via Lucid, M-of-N attestation aggregation, halt-mode + retry/slot-retry, daemon mode, CLI mode.
 - **`e2e/`** — 8-step preprod demo (spec §7.4) that drives `submit_intent` → committee attest → voucher mint on Cardano → settlement → cexplorer tx-link capture. Run `pnpm demo` from `e2e/`.
-- **`docs/`** — `spec-v1.md` (authoritative), 3 locked design memos in `docs/design/` (perp-engine v0, settle_claim L1 verification, MON Phase 1 oracle), decisions logs, test vectors.
+- **`docs/`** — `spec-v1.md` (authoritative), 3 design memos in `docs/design/` (perp-engine v0, retired; settle_claim L1 verification; MON Phase 1 oracle), decisions logs, test vectors.
 - **`runtime-upgrades/`** — reference 2-of-3-multisig sudo ceremony scripts (env-var parameterized; adapt to your own chain).
 
 ## Status — live on preprod, spec_version 227
