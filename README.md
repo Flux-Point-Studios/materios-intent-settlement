@@ -6,12 +6,12 @@ Built by [Flux Point Studios](https://fluxpointstudios.com).
 
 ## What this repo gives you
 
-Four production Substrate pallets that together form a permissionless-keeper, M-of-N-attested, Cardano-anchored settlement layer:
+Three production Substrate pallets that together form a permissionless-keeper, M-of-N-attested, Cardano-anchored settlement layer, plus the retired perp engine:
 
 | Crate | LoC | Surface | What it does |
 |---|---:|---|---|
 | `pallets/intent-settlement` | 8.9k | 22 extrinsics | Intent → attest → voucher → settle → bond → slash pipeline. Both legacy single-shot (`settle_claim`) and split B+D (`request_settle` + `attest_settle` + bond/slash) paths live. |
-| `pallets/perp-engine` | 3.5k | 10 extrinsics | Oracle-marked perpetual futures: deposit/withdraw margin, open/close positions, adjust leverage, permissionless `liquidate`, pull-based `settle_funding`, governance-gated market registration, bonded keeper slot. |
+| `pallets/perp-engine` | 3.5k | 10 extrinsics | **Retired, not wired into the Materios runtime.** Oracle-marked perpetual futures: deposit/withdraw margin, open/close positions, adjust leverage, permissionless `liquidate`, pull-based `settle_funding`, governance-gated market registration, bonded keeper slot. |
 | `pallets/oracle` | 1.1k | 2 extrinsics | M-of-N attested median price oracle. `register_attestor` (governance) + `submit_price` (attestor). Monotonic slot gate, configurable quorum, freshness window. |
 | `pallets/committee-governance` | 0.5k | 8 extrinsics | Cardano-mirrored committee + threshold + key rotation. Timelocked proposals, optional mirror-to-Cardano for SPO-based audit. |
 
@@ -34,7 +34,7 @@ Genesis: `0x0e46e33f639a56cc8780fd871d9a15e16d99af248526f907cb560cb40849f7bf`. S
 - ✅ Oracle: 5 ADA/BTC/ETH/USDT/USDC pairs publishing every ~60s with M=3 attestor quorum (3 attestors registered; threshold matches `submit_price` validation).
 - ✅ Cardano L1 anchoring: every certified availability batch checkpoints to Cardano preprod under metadata label 8746 (anchor-worker live, ~30s cadence).
 
-**Live perp demo:** <https://materios-perp.fluxpointstudios.com/?mode=live> — one-button cinematic end-to-end liquidation against real preprod. ~130s, real extrinsics, cexplorer tx-links on completion.
+The perp engine is retired: the runtime upgrade that removes it releases every keeper bond, sweeps the margin pot into the treasury and deletes its state, and the preprod perp demo stops working when that upgrade is enacted.
 
 ## Quickstart
 
@@ -115,9 +115,8 @@ Required env: `MATERIOS_RPC_URL`, `KEEPER_MNEMONIC`, plus Cardano-side `OGMIOS_U
 The primitive is intentionally generic — any oracle-marked, M-of-N-attested, bonded-keeper application maps onto it:
 
 - **Parametric insurance** (the original target, [Aegis](https://github.com/Flux-Point-Studios) is the reference implementation): `BuyPolicy` intents, payouts triggered by oracle evidence, LP pool with utilization caps via `set_pool_utilization`.
-- **Perpetual futures DEXes**: `pallet-perp-engine` is a complete v0. Add a CLOB or vAMM front-end, register markets via `governance_set_market`, run keepers.
 - **Prediction markets**: a binary feed registered through `pallet-oracle.register_attestor` plus a `BuyPolicy`-shaped intent gives you cryptographically-settled binary markets with Cardano-anchored receipts.
-- **Anything M-of-N + bond + slash**: the `post_settlement_bond` → `slash_bad_settlement_evidence` → `release_settlement_bond` pattern is reusable. Fork `pallet-perp-engine` for a starting template.
+- **Anything M-of-N + bond + slash**: the `post_settlement_bond` → `slash_bad_settlement_evidence` → `release_settlement_bond` pattern is reusable.
 
 ## Architecture in one diagram
 
@@ -141,7 +140,7 @@ The primitive is intentionally generic — any oracle-marked, M-of-N-attested, b
 ```
 pallets/
   intent-settlement/       — 22 extrinsics, ~8.9k LoC
-  perp-engine/             — 10 extrinsics, ~3.5k LoC
+  perp-engine/             — retired, unwired; 10 extrinsics, ~3.5k LoC
   oracle/                  — 2 extrinsics, ~1.1k LoC
   committee-governance/    — 8 extrinsics, ~0.5k LoC
 sdk/                       — TypeScript client + builders + hashing + fees (~5.3k LoC)

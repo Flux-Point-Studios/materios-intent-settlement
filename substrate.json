@@ -1,0 +1,64 @@
+{
+  "repo": "materios-intent-settlement",
+  "primitives": [
+    {
+      "id": "intent-settlement-pallet",
+      "name": "Intent settlement pallet",
+      "desc": "Batched intent settlement on Materios: submit, match and atomically settle signed trading intents with bonded execution.",
+      "kind": "pallet",
+      "paths": [
+        "pallets/intent-settlement"
+      ],
+      "consumes": [],
+      "status": "live"
+    },
+    {
+      "id": "is-oracle-pallet",
+      "name": "Intent-settlement oracle pallet",
+      "desc": "Threshold price oracle publishing attested median prices, with staleness and deviation guards.",
+      "kind": "pallet",
+      "paths": [
+        "pallets/oracle"
+      ],
+      "consumes": [],
+      "status": "live"
+    },
+    {
+      "id": "committee-governance-pallet",
+      "name": "Committee governance pallet",
+      "desc": "Governance over the settlement committee: membership, thresholds and parameter changes under a root-gated origin.",
+      "kind": "pallet",
+      "paths": [
+        "pallets/committee-governance"
+      ],
+      "consumes": [],
+      "status": "live"
+    },
+    {
+      "id": "is-keeper",
+      "name": "Settlement keeper",
+      "desc": "Off-chain keeper that watches for matchable intents and submits the settling extrinsics.",
+      "kind": "agent",
+      "paths": [
+        "keeper"
+      ],
+      "consumes": [
+        "intent-settlement-pallet"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "is-sdk",
+      "name": "Intent settlement SDK",
+      "desc": "TypeScript client for building, signing and submitting settlement intents.",
+      "kind": "toolkit",
+      "paths": [
+        "sdk"
+      ],
+      "consumes": [
+        "intent-settlement-pallet"
+      ],
+      "status": "live"
+    }
+  ]
+}

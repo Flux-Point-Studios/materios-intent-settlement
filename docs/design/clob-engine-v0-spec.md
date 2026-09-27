@@ -1,6 +1,6 @@
 # Materios `pallet-clob` v0 — design memo
 
-**Status:** Draft for internal review
+**Status:** Retired 2026-09-26, not to be built. The design depends on wrapped Cardano assets (`wADA`, `wUSDC`) minted on Materios by a bridge pallet, and Materios does not issue wrapped assets: value stays on the chain where it lives and moves through intents that settle there. Kept as a record of the design.
 **Author:** Materios core (this agent)
 **Date:** 2026-05-17
 **Companion docs:** `perp-engine-v0-spec.md`, `mm-rebate-program-design.md`, `settle-claim-l1-verification-design.md`, `mon-phase1-aegis-extend-design.md`, `materios-oracle-design.md`, `project_cardano_market_making_thesis.md`, `project_v5_1_tokenomics.md`
