@@ -1,6 +1,6 @@
 # Materios `pallet-perp-engine` v0 — design memo
 
-**Status:** Draft for internal review.
+**Status:** Retired 2026-09-26. The Materios runtime drops `pallet-perp-engine` (Flux-Point-Studios/materios#52): the pallet held MATRA margin, and the mainnet runtime carries no margin-holding pallet. The crate stays in this repo, unwired. Kept as a record of the design.
 **Date:** 2026-05-14.
 **Author:** Agent C, task #163 (perp-engine v0 spec) — fan-out on Materios intent-settlement.
 **Companion docs:** `materios-oracle-design.md`, `project_intent_settlement_wave2_status.md`, `project_cardano_market_making_thesis.md`, `project_v5_1_tokenomics.md`, `pallets/intent-settlement/src/lib.rs`.
