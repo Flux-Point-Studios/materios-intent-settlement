@@ -4163,7 +4163,7 @@ pub mod pallet {
         /// `ClaimSettlementRequests[claim_id].bond_amount` is rewritten
         /// to `amount`, and `SettlementBondPosted` is emitted.
         #[pallet::call_index(19)]
-        #[pallet::weight((Weight::from_parts(500_000_000, 0), DispatchClass::Operational, Pays::Yes))]
+        #[pallet::weight((T::WeightInfo::post_settlement_bond(), DispatchClass::Operational, Pays::Yes))]
         pub fn post_settlement_bond(
             origin: OriginFor<T>,
             claim_id: ClaimId,
@@ -4262,7 +4262,7 @@ pub mod pallet {
         /// `attest_settle` errors with `SettlementRequestMissing`),
         /// and `SettlementBondSlashed` is emitted.
         #[pallet::call_index(20)]
-        #[pallet::weight((Weight::from_parts(500_000_000, 0), DispatchClass::Operational, Pays::No))]
+        #[pallet::weight((T::WeightInfo::slash_bad_settlement_evidence(), DispatchClass::Operational, Pays::No))]
         pub fn slash_bad_settlement_evidence(
             origin: OriginFor<T>,
             claim_id: ClaimId,
@@ -4441,7 +4441,7 @@ pub mod pallet {
         /// surface flat we store the bonded requester + amount in a
         /// separate map only at attest time when the bond is present.
         #[pallet::call_index(21)]
-        #[pallet::weight((Weight::from_parts(500_000_000, 0), DispatchClass::Operational, Pays::Yes))]
+        #[pallet::weight((T::WeightInfo::release_settlement_bond(), DispatchClass::Operational, Pays::Yes))]
         pub fn release_settlement_bond(
             origin: OriginFor<T>,
             claim_id: ClaimId,

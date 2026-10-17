@@ -4,7 +4,7 @@
     {
       "id": "intent-settlement-pallet",
       "name": "Intent settlement pallet",
-      "desc": "Intent settlement on Materios: policy and refund intents go through committee attestation, vouchers, settlement or expiry, with settlement bonds and slashing.",
+      "desc": "Intent settlement on Materios: policy and refund intents go through committee attestation, vouchers, settlement or expiry, with settlement bonds and slashing charged through runtime-defined dispatch weights and integration examples tied to Materios' Gemtek checkpoint benchmark.",
       "kind": "pallet",
       "paths": [
         "pallets/intent-settlement"

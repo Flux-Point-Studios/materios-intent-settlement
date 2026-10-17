@@ -259,7 +259,86 @@ impl pallet_intent_settlement::pallet::Config for Test {
     type SettlementTreasuryPalletId = TestSettlementTreasuryPalletId;
     #[cfg(feature = "runtime-benchmarks")]
     type BenchmarkHelper = MockBenchmarkHelper;
-    type WeightInfo = ();
+    type WeightInfo = BondWeights;
+}
+
+pub struct BondWeights;
+
+impl crate::weights::WeightInfo for BondWeights {
+    fn settle_batch_atomic(n: u32) -> frame_support::weights::Weight {
+        <() as crate::weights::WeightInfo>::settle_batch_atomic(n)
+    }
+
+    fn post_settlement_bond() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(648_885_000, 3_533)
+    }
+
+    fn slash_bad_settlement_evidence() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(1_095_540_000, 14_132)
+    }
+
+    fn release_settlement_bond() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(648_885_000, 3_533)
+    }
+}
+
+#[test]
+fn bond_weight_examples_use_the_gemtek_checkpoint_benchmark() {
+    use crate::weights::WeightInfo;
+    use frame_support::weights::Weight;
+    let checkpoint = Weight::from_parts(148_885_000, 3_533);
+    let base = Weight::from_parts(500_000_000, 0);
+    assert_eq!(
+        BondWeights::post_settlement_bond(),
+        base.saturating_add(checkpoint)
+    );
+    assert_eq!(
+        BondWeights::release_settlement_bond(),
+        base.saturating_add(checkpoint)
+    );
+    assert_eq!(
+        BondWeights::slash_bad_settlement_evidence(),
+        base.saturating_add(checkpoint.saturating_mul(4))
+    );
+}
+
+#[test]
+fn bond_dispatches_preserve_runtime_weight_class_and_fee_policy() {
+    use crate::weights::WeightInfo;
+    use frame_support::dispatch::{DispatchClass, GetDispatchInfo, Pays};
+
+    let calls = [
+        (
+            crate::Call::<Test>::post_settlement_bond {
+                claim_id: H256::zero(),
+                amount: 1,
+            },
+            BondWeights::post_settlement_bond(),
+            Pays::Yes,
+        ),
+        (
+            crate::Call::<Test>::slash_bad_settlement_evidence {
+                claim_id: H256::zero(),
+                fraud_proof: FraudProof::TxNotFound,
+                signatures: vec![],
+            },
+            BondWeights::slash_bad_settlement_evidence(),
+            Pays::No,
+        ),
+        (
+            crate::Call::<Test>::release_settlement_bond {
+                claim_id: H256::zero(),
+            },
+            BondWeights::release_settlement_bond(),
+            Pays::Yes,
+        ),
+    ];
+    for (call, weight, pays_fee) in calls {
+        let info = call.get_dispatch_info();
+        assert_eq!(info.weight, weight);
+        assert_eq!(info.class, DispatchClass::Operational);
+        assert_eq!(info.pays_fee, pays_fee);
+    }
 }
 
 #[cfg(feature = "runtime-benchmarks")]
@@ -7297,4 +7376,3 @@ mod max_submit_batch_boundary {
         });
     }
 }
-
