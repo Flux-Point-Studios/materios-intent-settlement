@@ -178,9 +178,11 @@ steps first in the same upgrade. The host runtime needs no Balances change when
 Materios.
 
 Try-runtime pre/post hooks check version progression, cutover preservation and
-legacy audit flags. An upgrade over a chain already at the current version must
-leave every key and value under the pallet's storage prefix unchanged; other
-pallets' storage is out of scope. `try_state` rejects unknown versions,
+legacy audit flags. On a chain already at the current version, this pallet's
+`on_runtime_upgrade` must leave every key and value under the pallet's storage
+prefix unchanged. FRAME runs each migration's pre, upgrade and post hooks in
+sequence, so the check brackets only this pallet's hook: a runtime-level
+migration that writes under the prefix before or after it is not compared. `try_state` rejects unknown versions,
 inconsistent cutovers, migration progress outside version 2 and, at version 4,
 any requester whose outstanding bonds exceed their settlement reserve.
 
