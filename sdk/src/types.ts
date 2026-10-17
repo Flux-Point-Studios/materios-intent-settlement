@@ -138,6 +138,7 @@ export interface SettlementConstants {
   settlementRequestTtl: number;
   bondReleaseDelayBlocks: number;
   maxObservedDepth: number;
+  minFinalityDepth: number;
 }
 
 export interface KeeperSubmission {

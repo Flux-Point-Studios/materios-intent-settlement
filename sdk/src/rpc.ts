@@ -39,19 +39,78 @@ export class DispatchFailedError extends Error {
   }
 }
 
-function describeDispatchError(api: ApiPromise, dispatchError: any): { pallet: string | null; error: string } {
+/**
+ * The extrinsic's outcome could not be established: it was not included
+ * within the timeout, or it was included but its events could not be read or
+ * attributed to it. The caller must read chain state to learn what happened.
+ */
+export class ExtrinsicOutcomeUnknownError extends Error {
+  constructor(readonly call: string, detail: string) {
+    super(`${call}: outcome unknown (${detail})`);
+    this.name = "ExtrinsicOutcomeUnknownError";
+  }
+}
+
+/** The node refused the transaction before inclusion, e.g. `1010` for an unpaid fee. */
+export class TransactionRejectedError extends Error {
+  constructor(
+    readonly call: string,
+    readonly code: number,
+    readonly reason: string,
+  ) {
+    super(`${call} rejected by the pool: ${code}: ${reason}`);
+    this.name = "TransactionRejectedError";
+  }
+}
+
+function describeDispatchError(dispatchError: any): { pallet: string | null; error: string } {
   if (dispatchError.isModule) {
-    const meta = api.registry.findMetaError(dispatchError.asModule);
-    return { pallet: meta.section, error: meta.name };
+    try {
+      const meta = dispatchError.registry.findMetaError(dispatchError.asModule);
+      return { pallet: meta.section, error: meta.name };
+    } catch {
+      return { pallet: null, error: dispatchError.toString() };
+    }
   }
   const variant = String(dispatchError.type);
   const inner = dispatchError[`as${variant}`];
   return { pallet: null, error: inner?.type ? `${variant}.${inner.type}` : variant };
 }
 
+/**
+ * The dispatch error behind a failed inclusion: the extrinsic's own, or one
+ * reported by a wrapper (utility batch, sudo, proxy) whose inner call failed.
+ */
+function failedDispatch(result: any): unknown | null {
+  if (result.dispatchError) return result.dispatchError;
+  for (const { event } of result.events ?? []) {
+    if (event.section === "utility" && (event.method === "BatchInterrupted" || event.method === "ItemFailed")) {
+      return event.data[event.data.length - 1];
+    }
+    const innerResult = (event.data ?? []).find((value: any) => value?.isErr === true);
+    if (innerResult) return innerResult.asErr;
+  }
+  return null;
+}
+
+function succeeded(result: any): boolean {
+  return (result.events ?? []).some(
+    ({ event }: any) => event.section === "system" && event.method === "ExtrinsicSuccess",
+  );
+}
+
+function asRejection(call: string, error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  const pool = /^(\d{4}): (.*)$/s.exec(message);
+  if (pool) return new TransactionRejectedError(call, Number(pool[1]), pool[2]!);
+  return error instanceof Error ? error : new Error(message);
+}
+
 export interface MateriosRpcClientOptions {
   rpcUrl: string;
   signerUri?: string; // optional; only needed for signed extrinsics
+  /** How long submitExtrinsic waits for inclusion before giving up. Default 120 s. */
+  inclusionTimeoutMs?: number;
 }
 
 export class MateriosRpcClient {
@@ -59,6 +118,7 @@ export class MateriosRpcClient {
   private signer?: KeyringPair;
   private readonly rpcUrl: string;
   private readonly signerUri?: string;
+  private readonly inclusionTimeoutMs: number;
   private provider?: WsProvider;
   /**
    * Task #77: per-signer nonce gate. Serialises `accountNextIndex →
@@ -81,6 +141,7 @@ export class MateriosRpcClient {
   constructor(opts: MateriosRpcClientOptions) {
     this.rpcUrl = opts.rpcUrl;
     this.signerUri = opts.signerUri;
+    this.inclusionTimeoutMs = opts.inclusionTimeoutMs ?? 120_000;
   }
 
   async connect(): Promise<void> {
@@ -213,6 +274,7 @@ export class MateriosRpcClient {
             return;
           }
 
+          const call = `${section}.${method}`;
           let unsub: (() => void) | null = null;
           let settled = false;
           const done = (
@@ -221,36 +283,48 @@ export class MateriosRpcClient {
           ): void => {
             if (settled) return;
             settled = true;
+            clearTimeout(timeout);
             if (unsub) unsub();
             release();
             if (err) reject(err);
             else if (value) resolve(value);
           };
+          const timeout = setTimeout(
+            () => done(null, new ExtrinsicOutcomeUnknownError(call, `not included within ${this.inclusionTimeoutMs} ms`)),
+            this.inclusionTimeoutMs,
+          );
+
+          const onStatus = (result: any): void => {
+            if (result?.status?.isInBlock) {
+              const blockHash = result.status.asInBlock.toHex() as HexString;
+              if (result.internalError) {
+                done(null, new ExtrinsicOutcomeUnknownError(call, `events unreadable in ${blockHash}`));
+                return;
+              }
+              const failure = failedDispatch(result);
+              if (failure) {
+                const { pallet, error } = describeDispatchError(failure);
+                done(null, new DispatchFailedError(call, pallet, error, blockHash));
+                return;
+              }
+              if (!succeeded(result)) {
+                done(null, new ExtrinsicOutcomeUnknownError(call, `no ExtrinsicSuccess in ${blockHash}`));
+                return;
+              }
+              done({ txHash: ext.hash.toHex() as HexString, blockHash }, null);
+            } else if (result?.isError) {
+              done(null, new Error(`extrinsic ${call} errored (nonce=${nonce})`));
+            }
+          };
 
           try {
-            const unsubPromise = ext.signAndSend(
-              signer,
-              { nonce },
-              (result: any) => {
-                if (result?.status?.isInBlock) {
-                  const blockHash = result.status.asInBlock.toHex() as HexString;
-                  if (result.dispatchError) {
-                    const { pallet, error } = describeDispatchError(api, result.dispatchError);
-                    done(null, new DispatchFailedError(`${section}.${method}`, pallet, error, blockHash));
-                    return;
-                  }
-                  const txHash = ext.hash.toHex() as HexString;
-                  done({ txHash, blockHash }, null);
-                } else if (result?.isError) {
-                  done(
-                    null,
-                    new Error(
-                      `extrinsic ${section}.${method} errored (nonce=${nonce})`,
-                    ),
-                  );
-                }
-              },
-            );
+            const unsubPromise = ext.signAndSend(signer, { nonce }, (result: any) => {
+              try {
+                onStatus(result);
+              } catch (e) {
+                done(null, e instanceof Error ? e : new Error(String(e)));
+              }
+            });
             unsubPromise
               .then((u: () => void) => {
                 unsub = u;
@@ -260,10 +334,10 @@ export class MateriosRpcClient {
                 release();
               })
               .catch((e: unknown) => {
-                done(null, e instanceof Error ? e : new Error(String(e)));
+                done(null, asRejection(call, e));
               });
           } catch (e) {
-            done(null, e instanceof Error ? e : new Error(String(e)));
+            done(null, asRejection(call, e));
           }
         })
         .catch((e) => {
@@ -295,10 +369,19 @@ export class MateriosRpcClient {
     };
   }
 
-  /** Whether the claim is settled on Materios. */
-  async isClaimSettled(claimId: ClaimId): Promise<boolean> {
-    const stored: any = await (this.getApi().query as any).intentSettlement.claims(claimId);
-    return stored.isSome && stored.unwrap().settled.isTrue;
+  /** Whether the claim is settled at the best block and at the finalized head. */
+  async claimSettlement(claimId: ClaimId): Promise<{ best: boolean; finalized: boolean }> {
+    const api = this.getApi();
+    const settledIn = async (query: any): Promise<boolean> => {
+      const stored: any = await query.intentSettlement.claims(claimId);
+      return stored.isSome && stored.unwrap().settled.isTrue;
+    };
+    const finalizedHead = await api.rpc.chain.getFinalizedHead();
+    const [best, finalized] = await Promise.all([
+      settledIn(api.query),
+      api.at(finalizedHead).then((at) => settledIn(at.query)),
+    ]);
+    return { best, finalized };
   }
 
   /** The bond held after attestation until its release, if any. */
@@ -330,6 +413,7 @@ export class MateriosRpcClient {
       settlementRequestTtl: read("settlementRequestTtl").toNumber(),
       bondReleaseDelayBlocks: read("bondReleaseDelayBlocks").toNumber(),
       maxObservedDepth: read("maxObservedDepth").toNumber(),
+      minFinalityDepth: read("minFinalityDepth").toNumber(),
     };
   }
 
@@ -409,7 +493,7 @@ export class MateriosRpcClient {
     };
   }
 
-  /** Current finalized block number, used as keeper cursor. */
+  /** Current best block number, used as keeper cursor and for TTL arithmetic. */
   async getLatestBlockNumber(): Promise<BlockNumber> {
     const api = this.getApi();
     const header = await api.rpc.chain.getHeader();

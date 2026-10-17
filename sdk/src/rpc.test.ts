@@ -1,7 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   DispatchFailedError,
+  ExtrinsicOutcomeUnknownError,
   MateriosRpcClient,
+  TransactionRejectedError,
   submitIntent,
   submitCreditRefund,
   submitSettleClaim,
@@ -107,6 +109,7 @@ describe("MateriosRpcClient", () => {
                 asInBlock: { toHex: () => "0x" + "11".repeat(32) },
               },
               isError: false,
+              events: [SUCCESS],
             }),
           10,
         );
@@ -169,29 +172,40 @@ describe("MateriosRpcClient", () => {
   });
 });
 
-function inBlockClient(dispatchError: unknown): MateriosRpcClient {
-  const client = new MateriosRpcClient({ rpcUrl: "ws://stub", signerUri: "//Alice" });
+const SUCCESS = { event: { section: "system", method: "ExtrinsicSuccess", data: [] } };
+const BLOCK = "0x" + "11".repeat(32);
+
+function moduleError(name: string) {
+  return {
+    isModule: true,
+    asModule: { index: 2, error: 45 },
+    registry: { findMetaError: () => ({ section: "intentSettlement", name }) },
+    toString: () => `{"module":{"index":2,"error":45}}`,
+  };
+}
+
+/** A client whose signAndSend reports `outcome` (or nothing) once the tx is in a block. */
+function submittingClient(
+  outcome: Record<string, unknown> | null,
+  options: { send?: () => Promise<unknown>; inclusionTimeoutMs?: number } = {},
+): MateriosRpcClient {
+  const client = new MateriosRpcClient({
+    rpcUrl: "ws://stub",
+    signerUri: "//Alice",
+    inclusionTimeoutMs: options.inclusionTimeoutMs ?? 5_000,
+  });
   const ext = {
     hash: { toHex: () => "0x" + "ff".repeat(32) },
     signAndSend: vi.fn().mockImplementation((_signer, _opts, cb) => {
-      setTimeout(
-        () =>
-          cb({
-            status: { isInBlock: true, asInBlock: { toHex: () => "0x" + "11".repeat(32) } },
-            isError: false,
-            dispatchError,
-          }),
-        1,
-      );
-      return Promise.resolve(vi.fn());
+      if (outcome) {
+        setTimeout(() => cb({ status: { isInBlock: true, asInBlock: { toHex: () => BLOCK } }, isError: false, events: [], ...outcome }), 1);
+      }
+      return options.send ? options.send() : Promise.resolve(vi.fn());
     }),
   };
   const api = {
     tx: { intentSettlement: { requestSettle: () => ext } },
     rpc: { system: { accountNextIndex: vi.fn().mockResolvedValue({ toNumber: () => 3 }) } },
-    registry: {
-      findMetaError: vi.fn().mockReturnValue({ section: "intentSettlement", name: "SettlementRequestAlreadyExists" }),
-    },
   };
   // @ts-expect-error
   client["api"] = api as any;
@@ -201,34 +215,94 @@ function inBlockClient(dispatchError: unknown): MateriosRpcClient {
 }
 
 describe("dispatch failures", () => {
+  const submit = (client: MateriosRpcClient) =>
+    client.submitExtrinsic("intentSettlement", "requestSettle", []).catch((error: unknown) => error);
+
   it("rejects an included extrinsic whose dispatch failed, naming the module error", async () => {
-    const client = inBlockClient({ isModule: true, asModule: { index: 2, error: 45 } });
-    const failure = await client
-      .submitExtrinsic("intentSettlement", "requestSettle", [])
-      .catch((error: unknown) => error);
+    const failure = await submit(submittingClient({ dispatchError: moduleError("SettlementRequestAlreadyExists") }));
     expect(failure).toBeInstanceOf(DispatchFailedError);
     expect(failure).toMatchObject({
       call: "intentSettlement.requestSettle",
       pallet: "intentSettlement",
       error: "SettlementRequestAlreadyExists",
-      blockHash: "0x" + "11".repeat(32),
+      blockHash: BLOCK,
     });
   });
 
   it("names non-module dispatch errors by their variant", async () => {
-    const client = inBlockClient({ isModule: false, type: "Token", asToken: { type: "FundsUnavailable" } });
-    await expect(client.submitExtrinsic("intentSettlement", "requestSettle", [])).rejects.toMatchObject({
-      pallet: null,
-      error: "Token.FundsUnavailable",
-    });
+    const failure = await submit(
+      submittingClient({ dispatchError: { isModule: false, type: "Token", asToken: { type: "FundsUnavailable" } } }),
+    );
+    expect(failure).toMatchObject({ pallet: null, error: "Token.FundsUnavailable" });
+  });
+
+  it("still rejects when the dispatch error cannot be decoded", async () => {
+    const undecodable = {
+      ...moduleError("unused"),
+      registry: {
+        findMetaError: () => {
+          throw new Error("unknown module error");
+        },
+      },
+    };
+    const failure = await submit(submittingClient({ dispatchError: undecodable }));
+    expect(failure).toBeInstanceOf(DispatchFailedError);
+    expect(failure).toMatchObject({ pallet: null, error: `{"module":{"index":2,"error":45}}` });
+  });
+
+  it("rejects a wrapper call whose inner dispatch failed", async () => {
+    const interrupted = {
+      events: [SUCCESS, { event: { section: "utility", method: "BatchInterrupted", data: [{}, moduleError("AlreadySettled")] } }],
+    };
+    expect(await submit(submittingClient(interrupted))).toMatchObject({ error: "AlreadySettled" });
+    const sudid = {
+      events: [SUCCESS, { event: { section: "sudo", method: "Sudid", data: [{ isErr: true, asErr: moduleError("BondNotReserved") }] } }],
+    };
+    expect(await submit(submittingClient(sudid))).toMatchObject({ error: "BondNotReserved" });
+  });
+
+  it("treats an inclusion it cannot attribute to success as an unknown outcome", async () => {
+    const unreadable = await submit(submittingClient({ internalError: new Error("events unavailable") }));
+    expect(unreadable).toBeInstanceOf(ExtrinsicOutcomeUnknownError);
+    const unattributed = await submit(submittingClient({ events: [] }));
+    expect(unattributed).toBeInstanceOf(ExtrinsicOutcomeUnknownError);
+  });
+
+  it("gives up on a submission that is never included", async () => {
+    const failure = await submit(submittingClient(null, { inclusionTimeoutMs: 20 }));
+    expect(failure).toBeInstanceOf(ExtrinsicOutcomeUnknownError);
+  });
+
+  it("names a transaction the pool rejected, such as an unpaid fee", async () => {
+    const failure = await submit(
+      submittingClient(null, {
+        send: () =>
+          Promise.reject(new Error("1010: Invalid Transaction: Inability to pay some fees , e.g. account balance too low")),
+      }),
+    );
+    expect(failure).toBeInstanceOf(TransactionRejectedError);
+    expect(failure).toMatchObject({ code: 1010, reason: "Invalid Transaction: Inability to pay some fees , e.g. account balance too low" });
   });
 });
 
 describe("settlement reads", () => {
-  function readClient(query: Record<string, unknown>, consts: Record<string, unknown> = {}): MateriosRpcClient {
+  function readClient(
+    query: Record<string, unknown>,
+    consts: Record<string, unknown> = {},
+    finalizedQuery: Record<string, unknown> = query,
+  ): MateriosRpcClient {
     const client = new MateriosRpcClient({ rpcUrl: "ws://stub" });
+    const finalizedHead = "0x" + "fe".repeat(32);
     // @ts-expect-error
-    client["api"] = { query: { intentSettlement: query }, consts: { intentSettlement: consts } } as any;
+    client["api"] = {
+      query: { intentSettlement: query },
+      consts: { intentSettlement: consts },
+      rpc: { chain: { getFinalizedHead: vi.fn().mockResolvedValue(finalizedHead) } },
+      at: vi.fn().mockImplementation(async (hash: string) => {
+        expect(hash).toBe(finalizedHead);
+        return { query: { intentSettlement: finalizedQuery } };
+      }),
+    } as any;
     return client;
   }
   const codec = (value: unknown) => ({ toString: () => String(value), toNumber: () => Number(value), toHex: () => value });
@@ -279,7 +353,7 @@ describe("settlement reads", () => {
     });
     const claim = ("0x" + "01".repeat(32)) as `0x${string}`;
     await expect(client.getSettlementRequest(claim)).resolves.toBeNull();
-    await expect(client.isClaimSettled(claim)).resolves.toBe(false);
+    await expect(client.claimSettlement(claim)).resolves.toEqual({ best: false, finalized: false });
     await expect(client.getAttestedBond(claim)).resolves.toBeNull();
   });
 
@@ -290,11 +364,21 @@ describe("settlement reads", () => {
       bondedClaimAttestedAt: vi.fn().mockResolvedValue(some(codec(90))),
     });
     const claim = ("0x" + "01".repeat(32)) as `0x${string}`;
-    await expect(client.isClaimSettled(claim)).resolves.toBe(true);
+    await expect(client.claimSettlement(claim)).resolves.toEqual({ best: true, finalized: true });
     await expect(client.getAttestedBond(claim)).resolves.toEqual({
       requester: "0x" + "ab".repeat(32),
       amount: 500n,
       attestedAt: 90,
+    });
+  });
+
+  it("reads settlement at the best block and at the finalized head separately", async () => {
+    const settled = { claims: vi.fn().mockResolvedValue(some({ settled: { isTrue: true } })) };
+    const unsettled = { claims: vi.fn().mockResolvedValue(none) };
+    const client = readClient(settled, {}, unsettled);
+    await expect(client.claimSettlement(("0x" + "01".repeat(32)) as `0x${string}`)).resolves.toEqual({
+      best: true,
+      finalized: false,
     });
   });
 
@@ -304,12 +388,14 @@ describe("settlement reads", () => {
       settlementRequestTtl: codec(2400),
       bondReleaseDelayBlocks: codec(30),
       maxObservedDepth: codec(2160),
+      minFinalityDepth: codec(15),
     };
     expect(readClient({}, complete).getSettlementConstants()).toEqual({
       minSettlementBond: 0n,
       settlementRequestTtl: 2400,
       bondReleaseDelayBlocks: 30,
       maxObservedDepth: 2160,
+      minFinalityDepth: 15,
     });
     const { maxObservedDepth: _, ...missing } = complete;
     expect(() => readClient({}, missing).getSettlementConstants()).toThrow(/maxObservedDepth/);

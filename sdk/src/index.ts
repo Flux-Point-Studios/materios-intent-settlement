@@ -38,6 +38,8 @@ export {
   submitSettleClaim,
   MateriosRpcClient,
   DispatchFailedError,
+  ExtrinsicOutcomeUnknownError,
+  TransactionRejectedError,
 } from "./rpc.js";
 export type { MateriosRpcClientOptions, SettleClaimArgs } from "./rpc.js";
 
