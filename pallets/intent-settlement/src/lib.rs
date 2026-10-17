@@ -3493,9 +3493,7 @@ pub mod pallet {
         /// - `bond_amount` is positive and at least `MinSettlementBond`,
         ///   reserved atomically before the request becomes visible.
         #[pallet::call_index(13)]
-        #[pallet::weight((Weight::from_parts(40_000_000, 0)
-            .saturating_add(T::WeightInfo::release_settlement_bond())
-            .saturating_add(T::WeightInfo::post_settlement_bond()), DispatchClass::Operational, Pays::Yes))]
+        #[pallet::weight((T::WeightInfo::request_settle(), DispatchClass::Operational, Pays::Yes))]
         pub fn request_settle(
             origin: OriginFor<T>,
             claim_id: ClaimId,
@@ -3693,8 +3691,7 @@ pub mod pallet {
         /// mode already match must be attested instead
         /// (`SupersedeMatchesRequest`).
         #[pallet::call_index(22)]
-        #[pallet::weight((Weight::from_parts(60_000_000, 0)
-            .saturating_add(T::WeightInfo::release_settlement_bond())
+        #[pallet::weight((T::WeightInfo::supersede_settlement_request()
             .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
             DispatchClass::Operational, Pays::No))]
         pub fn supersede_settlement_request(
@@ -3705,8 +3702,7 @@ pub mod pallet {
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
         ) -> DispatchResultWithPostInfo {
             Self::with_signature_weight(
-                Weight::from_parts(60_000_000, 0)
-                    .saturating_add(T::WeightInfo::release_settlement_bond()),
+                T::WeightInfo::supersede_settlement_request(),
                 |checked| {
                     let who = ensure_signed(origin)?;
                     ensure!(
@@ -3775,13 +3771,7 @@ pub mod pallet {
         /// resubmitting.
         #[pallet::call_index(15)]
         #[pallet::weight((
-            Weight::from_parts(
-                40_000_000u64.saturating_add(
-                    (entries.len() as u64).saturating_mul(8_000_000),
-                ),
-                0,
-            ).saturating_add(T::WeightInfo::release_settlement_bond().saturating_mul(entries.len() as u64))
-            .saturating_add(T::WeightInfo::post_settlement_bond().saturating_mul(entries.len() as u64)),
+            T::WeightInfo::request_batch_settle(entries.len() as u32),
             DispatchClass::Operational,
             Pays::Yes,
         ))]

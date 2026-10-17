@@ -288,6 +288,20 @@ impl crate::weights::WeightInfo for BondWeights {
     fn release_settlement_bond() -> frame_support::weights::Weight {
         frame_support::weights::Weight::from_parts(30_003, 23)
     }
+
+    fn request_settle() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(40_004, 29)
+    }
+
+    fn request_batch_settle(n: u32) -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(50_005, 31)
+            .saturating_mul(n.into())
+            .saturating_add(frame_support::weights::Weight::from_parts(1, 0))
+    }
+
+    fn supersede_settlement_request() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(60_006, 37)
+    }
 }
 
 #[test]

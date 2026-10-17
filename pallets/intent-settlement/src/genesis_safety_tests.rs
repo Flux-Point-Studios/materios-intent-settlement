@@ -345,6 +345,12 @@ fn genesis_safety_threshold_dispatch_weights_scale_for_every_bundle() {
                 crate::Call::<Test>::slash_bad_settlement_evidence {
                     claim_id: cid,
                     fraud_proof: FraudProof::TxNotFound,
+                    signatures: signatures.clone(),
+                },
+                crate::Call::<Test>::supersede_settlement_request {
+                    claim_id: cid,
+                    settled_direct: false,
+                    evidence: settled_evidence_for(&voucher, 15, 123),
                     signatures,
                 },
             ]
@@ -1551,6 +1557,58 @@ fn genesis_safety_try_state_rejects_an_unbacked_settlement_bond() {
         assert_eq!(
             <IntentSettlement as Hooks<u64>>::try_state(1),
             Err("settlement bonds exceed the settlement reserve".into())
+        );
+    });
+}
+
+#[test]
+fn genesis_safety_request_dispatches_declare_their_benchmarked_weights() {
+    use crate::weights::WeightInfo;
+    use frame_support::dispatch::GetDispatchInfo;
+    type Weights = <Test as crate::Config>::WeightInfo;
+    new_test_ext().execute_with(|| {
+        let (cid, _, voucher) = vouchered_claim_with_voucher(0x32, 1_000);
+        let evidence = settled_evidence_for(&voucher, 15, 123);
+        assert_eq!(
+            crate::Call::<Test>::request_settle {
+                claim_id: cid,
+                cardano_tx_hash: evidence.cardano_tx_hash,
+                settled_direct: false,
+                attestation_evidence: evidence,
+                bond_amount: 1,
+            }
+            .get_dispatch_info()
+            .weight,
+            Weights::request_settle()
+        );
+        for n in [1u32, 7] {
+            let entries = (0..n)
+                .map(|_| SettleAttestedBatchEntry {
+                    claim_id: cid,
+                    settled_direct: false,
+                    evidence,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                crate::Call::<Test>::request_batch_settle {
+                    entries: entries.try_into().expect("bounded batch"),
+                    bond_amount: 1,
+                }
+                .get_dispatch_info()
+                .weight,
+                Weights::request_batch_settle(n)
+            );
+        }
+        assert_eq!(
+            crate::Call::<Test>::supersede_settlement_request {
+                claim_id: cid,
+                settled_direct: false,
+                evidence,
+                signatures: mock_settle_sigs(),
+            }
+            .get_dispatch_info()
+            .weight,
+            Weights::supersede_settlement_request().saturating_add(Weights::threshold_signatures(2))
         );
     });
 }

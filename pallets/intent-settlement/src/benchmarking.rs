@@ -14,6 +14,7 @@ use sp_runtime::traits::{AccountIdConversion, Saturating};
 use sp_std::vec::Vec;
 
 const MAX_BATCH_BENCH: u32 = 256;
+const SIGNER_KEY_TYPE: sp_core::crypto::KeyTypeId = sp_core::crypto::KeyTypeId(*b"sett");
 
 /// Sets `who`'s free balance to `amount` plus the existential deposit and
 /// returns `amount` as a Currency balance.
@@ -27,6 +28,123 @@ fn fund_bond<T: Config>(who: &T::AccountId, amount: u128) -> BalanceOf<T> {
         amount.saturating_add(T::Currency::minimum_balance()),
     );
     amount
+}
+
+/// Seeds an unsettled claim and its voucher, returning the claim id and
+/// evidence that passes every request check.
+fn seed_settleable_claim<T: Config>(tag: &[u8; 4], index: u32) -> (ClaimId, SettlementEvidence)
+where
+    T::AccountId: parity_scale_codec::Encode,
+{
+    use crate::pallet::{Claims, PoolUtilization, Vouchers};
+    let mut id_bytes = [0u8; 32];
+    id_bytes[..4].copy_from_slice(&index.to_be_bytes());
+    id_bytes[4..8].copy_from_slice(tag);
+    let claim_id = ClaimId::from(id_bytes);
+    let intent_id = IntentId::from(id_bytes);
+    let amount: u64 = 1_000;
+    let payment_hash = [0xB1u8; 28];
+    let mut addr = Vec::with_capacity(57);
+    addr.push(0x01u8);
+    addr.extend_from_slice(&payment_hash);
+    addr.extend_from_slice(&[0xB1u8; 28]);
+    let bfpr = BatchFairnessProof {
+        batch_block_range: (1, 1),
+        sorted_intent_ids: frame_support::BoundedVec::try_from(sp_std::vec![intent_id]).unwrap(),
+        requested_amounts_ada: frame_support::BoundedVec::try_from(sp_std::vec![amount]).unwrap(),
+        pool_balance_ada: 1_000_000_000,
+        pro_rata_scale_bps: 10_000,
+        awarded_amounts_ada: frame_support::BoundedVec::try_from(sp_std::vec![amount]).unwrap(),
+    };
+    Vouchers::<T>::insert(
+        claim_id,
+        Voucher {
+            claim_id,
+            policy_id: PolicyId::from([0u8; 32]),
+            beneficiary_cardano_addr: frame_support::BoundedVec::try_from(addr).unwrap(),
+            amount_ada: amount,
+            batch_fairness_proof_digest: compute_fairness_proof_digest(&bfpr),
+            issued_block: 1,
+            expiry_slot_cardano: 100_000,
+            committee_sigs: Default::default(),
+        },
+    );
+    Claims::<T>::insert(
+        claim_id,
+        Claim {
+            intent_id,
+            policy_id: PolicyId::from([0u8; 32]),
+            amount_ada: amount,
+            issued_block: 1,
+            expiry_slot_cardano: 100_000,
+            settled: false,
+            settled_direct: false,
+            cardano_tx_hash: [0u8; 32],
+        },
+    );
+    PoolUtilization::<T>::mutate(|u| {
+        u.total_nav_ada = u.total_nav_ada.saturating_add(amount.saturating_mul(2));
+        u.outstanding_coverage_ada = u.outstanding_coverage_ada.saturating_add(amount);
+    });
+    let evidence = SettlementEvidence {
+        cardano_tx_hash: [0xFFu8; 32],
+        observed_at_depth: T::MinFinalityDepth::get(),
+        observed_slot: 12_345_678,
+        beneficiary_addr_hash: payment_hash,
+        amount_lovelace: amount,
+        mainchain_genesis_hash: T::MainchainGenesisHash::get(),
+    };
+    (claim_id, evidence)
+}
+
+/// Stores a request for `claim_id` from a fresh account `index`, submitted
+/// at block 0 with a reserved bond, and moves the chain past its TTL. The
+/// request's slot differs from `evidence`, so it is unattestable junk that
+/// a request or supersede must refund.
+fn seed_expired_bonded_request<T: Config>(
+    claim_id: ClaimId,
+    evidence: SettlementEvidence,
+    index: u32,
+) {
+    let requester: T::AccountId = account("prior-requester", index, 0);
+    let bond = T::MinSettlementBond::get().max(1);
+    T::Currency::reserve_named(
+        &SETTLEMENT_BOND_RESERVE_ID,
+        &requester,
+        fund_bond::<T>(&requester, bond),
+    )
+    .expect("funded bond");
+    crate::pallet::ClaimSettlementRequests::<T>::insert(
+        claim_id,
+        SettlementRequestRecord::<T::AccountId, BlockNumberFor<T>> {
+            requester,
+            evidence: SettlementEvidence {
+                observed_slot: evidence.observed_slot.saturating_add(1),
+                ..evidence
+            },
+            settled_direct: false,
+            submitted_block: 0u32.into(),
+            bond_amount: bond,
+        },
+    );
+    frame_system::Pallet::<T>::set_block_number(
+        T::SettlementRequestTtl::get().saturating_add(1).into(),
+    );
+}
+
+/// Generates the calling committee member's sr25519 key so the
+/// integration runtime can verify its signature.
+fn committee_signer<T: Config>(seed: &[u8]) -> (T::AccountId, sp_core::sr25519::Public)
+where
+    T::AccountId: parity_scale_codec::Encode,
+{
+    use parity_scale_codec::Decode;
+    let public = sp_io::crypto::sr25519_generate(SIGNER_KEY_TYPE, Some(seed.to_vec()));
+    let caller = T::AccountId::decode(&mut &public.0[..])
+        .expect("runtime account decodes a committee public key");
+    T::BenchmarkHelper::whitelist_as_committee(&caller);
+    crate::pallet::MinSignerThreshold::<T>::put(1);
+    (caller, public)
 }
 
 /// Build a vouchered claim under a synthetic id for the given index. Uses
@@ -120,6 +238,7 @@ mod benchmarks {
             Pallet::<Runtime>::test_benchmark_post_settlement_bond,
             Pallet::<Runtime>::test_benchmark_release_settlement_bond,
             Pallet::<Runtime>::test_benchmark_slash_bad_settlement_evidence,
+            Pallet::<Runtime>::test_benchmark_supersede_settlement_request,
         ] {
             execute_in_integration_runtime(benchmark);
         }
@@ -131,16 +250,16 @@ mod benchmarks {
     fn threshold_signatures(s: Linear<1, { T::MaxCommittee::get() }>) {
         use parity_scale_codec::Decode;
         let payload = [0x5Au8; 32];
-        let key_type = sp_core::crypto::KeyTypeId(*b"sett");
         let mut signatures = Vec::new();
         for index in 0..T::MaxCommittee::get() {
             let seed = alloc::format!("//settlement-signature-benchmark/{index}");
-            let public = sp_io::crypto::sr25519_generate(key_type, Some(seed.as_bytes().to_vec()));
+            let public =
+                sp_io::crypto::sr25519_generate(SIGNER_KEY_TYPE, Some(seed.as_bytes().to_vec()));
             let account = T::AccountId::decode(&mut &public.0[..])
                 .expect("runtime account decodes a committee public key");
             T::BenchmarkHelper::whitelist_as_committee(&account);
             assert!(T::CommitteeMembership::is_member(&account));
-            let signature = sp_io::crypto::sr25519_sign(key_type, &public, &payload)
+            let signature = sp_io::crypto::sr25519_sign(SIGNER_KEY_TYPE, &public, &payload)
                 .expect("benchmark key was generated");
             signatures.push((public.0, signature.0));
         }
@@ -386,86 +505,12 @@ mod benchmarks {
     //   attest_batch_settle (n)  ~50M + n*14M ref_time
     // ---------------------------------------------------------------------
 
-    /// Bench `request_settle` — single-claim phase 1 of the attested path.
+    /// Bench `request_settle` replacing an expired request bonded by another
+    /// account, so the refund and the new reserve are both measured.
     #[benchmark]
     fn request_settle() {
-        use crate::pallet::{Claims, PoolUtilization, Vouchers};
-        // Seed a vouchered claim + matching voucher record so the call's
-        // amount + beneficiary cross-checks pass.
-        let mut id_bytes = [0u8; 32];
-        id_bytes[..4].copy_from_slice(b"RQST");
-        let claim_id = ClaimId::from(id_bytes);
-        let intent_id = IntentId::from(id_bytes);
-        let amount: u64 = 1_000;
-        // 57-byte CIP-0019 type-0 address shape (0x01 || pay × 28 || stake × 28).
-        let payment_hash = [0xB1u8; 28];
-        let mut addr = sp_std::vec::Vec::with_capacity(57);
-        addr.push(0x01u8);
-        addr.extend_from_slice(&payment_hash);
-        addr.extend_from_slice(&[0xB1u8; 28]);
-        let addr_bv = frame_support::BoundedVec::<u8, sp_core::ConstU32<MAX_CARDANO_ADDR>>::try_from(
-            addr,
-        )
-        .expect("57B fits");
-
-        let bfpr = BatchFairnessProof {
-            batch_block_range: (1, 1),
-            sorted_intent_ids: frame_support::BoundedVec::try_from(
-                sp_std::vec![intent_id],
-            )
-            .unwrap(),
-            requested_amounts_ada: frame_support::BoundedVec::try_from(
-                sp_std::vec![amount],
-            )
-            .unwrap(),
-            pool_balance_ada: 1_000_000_000,
-            pro_rata_scale_bps: 10_000,
-            awarded_amounts_ada: frame_support::BoundedVec::try_from(
-                sp_std::vec![amount],
-            )
-            .unwrap(),
-        };
-        let bfpr_d = compute_fairness_proof_digest(&bfpr);
-        let voucher = Voucher {
-            claim_id,
-            policy_id: PolicyId::from([0u8; 32]),
-            beneficiary_cardano_addr: addr_bv,
-            amount_ada: amount,
-            batch_fairness_proof_digest: bfpr_d,
-            issued_block: 1,
-            expiry_slot_cardano: 100_000,
-            committee_sigs: Default::default(),
-        };
-        Vouchers::<T>::insert(claim_id, voucher);
-        Claims::<T>::insert(
-            claim_id,
-            Claim {
-                intent_id,
-                policy_id: PolicyId::from([0u8; 32]),
-                amount_ada: amount,
-                issued_block: 1,
-                expiry_slot_cardano: 100_000,
-                settled: false,
-                settled_direct: false,
-                cardano_tx_hash: [0u8; 32],
-            },
-        );
-        PoolUtilization::<T>::mutate(|u| {
-            u.total_nav_ada = u.total_nav_ada.saturating_add(amount.saturating_mul(2));
-            u.outstanding_coverage_ada =
-                u.outstanding_coverage_ada.saturating_add(amount);
-        });
-
-        let mc_g = T::MainchainGenesisHash::get();
-        let depth = T::MinFinalityDepth::get();
-        let evidence = SettlementEvidence {
-            cardano_tx_hash: [0xFFu8; 32],
-            observed_at_depth: depth,
-            observed_slot: 12_345_678,
-            beneficiary_addr_hash: payment_hash,
-            amount_lovelace: amount,
-            mainchain_genesis_hash: mc_g,
-        };
+        let (claim_id, evidence) = seed_settleable_claim::<T>(b"RQST", 0);
+        seed_expired_bonded_request::<T>(claim_id, evidence, 0);
         let caller: T::AccountId = whitelisted_caller();
         let bond = T::MinSettlementBond::get().max(1);
         fund_bond::<T>(&caller, bond);
@@ -582,105 +627,29 @@ mod benchmarks {
         _(RawOrigin::Signed(caller), claim_id, signatures);
     }
 
-    /// Bench `request_batch_settle` across Linear<1, MAX_BATCH_BENCH>. The
-    /// per-entry cost dominates (voucher + claim hydration + checks +
-    /// storage write); the sig-verify pass is single.
+    /// Bench `request_batch_settle` across Linear<1, MAX_BATCH_BENCH>, each
+    /// entry replacing an expired request bonded by a different account.
     #[benchmark]
     fn request_batch_settle(n: Linear<1, MAX_BATCH_BENCH>) {
-        use crate::pallet::{Claims, PoolUtilization, Vouchers};
-        let caller: T::AccountId = whitelisted_caller();
-        let mc_g = T::MainchainGenesisHash::get();
-        let payment_hash = [0xB1u8; 28];
-        let mut entries: sp_std::vec::Vec<SettleAttestedBatchEntry> =
-            sp_std::vec::Vec::with_capacity(n as usize);
-        for i in 0..n {
-            let mut id_bytes = [0u8; 32];
-            id_bytes[..4].copy_from_slice(&i.to_be_bytes());
-            id_bytes[4..8].copy_from_slice(b"RQBS");
-            let claim_id = ClaimId::from(id_bytes);
-            let intent_id = IntentId::from(id_bytes);
-            let amount: u64 = 1_000;
-            let mut addr = sp_std::vec::Vec::with_capacity(57);
-            addr.push(0x01u8);
-            addr.extend_from_slice(&payment_hash);
-            addr.extend_from_slice(&[0xB1u8; 28]);
-            let addr_bv = frame_support::BoundedVec::<u8, sp_core::ConstU32<MAX_CARDANO_ADDR>>::try_from(
-                addr,
-            )
-            .unwrap();
-            let bfpr = BatchFairnessProof {
-                batch_block_range: (1, 1),
-                sorted_intent_ids: frame_support::BoundedVec::try_from(
-                    sp_std::vec![intent_id],
-                )
-                .unwrap(),
-                requested_amounts_ada: frame_support::BoundedVec::try_from(
-                    sp_std::vec![amount],
-                )
-                .unwrap(),
-                pool_balance_ada: 1_000_000_000,
-                pro_rata_scale_bps: 10_000,
-                awarded_amounts_ada: frame_support::BoundedVec::try_from(
-                    sp_std::vec![amount],
-                )
-                .unwrap(),
-            };
-            let bfpr_d = compute_fairness_proof_digest(&bfpr);
-            let voucher = Voucher {
-                claim_id,
-                policy_id: PolicyId::from([0u8; 32]),
-                beneficiary_cardano_addr: addr_bv,
-                amount_ada: amount,
-                batch_fairness_proof_digest: bfpr_d,
-                issued_block: 1,
-                expiry_slot_cardano: 100_000,
-                committee_sigs: Default::default(),
-            };
-            Vouchers::<T>::insert(claim_id, voucher);
-            Claims::<T>::insert(
-                claim_id,
-                Claim {
-                    intent_id,
-                    policy_id: PolicyId::from([0u8; 32]),
-                    amount_ada: amount,
-                    issued_block: 1,
-                    expiry_slot_cardano: 100_000,
-                    settled: false,
+        let entries: Vec<SettleAttestedBatchEntry> = (0..n)
+            .map(|index| {
+                let (claim_id, evidence) = seed_settleable_claim::<T>(b"RQBS", index);
+                seed_expired_bonded_request::<T>(claim_id, evidence, index);
+                SettleAttestedBatchEntry {
+                    claim_id,
+                    evidence,
                     settled_direct: false,
-                    cardano_tx_hash: [0u8; 32],
-                },
-            );
-            entries.push(SettleAttestedBatchEntry {
-                claim_id,
-                evidence: SettlementEvidence {
-                    cardano_tx_hash: [0xFFu8; 32],
-                    observed_at_depth: T::MinFinalityDepth::get(),
-                    observed_slot: 12_345_678,
-                    beneficiary_addr_hash: payment_hash,
-                    amount_lovelace: amount,
-                    mainchain_genesis_hash: mc_g,
-                },
-                settled_direct: false,
-            });
-        }
-        PoolUtilization::<T>::mutate(|u| {
-            u.total_nav_ada = u
-                .total_nav_ada
-                .saturating_add(1_000u64.saturating_mul(n as u64 * 2));
-            u.outstanding_coverage_ada = u
-                .outstanding_coverage_ada
-                .saturating_add(1_000u64.saturating_mul(n as u64));
-        });
-        let bv: frame_support::BoundedVec<
-            SettleAttestedBatchEntry,
-            T::MaxSettleBatch,
-        > = frame_support::BoundedVec::try_from(entries).unwrap();
-
+                }
+            })
+            .collect();
+        let caller: T::AccountId = whitelisted_caller();
         let bond = T::MinSettlementBond::get().max(1);
         fund_bond::<T>(&caller, bond.saturating_mul(n.into()));
+        let entries: frame_support::BoundedVec<SettleAttestedBatchEntry, T::MaxSettleBatch> =
+            entries.try_into().expect("bench n <= MaxSettleBatch");
 
         #[extrinsic_call]
-        _(RawOrigin::Signed(caller), bv, bond);
+        _(RawOrigin::Signed(caller), entries, bond);
     }
 
     /// Bench `attest_batch_settle` across Linear<1, MAX_BATCH_BENCH>. The
@@ -981,97 +950,20 @@ mod benchmarks {
         _(RawOrigin::Signed(caller), bv);
     }
 
-    // ---- Task #84 (mis-sec P1) — bond + slash benches -------------------
+    // ---- Bond lifecycle benches ------------------------------------------
     //
-    // Single-shot benches for the three new extrinsics. We use 500M
-    // ref_time placeholders in the weight expression (matches the sec-
-    // review F1 pattern from PR #36); the production materios-runtime
-    // pass will replace these with bench-cli output once the wiring PR
-    // (after this) lands.
-    //
-    // Bench-cli command (run via downstream materios-runtime):
-    //   frame-omni-bencher v1 benchmark pallet \
-    //     --runtime <materios_runtime.compact.compressed.wasm> \
-    //     --pallet pallet_intent_settlement \
-    //     --extrinsic post_settlement_bond,release_settlement_bond,
-    //                 slash_bad_settlement_evidence \
-    //     --steps 10 --repeat 5 --genesis-builder runtime
+    // Each bench measures its call's most expensive branch with a real
+    // reserved bond. Threshold verification is charged separately by
+    // `threshold_signatures`, so the committee calls carry one signature.
     // ---------------------------------------------------------------------
 
-    /// Bench `post_settlement_bond` — phase 0 of the #84 bond lifecycle.
-    /// Pre-seeds a `request_settle` pending entry so the call exercises
-    /// only the `Currency::reserve` cost + the storage rewrite.
+    /// Bench `post_settlement_bond` on an unbonded request stored before
+    /// request-time bonding.
     #[benchmark]
     fn post_settlement_bond() {
-        use crate::pallet::{ClaimSettlementRequests, Claims, Vouchers};
-        let mut id_bytes = [0u8; 32];
-        id_bytes[..4].copy_from_slice(b"PBND");
-        let claim_id = ClaimId::from(id_bytes);
-        let intent_id = IntentId::from(id_bytes);
-        let amount: u64 = 1_000;
-        let payment_hash = [0xB1u8; 28];
-        let mut addr = sp_std::vec::Vec::with_capacity(57);
-        addr.push(0x01u8);
-        addr.extend_from_slice(&payment_hash);
-        addr.extend_from_slice(&[0xB1u8; 28]);
-        let addr_bv = frame_support::BoundedVec::<u8, sp_core::ConstU32<MAX_CARDANO_ADDR>>::try_from(
-            addr,
-        )
-        .unwrap();
-        let bfpr = BatchFairnessProof {
-            batch_block_range: (1, 1),
-            sorted_intent_ids: frame_support::BoundedVec::try_from(
-                sp_std::vec![intent_id],
-            )
-            .unwrap(),
-            requested_amounts_ada: frame_support::BoundedVec::try_from(
-                sp_std::vec![amount],
-            )
-            .unwrap(),
-            pool_balance_ada: 1_000_000_000,
-            pro_rata_scale_bps: 10_000,
-            awarded_amounts_ada: frame_support::BoundedVec::try_from(
-                sp_std::vec![amount],
-            )
-            .unwrap(),
-        };
-        let bfpr_d = compute_fairness_proof_digest(&bfpr);
-        let voucher = Voucher {
-            claim_id,
-            policy_id: PolicyId::from([0u8; 32]),
-            beneficiary_cardano_addr: addr_bv,
-            amount_ada: amount,
-            batch_fairness_proof_digest: bfpr_d,
-            issued_block: 1,
-            expiry_slot_cardano: 100_000,
-            committee_sigs: Default::default(),
-        };
-        Vouchers::<T>::insert(claim_id, voucher);
-        Claims::<T>::insert(
-            claim_id,
-            Claim {
-                intent_id,
-                policy_id: PolicyId::from([0u8; 32]),
-                amount_ada: amount,
-                issued_block: 1,
-                expiry_slot_cardano: 100_000,
-                settled: false,
-                settled_direct: false,
-                cardano_tx_hash: [0u8; 32],
-            },
-        );
-
+        let (claim_id, evidence) = seed_settleable_claim::<T>(b"PBND", 0);
         let caller: T::AccountId = whitelisted_caller();
-        let mc_g = T::MainchainGenesisHash::get();
-        let evidence = SettlementEvidence {
-            cardano_tx_hash: [0xFFu8; 32],
-            observed_at_depth: T::MinFinalityDepth::get(),
-            observed_slot: 12_345_678,
-            beneficiary_addr_hash: payment_hash,
-            amount_lovelace: amount,
-            mainchain_genesis_hash: mc_g,
-        };
-        ClaimSettlementRequests::<T>::insert(
+        crate::pallet::ClaimSettlementRequests::<T>::insert(
             claim_id,
             SettlementRequestRecord::<T::AccountId, BlockNumberFor<T>> {
                 requester: caller.clone(),
@@ -1088,22 +980,14 @@ mod benchmarks {
         _(RawOrigin::Signed(caller), claim_id, bond);
     }
 
-    /// Bench `release_settlement_bond` — phase 2 of the #84 lifecycle.
-    /// Pre-seeds an attested + bonded entry so the call exercises only
-    /// the `Currency::unreserve` cost + storage cleanup.
+    /// Bench `release_settlement_bond` on an expired, unattested request:
+    /// it reads and removes the request row on top of the refund and the
+    /// side-record removals the attested branch also performs.
     #[benchmark]
     fn release_settlement_bond() {
-        use crate::pallet::{BondedClaimAttestedAt, BondedClaimRequester};
-        let mut id_bytes = [0u8; 32];
-        id_bytes[..4].copy_from_slice(b"REBN");
-        let claim_id = ClaimId::from(id_bytes);
+        let (claim_id, evidence) = seed_settleable_claim::<T>(b"REBN", 0);
+        seed_expired_bonded_request::<T>(claim_id, evidence, 0);
         let caller: T::AccountId = whitelisted_caller();
-        BondedClaimAttestedAt::<T>::insert(claim_id, BlockNumberFor::<T>::from(0u32));
-        frame_system::Pallet::<T>::set_block_number(T::BondReleaseDelayBlocks::get().into());
-        let bond = T::MinSettlementBond::get().max(1);
-        T::Currency::reserve_named(&SETTLEMENT_BOND_RESERVE_ID, &caller, fund_bond::<T>(&caller, bond))
-            .expect("funded bond");
-        BondedClaimRequester::<T>::insert(claim_id, (caller.clone(), bond));
 
         #[extrinsic_call]
         _(RawOrigin::Signed(caller), claim_id);
@@ -1111,104 +995,32 @@ mod benchmarks {
 
     /// Bench `slash_bad_settlement_evidence` against a reserved bond of at
     /// least 2, so a split such as Materios' 50% pays both the watcher and
-    /// the treasury, with one valid FRV2 signature from the calling
-    /// committee member. Further signatures are charged by
-    /// `threshold_signatures`.
+    /// the treasury.
     #[benchmark]
     fn slash_bad_settlement_evidence() {
-        use crate::pallet::{ClaimSettlementRequests, Claims, MinSignerThreshold, Vouchers};
-        use parity_scale_codec::Decode;
-        let mut id_bytes = [0u8; 32];
-        id_bytes[..4].copy_from_slice(b"SLBE");
-        let claim_id = ClaimId::from(id_bytes);
-        let intent_id = IntentId::from(id_bytes);
-        let amount: u64 = 1_000;
-        let payment_hash = [0xB1u8; 28];
-        let mut addr = sp_std::vec::Vec::with_capacity(57);
-        addr.push(0x01u8);
-        addr.extend_from_slice(&payment_hash);
-        addr.extend_from_slice(&[0xB1u8; 28]);
-        let addr_bv = frame_support::BoundedVec::<u8, sp_core::ConstU32<MAX_CARDANO_ADDR>>::try_from(
-            addr,
-        )
-        .unwrap();
-        let bfpr = BatchFairnessProof {
-            batch_block_range: (1, 1),
-            sorted_intent_ids: frame_support::BoundedVec::try_from(
-                sp_std::vec![intent_id],
-            )
-            .unwrap(),
-            requested_amounts_ada: frame_support::BoundedVec::try_from(
-                sp_std::vec![amount],
-            )
-            .unwrap(),
-            pool_balance_ada: 1_000_000_000,
-            pro_rata_scale_bps: 10_000,
-            awarded_amounts_ada: frame_support::BoundedVec::try_from(
-                sp_std::vec![amount],
-            )
-            .unwrap(),
-        };
-        let bfpr_d = compute_fairness_proof_digest(&bfpr);
-        let voucher = Voucher {
-            claim_id,
-            policy_id: PolicyId::from([0u8; 32]),
-            beneficiary_cardano_addr: addr_bv,
-            amount_ada: amount,
-            batch_fairness_proof_digest: bfpr_d,
-            issued_block: 1,
-            expiry_slot_cardano: 100_000,
-            committee_sigs: Default::default(),
-        };
-        Vouchers::<T>::insert(claim_id, voucher);
-        Claims::<T>::insert(
-            claim_id,
-            Claim {
-                intent_id,
-                policy_id: PolicyId::from([0u8; 32]),
-                amount_ada: amount,
-                issued_block: 1,
-                expiry_slot_cardano: 100_000,
-                settled: false,
-                settled_direct: false,
-                cardano_tx_hash: [0u8; 32],
-            },
-        );
-
-        let key_type = sp_core::crypto::KeyTypeId(*b"sett");
-        let public = sp_io::crypto::sr25519_generate(
-            key_type,
-            Some(b"//settlement-slash-benchmark".to_vec()),
-        );
-        let caller = T::AccountId::decode(&mut &public.0[..])
-            .expect("runtime account decodes a committee public key");
-        T::BenchmarkHelper::whitelist_as_committee(&caller);
-        MinSignerThreshold::<T>::put(1);
+        let (claim_id, evidence) = seed_settleable_claim::<T>(b"SLBE", 0);
+        let (caller, public) = committee_signer::<T>(b"//settlement-slash-benchmark");
         let treasury: T::AccountId = T::SettlementTreasuryPalletId::get().into_account_truncating();
         for receiver in [&caller, &treasury] {
             let _ = T::Currency::make_free_balance_be(receiver, T::Currency::minimum_balance());
         }
         let requester: T::AccountId = account("requester", 0, 0);
         let bond = T::MinSettlementBond::get().max(2);
-        T::Currency::reserve_named(&SETTLEMENT_BOND_RESERVE_ID, &requester, fund_bond::<T>(&requester, bond))
-            .expect("funded bond");
-
+        T::Currency::reserve_named(
+            &SETTLEMENT_BOND_RESERVE_ID,
+            &requester,
+            fund_bond::<T>(&requester, bond),
+        )
+        .expect("funded bond");
         let record = SettlementRequestRecord::<T::AccountId, BlockNumberFor<T>> {
             requester,
-            evidence: SettlementEvidence {
-                cardano_tx_hash: [0xFFu8; 32],
-                observed_at_depth: T::MinFinalityDepth::get(),
-                observed_slot: 12_345_678,
-                beneficiary_addr_hash: payment_hash,
-                amount_lovelace: amount,
-                mainchain_genesis_hash: T::MainchainGenesisHash::get(),
-            },
+            evidence,
             settled_direct: false,
             submitted_block: <frame_system::Pallet<T>>::block_number(),
             bond_amount: bond,
         };
         let proof = crate::types::FraudProof::WrongAmount {
-            actual_lovelace: (amount as u128).saturating_add(1),
+            actual_lovelace: (evidence.amount_lovelace as u128).saturating_add(1),
         };
         let payload = slash_bad_settlement_evidence_payload(
             &Pallet::<T>::materios_chain_id_bytes(),
@@ -1216,11 +1028,75 @@ mod benchmarks {
             &record,
             &proof,
         );
-        let signature = sp_io::crypto::sr25519_sign(key_type, &public, &payload)
+        let signature = sp_io::crypto::sr25519_sign(SIGNER_KEY_TYPE, &public, &payload)
             .expect("benchmark key was generated");
-        ClaimSettlementRequests::<T>::insert(claim_id, record);
+        crate::pallet::ClaimSettlementRequests::<T>::insert(claim_id, record);
 
         #[extrinsic_call]
         _(RawOrigin::Signed(caller), claim_id, proof, sp_std::vec![(public.0, signature.0)]);
     }
+
+    /// Bench `supersede_settlement_request` displacing a bonded request, so
+    /// the refund and the settle transitions are both measured. The claim's
+    /// intent sits last in a full `PendingBatches`, the longest scan its
+    /// removal can take.
+    #[benchmark]
+    fn supersede_settlement_request() {
+        let (claim_id, evidence) = seed_settleable_claim::<T>(b"SPSD", 0);
+        seed_expired_bonded_request::<T>(claim_id, evidence, 0);
+        let intent_id = crate::pallet::Claims::<T>::get(claim_id).expect("seeded claim").intent_id;
+        crate::pallet::Intents::<T>::insert(
+            intent_id,
+            Intent {
+                submitter: whitelisted_caller(),
+                nonce: 0,
+                kind: IntentKind::RequestPayout {
+                    policy_id: PolicyId::from([0u8; 32]),
+                    oracle_evidence: Default::default(),
+                },
+                submitted_block: 1,
+                ttl_block: 1_000_000,
+                status: IntentStatus::Vouchered,
+            },
+        );
+        let capacity = <T as Config>::MaxPendingBatches::get();
+        let mut pending: Vec<IntentId> = (1..capacity)
+            .map(|index| {
+                let mut id = [0u8; 32];
+                id[..4].copy_from_slice(&index.to_be_bytes());
+                id[4..8].copy_from_slice(b"PEND");
+                IntentId::from(id)
+            })
+            .collect();
+        pending.push(intent_id);
+        crate::pallet::PendingBatches::<T>::put(
+            frame_support::BoundedVec::try_from(pending).expect("capacity entries"),
+        );
+        let (caller, public) = committee_signer::<T>(b"//settlement-supersede-benchmark");
+        let voucher = crate::pallet::Vouchers::<T>::get(claim_id).expect("seeded voucher");
+        let payload = settle_claim_attested_payload(
+            &Pallet::<T>::materios_chain_id_bytes(),
+            &claim_id,
+            &Pallet::<T>::compute_canonical_voucher_digest(&voucher).expect("seeded voucher"),
+            &evidence.cardano_tx_hash,
+            false,
+            &evidence.beneficiary_addr_hash,
+            evidence.amount_lovelace,
+            evidence.observed_at_depth,
+            evidence.observed_slot,
+            &evidence.mainchain_genesis_hash,
+        );
+        let signature = sp_io::crypto::sr25519_sign(SIGNER_KEY_TYPE, &public, &payload)
+            .expect("benchmark key was generated");
+
+        #[extrinsic_call]
+        _(
+            RawOrigin::Signed(caller),
+            claim_id,
+            false,
+            evidence,
+            sp_std::vec![(public.0, signature.0)],
+        );
+    }
+
 }
