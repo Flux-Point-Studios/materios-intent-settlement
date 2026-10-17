@@ -270,16 +270,36 @@ impl crate::weights::WeightInfo for BondWeights {
     }
 
     fn post_settlement_bond() -> frame_support::weights::Weight {
-        frame_support::weights::Weight::from_parts(1_100_000_000, 42_000)
+        frame_support::weights::Weight::from_parts(648_885_000, 3_533)
     }
 
     fn slash_bad_settlement_evidence() -> frame_support::weights::Weight {
-        frame_support::weights::Weight::from_parts(2_900_000_000, 168_000)
+        frame_support::weights::Weight::from_parts(1_095_540_000, 14_132)
     }
 
     fn release_settlement_bond() -> frame_support::weights::Weight {
-        frame_support::weights::Weight::from_parts(1_100_000_000, 42_000)
+        frame_support::weights::Weight::from_parts(648_885_000, 3_533)
     }
+}
+
+#[test]
+fn bond_weight_examples_use_the_gemtek_checkpoint_benchmark() {
+    use crate::weights::WeightInfo;
+    use frame_support::weights::Weight;
+    let checkpoint = Weight::from_parts(148_885_000, 3_533);
+    let base = Weight::from_parts(500_000_000, 0);
+    assert_eq!(
+        BondWeights::post_settlement_bond(),
+        base.saturating_add(checkpoint)
+    );
+    assert_eq!(
+        BondWeights::release_settlement_bond(),
+        base.saturating_add(checkpoint)
+    );
+    assert_eq!(
+        BondWeights::slash_bad_settlement_evidence(),
+        base.saturating_add(checkpoint.saturating_mul(4))
+    );
 }
 
 #[test]
@@ -7356,4 +7376,3 @@ mod max_submit_batch_boundary {
         });
     }
 }
-
