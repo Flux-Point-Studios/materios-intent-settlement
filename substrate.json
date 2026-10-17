@@ -4,7 +4,7 @@
     {
       "id": "intent-settlement-pallet",
       "name": "Intent settlement pallet",
-      "desc": "Intent settlement on Materios: policy and refund intents go through committee attestation, vouchers, settlement or expiry, with settlement bonds and slashing charged through runtime-defined dispatch weights and integration examples tied to Materios' Gemtek checkpoint benchmark.",
+      "desc": "Intent settlement on Materios: fresh genesis requires evidence-bound settlement and expiry, expired settlement requests can be replaced with bond refunds, fraud signatures bind each request, and threshold bundles carry measured per-signature weights with post-dispatch refunds. Runtime-defined Currency weights cover reserve, release and slashing bookkeeping.",
       "kind": "pallet",
       "paths": [
         "pallets/intent-settlement"

@@ -1,24 +1,6 @@
-//! Benchmarks for `pallet_intent_settlement::settle_batch_atomic` (Task #177).
-//!
-//! These run via `frame-omni-bencher` or a downstream runtime's
-//! `cargo run --release --features runtime-benchmarks -- benchmark pallet
-//! --pallet pallet_intent_settlement --extrinsic settle_batch_atomic`.
-//!
-//! The goal is to confirm the cost slope: weight(N=256) / weight(N=1) is
-//! sublinear (~10x, NOT ~256x), because the dominant per-call cost — the
-//! M-of-N signature verification — is shared across the whole batch.
-//!
-//! Per `feedback_chain_weight_is_the_real_user_tps_ceiling.md` the chain's
-//! existing `settle_claim` consumes ~50M ref_time (largely sig-verify). The
-//! batch path expects:
-//!   - N=1   : ~55M ref_time   (1.1x baseline; small overhead from STBA hash)
-//!   - N=8   : ~70M ref_time   (1.4x baseline)
-//!   - N=64  : ~150M ref_time  (3.0x baseline)
-//!   - N=256 : ~400M ref_time  (8.0x baseline) — but settling 256 claims
-//!
-//! That means a 256-batch fits comfortably in one block (block budget
-//! ~1.5s ref_time on spec-204 normal class) while a 256-call equivalent
-//! via the legacy single-claim path would require 256/2 = 128 blocks.
+//! FRAME benchmarks for settlement mutation and threshold verification.
+//! The signature benchmark explicitly uses real sr25519 verification.
+//! Reproduction and sample bounds: docs/settlement-genesis-safety.md.
 
 #![cfg(feature = "runtime-benchmarks")]
 
@@ -94,8 +76,55 @@ where
 mod benchmarks {
     use super::*;
 
+    /// Includes full-committee decoding and real crypto even when the host
+    /// runtime uses BenchAllowAnyVerifier for its other benchmarks.
+    #[benchmark]
+    fn threshold_signatures(s: Linear<1, { T::MaxCommittee::get() }>) {
+        use parity_scale_codec::Decode;
+        let payload = [0x5Au8; 32];
+        let key_type = sp_core::crypto::KeyTypeId(*b"sett");
+        let mut signatures = Vec::new();
+        for index in 0..T::MaxCommittee::get() {
+            let seed = alloc::format!("//settlement-signature-benchmark/{index}");
+            let public = sp_io::crypto::sr25519_generate(key_type, Some(seed.as_bytes().to_vec()));
+            let account = T::AccountId::decode(&mut &public.0[..])
+                .expect("runtime account decodes a committee public key");
+            T::BenchmarkHelper::whitelist_as_committee(&account);
+            assert!(T::CommitteeMembership::is_member(&account));
+            let signature = sp_io::crypto::sr25519_sign(key_type, &public, &payload)
+                .expect("benchmark key was generated");
+            signatures.push((public.0, signature.0));
+        }
+        assert_eq!(
+            T::CommitteeMembership::member_count(),
+            T::MaxCommittee::get()
+        );
+        signatures.sort_unstable_by_key(|(key, _)| *key);
+        signatures.reverse();
+        signatures.truncate(s as usize);
+        let caller = T::CommitteeMembership::account_of_pubkey(&signatures[s as usize - 1].0)
+            .expect("benchmark signer belongs to committee");
+        crate::pallet::MinSignerThreshold::<T>::put(1);
+        let mut checked = 0;
+
+        #[block]
+        {
+            Pallet::<T>::verify_threshold_signatures::<crate::Sr25519Verifier>(
+                &payload,
+                &caller,
+                &signatures,
+                &mut checked,
+            )
+            .expect("valid benchmark bundle");
+        }
+
+        assert_eq!(checked, s);
+    }
+
     #[benchmark]
     fn settle_batch_atomic(n: Linear<1, MAX_BATCH_BENCH>) {
+        crate::pallet::SettlementStorageVersion::<T>::put(0);
+        crate::pallet::StcaCutoverBlock::<T>::kill();
         let mut entries: Vec<SettleBatchEntry> = Vec::with_capacity(n as usize);
         for i in 0..n {
             let cid = seed_vouchered_claim::<T>(i, 1_000);

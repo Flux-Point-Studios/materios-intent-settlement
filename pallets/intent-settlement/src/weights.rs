@@ -35,6 +35,11 @@ use core::marker::PhantomData;
 /// Weight surface used by `pallet_intent_settlement`. Production runtimes
 /// wire `T::WeightInfo = SubstrateWeight<Runtime>` (auto-generated below).
 pub trait WeightInfo {
+    /// Threshold validation, including each signature candidate examined.
+    /// Default measured with Materios' 96-member adapter and RocksDB costs.
+    fn threshold_signatures(s: u32) -> Weight {
+        crate::signature_weights::threshold_signatures(s)
+    }
     fn settle_batch_atomic(n: u32) -> Weight;
     /// Task #84 (mis-sec P1): scaffold weight for `post_settlement_bond`.
     /// 500M ref_time placeholder per the sec-review F1 pattern; the
@@ -43,8 +48,8 @@ pub trait WeightInfo {
     fn post_settlement_bond() -> Weight;
     /// Task #84 (mis-sec P1): scaffold weight for
     /// `slash_bad_settlement_evidence`. 500M ref_time placeholder; the
-    /// real cost is dominated by the M-of-N sig-verify pass + the two
-    /// `repatriate_reserved` storage layers (watcher + treasury).
+    /// base covers two `repatriate_reserved` paths (watcher + treasury).
+    /// Threshold verification is charged separately.
     fn slash_bad_settlement_evidence() -> Weight;
     /// Task #84 (mis-sec P1): scaffold weight for `release_settlement_bond`.
     /// 500M ref_time placeholder; the real cost is dominated by the
@@ -53,11 +58,8 @@ pub trait WeightInfo {
     fn release_settlement_bond() -> Weight;
 }
 
-/// Auto-generated `SubstrateWeight` impl. Mirrors the cost slope measured by
-/// `frame-omni-bencher` on the materios-runtime WASM with
-/// `BenchAllowAnyVerifier` (i.e. sig-verify cost is excluded). The
-/// production runtime budgets in a single sr25519 sig-verify (~50M ref_time)
-/// on top via the `weight!` annotation on the extrinsic call.
+/// Base dispatch costs. Threshold-signature work is charged separately by
+/// each call, using the real-crypto benchmark in `signature_weights`.
 pub struct SubstrateWeight<T>(PhantomData<T>);
 impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
     /// Storage: `OrinqReceipts::CommitteeMembers` (r:1 w:0)

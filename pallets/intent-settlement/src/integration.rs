@@ -314,7 +314,7 @@ fn full_lifecycle_submit_attest_voucher_settle() {
             10_000_000u64,
             cardano_tx,
             deposit_sigs
-        ));
+        ).map_err(|error| error.error));
 
         // Block 2: user submits BuyPolicy intent.
         System::set_block_number(2);
@@ -413,7 +413,7 @@ fn full_lifecycle_submit_attest_voucher_settle() {
             voucher,
             bfpr,
             voucher_sigs
-        ));
+        ).map_err(|error| error.error));
         let intent =
             pallet_intent_settlement::pallet::Intents::<Testnet>::get(expected_id)
                 .unwrap();
@@ -433,7 +433,7 @@ fn full_lifecycle_submit_attest_voucher_settle() {
             [0xDE; 32],
             false,
             settle_sigs
-        ));
+        ).map_err(|error| error.error));
         let intent =
             pallet_intent_settlement::pallet::Intents::<Testnet>::get(expected_id)
                 .unwrap();
@@ -591,7 +591,7 @@ fn rv_setup_attested(
         10_000_000u64,
         cardano_tx,
         crdp_sigs
-    ));
+    ).map_err(|error| error.error));
 
     // 3. submit_intent.
     assert_ok!(IntentSettlement::submit_intent(
@@ -671,7 +671,7 @@ fn task174_request_voucher_t2_happy_path_real_sr25519() {
             voucher,
             bfpr,
             sigs
-        ));
+        ).map_err(|error| error.error));
         let intent =
             pallet_intent_settlement::pallet::Intents::<Testnet>::get(intent_id)
                 .unwrap();
@@ -695,7 +695,7 @@ fn task174_request_voucher_t3_below_threshold_rejected() {
                 voucher,
                 bfpr,
                 sigs
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Testnet>::InsufficientSignatures
         );
     });
@@ -719,7 +719,7 @@ fn task174_request_voucher_t4_above_threshold_accepted() {
             voucher,
             bfpr,
             sigs
-        ));
+        ).map_err(|error| error.error));
         let intent =
             pallet_intent_settlement::pallet::Intents::<Testnet>::get(intent_id)
                 .unwrap();
@@ -749,7 +749,7 @@ fn task174_request_voucher_t5_bad_sig_over_wrong_preimage_rejected() {
                 voucher,
                 bfpr,
                 sigs
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Testnet>::InvalidSignature
         );
     });
@@ -772,7 +772,7 @@ fn task174_request_voucher_t6_non_committee_signer_rejected() {
                 voucher,
                 bfpr,
                 sigs
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Testnet>::SignerNotCommitteeMember
         );
     });
@@ -798,7 +798,7 @@ fn task174_request_voucher_t7_duplicate_signer_rejected() {
                 voucher,
                 bfpr,
                 sigs
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Testnet>::DuplicateSigner
         );
     });
@@ -828,7 +828,7 @@ fn task174_request_voucher_t8_caller_not_in_bundle_rejected_epoch_proxy() {
                 voucher,
                 bfpr,
                 sigs
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Testnet>::InsufficientSignatures
         );
     });
@@ -882,7 +882,7 @@ fn task174_request_voucher_t9_preimage_determinism_across_operators() {
             voucher,
             bfpr,
             vec![alice_sig, bob_sig]
-        ));
+        ).map_err(|error| error.error));
     });
 }
 
@@ -931,7 +931,7 @@ fn task211_attest_batch_intents_real_runtime_happy_path() {
             RuntimeOrigin::signed(alice.clone()),
             bv,
             vec![alice_sig, bob_sig],
-        ));
+        ).map_err(|error| error.error));
         for iid in iids.iter() {
             let intent =
                 pallet_intent_settlement::pallet::Intents::<Testnet>::get(iid)
@@ -974,7 +974,7 @@ fn task210_submit_batch_intents_atomic_revert_real_runtime() {
             100_000_000u64,
             cardano_tx,
             crdp_sigs
-        ));
+        ).map_err(|error| error.error));
 
         let nonce_before = pallet_intent_settlement::pallet::Nonces::<Testnet>::get(
             &user,
@@ -1060,7 +1060,7 @@ fn task211_attest_batch_intents_real_runtime_atomic_revert() {
             RuntimeOrigin::signed(alice.clone()),
             bv,
             vec![alice_sig, bob_sig],
-        );
+        ).map_err(|error| error.error);
         assert!(res.is_err(), "expected atomic revert on bogus intent");
         // Both real intents STILL Pending (atomic).
         for iid in iids.iter() {
@@ -1109,7 +1109,7 @@ fn task212_request_batch_vouchers_real_runtime_happy_path() {
             amount * 4,
             cardano_tx,
             crdp_sigs,
-        ));
+        ).map_err(|error| error.error));
 
         let mut iids: Vec<IntentId> = Vec::new();
         for seed in [0xA1u8, 0xA2u8] {
@@ -1214,7 +1214,7 @@ fn task212_request_batch_vouchers_real_runtime_happy_path() {
             RuntimeOrigin::signed(alice.clone()),
             bv,
             vec![alice_sig, bob_sig],
-        ));
+        ).map_err(|error| error.error));
         for entry in entries.iter() {
             let intent =
                 pallet_intent_settlement::pallet::Intents::<Testnet>::get(entry.intent_id)
@@ -1254,7 +1254,7 @@ fn task210_submit_batch_intents_happy_path_real_runtime() {
             10_000_000u64,
             cardano_tx,
             crdp_sigs
-        ));
+        ).map_err(|error| error.error));
 
         let entries: Vec<SubmitIntentEntry> = (0..5u8)
             .map(|i| SubmitIntentEntry {
@@ -1326,7 +1326,7 @@ fn task266_full_lifecycle_attested_settle_real_sr25519() {
             10_000_000u64,
             cardano_tx,
             deposit_sigs
-        ));
+        ).map_err(|error| error.error));
         System::set_block_number(2);
         let kind = IntentKind::BuyPolicy {
             product_id: H256::from([1; 32]),
@@ -1401,7 +1401,7 @@ fn task266_full_lifecycle_attested_settle_real_sr25519() {
             voucher.clone(),
             bfpr,
             voucher_sigs
-        ));
+        ).map_err(|error| error.error));
 
         // Block 5: NEW PATH — request_settle + attest_settle.
         System::set_block_number(5);
@@ -1454,7 +1454,7 @@ fn task266_full_lifecycle_attested_settle_real_sr25519() {
             RuntimeOrigin::signed(alice.clone()),
             claim_id,
             attest_sigs,
-        ));
+        ).map_err(|error| error.error));
 
         // Post-state: claim settled, pending request consumed, intent terminal.
         let claim =
@@ -1522,7 +1522,7 @@ fn task267_full_lifecycle_attested_expire_real_sr25519() {
             10_000_000u64,
             cardano_tx,
             deposit_sigs
-        ));
+        ).map_err(|error| error.error));
         System::set_block_number(2);
         let product_id = H256::from([0x77; 32]);
         let kind = IntentKind::BuyPolicy {
@@ -1597,7 +1597,7 @@ fn task267_full_lifecycle_attested_expire_real_sr25519() {
             RuntimeOrigin::signed(alice.clone()),
             intent_id,
             attest_sigs,
-        ));
+        ).map_err(|error| error.error));
 
         // Post-state: intent expired, pending expire request consumed.
         let intent =
@@ -1619,5 +1619,109 @@ fn task267_full_lifecycle_attested_expire_real_sr25519() {
             !pallet_intent_settlement::pallet::PreAuditExpiry::<Testnet>::get(intent_id),
             "EXPP path MUST NOT flag as pre-audit (only legacy expire_policy_mirror does)"
         );
+    });
+}
+
+
+#[test]
+fn genesis_safety_fraud_bundle_cannot_slash_a_replacement_request() {
+    use crate::pallet::{ClaimSettlementRequests, Error};
+    use frame_support::{
+        assert_noop,
+        traits::{Currency, ReservableCurrency},
+    };
+    use sp_runtime::traits::AccountIdConversion;
+    new_ext().execute_with(|| {
+        let (alice, bob, _) = committee_accounts();
+        let cid = H256::repeat_byte(0xE7);
+        let evidence = SettlementEvidence {
+            cardano_tx_hash: [0x33; 32],
+            observed_at_depth: 15,
+            observed_slot: 123,
+            beneficiary_addr_hash: [0x22; 28],
+            amount_lovelace: 1_000,
+            mainchain_genesis_hash: TestMainchainGenesisHash::get(),
+        };
+        let proof = FraudProof::TxNotFound;
+        let mut legacy_body = TEST_CHAIN_ID.to_vec();
+        legacy_body.extend_from_slice(cid.as_bytes());
+        legacy_body.extend_from_slice(&proof.encode());
+        let legacy = domain_hash(*b"FRAU", &legacy_body);
+        let requester = sp_runtime::AccountId32::new([0x77; 32]);
+        let treasury: sp_runtime::AccountId32 =
+            TestSettlementTreasuryPalletId::get().into_account_truncating();
+        for account in [&requester, &alice, &treasury] {
+            let _ = Balances::deposit_creating(account, 2_000);
+        }
+        assert_ok!(Balances::reserve(&requester, 500));
+        let mut record = SettlementRequestRecord {
+            requester: requester.clone(),
+            evidence,
+            settled_direct: false,
+            submitted_block: 1u64,
+            bond_amount: 500,
+        };
+        let digest_for = |record: &SettlementRequestRecord<sp_runtime::AccountId32, u64>| {
+            let request = (
+                crate::account_to_bytes(&record.requester),
+                record.submitted_block,
+                record.evidence,
+                record.settled_direct,
+            )
+                .encode();
+            let mut body = TEST_CHAIN_ID.to_vec();
+            body.extend_from_slice(cid.as_bytes());
+            body.extend_from_slice(&sp_io::hashing::blake2_256(&request));
+            body.extend_from_slice(&proof.encode());
+            domain_hash(*b"FRV2", &body)
+        };
+        let expired_digest = digest_for(&record);
+        record.submitted_block = 102;
+        System::set_block_number(102);
+        ClaimSettlementRequests::<Testnet>::insert(cid, record.clone());
+        for stale in [legacy, expired_digest] {
+            assert_noop!(
+                IntentSettlement::slash_bad_settlement_evidence(
+                    RuntimeOrigin::signed(alice.clone()),
+                    cid,
+                    proof.clone(),
+                    vec![sign_with("//Alice", &stale), sign_with("//Bob", &stale)]
+                )
+                .map_err(|error| error.error),
+                Error::<Testnet>::InvalidSignature
+            );
+            assert_eq!(Balances::reserved_balance(&requester), 500);
+        }
+        let current = digest_for(&record);
+        let narrow_block_record = SettlementRequestRecord {
+            requester: record.requester.clone(),
+            evidence: record.evidence,
+            settled_direct: record.settled_direct,
+            submitted_block: 102u32,
+            bond_amount: record.bond_amount,
+        };
+        assert_eq!(
+            crate::slash_bad_settlement_evidence_payload(
+                &TEST_CHAIN_ID,
+                &cid,
+                &narrow_block_record,
+                &proof,
+            ),
+            current
+        );
+        assert_eq!(
+            current,
+            hex_literal::hex!("a99ffae513bd71d6be7825c6bd7853f816fbf6ec22d1f24b7e312a7926e92437")
+        );
+        assert_ok!(IntentSettlement::slash_bad_settlement_evidence(
+            RuntimeOrigin::signed(alice),
+            cid,
+            proof,
+            vec![sign_with("//Alice", &current), sign_with("//Bob", &current)]
+        )
+        .map_err(|error| error.error));
+        assert_eq!(Balances::reserved_balance(&requester), 0);
+        assert!(!ClaimSettlementRequests::<Testnet>::contains_key(cid));
+        assert_ne!(requester, bob);
     });
 }
