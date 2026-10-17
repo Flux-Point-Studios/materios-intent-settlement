@@ -4,7 +4,7 @@
     {
       "id": "intent-settlement-pallet",
       "name": "Intent settlement pallet",
-      "desc": "Intent settlement on Materios: requests atomically reserve a positive runtime-minimum bond; request-scoped slash tombstones preserve honest replacement, expired requests refund available reserves with explicit deficit events, fresh genesis closes legacy paths, and FRV2 fraud signatures bind each request. Signature preflight and measured weights bound verification; try-runtime checks version and cutover invariants.",
+      "desc": "Intent settlement on Materios: requests reserve a positive runtime-minimum bond in a named Balances reserve; slash tombstones are request-scoped, and an M-of-N committee supersede settles claims that unslashable junk would block. Expired requests refund with explicit deficit events, fresh genesis closes legacy paths, FRV2 binds each fraud allegation to its request, and every digest tag is a metadata constant. Bundles are scanned before verification, bond paths carry measured weights, and try-runtime checks versions, cutovers and bond backing.",
       "kind": "pallet",
       "paths": [
         "pallets/intent-settlement"
@@ -37,7 +37,7 @@
     {
       "id": "is-keeper",
       "name": "Settlement keeper",
-      "desc": "Off-chain keeper that turns voucher batches into Cardano payout transactions, waits for confirmation and files bonded settlement requests using the runtime MinSettlementBond constant.",
+      "desc": "Off-chain keeper that turns voucher batches into Cardano payout transactions, waits for confirmation and settles them on Materios from chain state: it files bonded requests, attests or supersedes blocking requests, marks claims settled only when the chain does, and releases its bonds.",
       "kind": "agent",
       "paths": [
         "keeper"
@@ -51,7 +51,7 @@
     {
       "id": "is-sdk",
       "name": "Intent settlement SDK",
-      "desc": "TypeScript client for building, signing and submitting settlement intents.",
+      "desc": "TypeScript client for building, signing and submitting settlement intents; rejects extrinsics whose dispatch failed and reads settlement requests, attested bonds and runtime constants.",
       "kind": "toolkit",
       "paths": [
         "sdk"

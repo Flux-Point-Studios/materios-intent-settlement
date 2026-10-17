@@ -1333,14 +1333,12 @@ pub mod pallet {
             requester: T::AccountId,
             amount: u128,
         },
-        /// Task #84 (mis-sec P1): a `slash_bad_settlement_evidence` call
-        /// succeeded. The reserved bond is split: `watcher_share` units
-        /// go to the caller (the watcher who posted the fraud proof);
-        /// `treasury_share` units go to the
-        /// `SettlementTreasuryPalletId`-derived treasury account. The
-        /// `fraud_proof` discriminant is surfaced so explorers can
-        /// distinguish WrongAmount vs TxNotFound vs WrongBeneficiary
-        /// without re-decoding the pre-image.
+        /// A `slash_bad_settlement_evidence` call succeeded. `watcher_share`
+        /// units moved to the caller and `treasury_share` units to the
+        /// `SettlementTreasuryPalletId`-derived treasury account, as far as
+        /// the settlement reserve held them. The `fraud_proof` discriminant
+        /// is surfaced so explorers can distinguish WrongAmount vs
+        /// TxNotFound vs WrongBeneficiary without re-decoding the pre-image.
         SettlementBondSlashed {
             claim_id: ClaimId,
             requester: T::AccountId,
@@ -1349,18 +1347,16 @@ pub mod pallet {
             treasury_share: u128,
             fraud_proof: FraudProof,
         },
-        /// Task #84 (mis-sec P1): a `release_settlement_bond` call
-        /// succeeded — the requester's reserved units are unreserved and
-        /// returned to their free balance. Emits in both the
-        /// requester-initiated and the keeper-initiated release path
-        /// (anyone can call once the delay has elapsed and the request
-        /// wasn't slashed).
+        /// A bond returned to its requester's free balance by release,
+        /// replacement or supersede; `amount` is what the settlement reserve
+        /// returned.
         SettlementBondReleased {
             claim_id: ClaimId,
             requester: T::AccountId,
             amount: u128,
         },
-        /// A shared-reserve deficit was observed while returning a bond.
+        /// The settlement reserve held less than a bond being returned or
+        /// slashed; `missing_amount` was not moved.
         SettlementBondReserveDeficit {
             claim_id: ClaimId,
             requester: T::AccountId,
@@ -4415,7 +4411,7 @@ pub mod pallet {
         /// - Claim must not already be attested (`RequestAlreadyAttested`)
         ///   — bonds MUST be posted before `attest_settle` lands.
         ///
-        /// On success: `Currency::reserve(who, amount)` succeeds,
+        /// On success: `amount` is reserved under `SETTLEMENT_BOND_RESERVE_ID`,
         /// `ClaimSettlementRequests[claim_id].bond_amount` is rewritten
         /// to `amount`, and `SettlementBondPosted` is emitted.
         #[pallet::call_index(19)]
@@ -4489,14 +4485,16 @@ pub mod pallet {
         /// - Caller binding: the watcher's own pubkey MUST appear in
         ///   the sig bundle (`ensure_threshold_signatures` enforces).
         ///
-        /// On success: the bond is repatriated via
-        /// `Currency::repatriate_reserved` (watcher gets
-        /// `bond * watcher_bps / 10_000`, treasury gets the rest),
+        /// On success: the bond moves out of the requester's
+        /// `SETTLEMENT_BOND_RESERVE_ID` reserve (watcher gets
+        /// `bond * watcher_bps / 10_000`, treasury gets the rest, and a
+        /// shortfall in that reserve is reported in
+        /// `SettlementBondReserveDeficit`),
         /// `SlashedSettlementRequests[claim_id, request_id]` is set, the
         /// `ClaimSettlementRequests` row is removed (so
         /// `attest_settle` errors with `SettlementRequestMissing`),
-        /// and `SettlementBondSlashed` is emitted. Any other request for
-        /// the claim can then be filed and attested.
+        /// and `SettlementBondSlashed` is emitted with the amounts moved.
+        /// Any other request for the claim can then be filed and attested.
         #[pallet::call_index(20)]
         #[pallet::weight((T::WeightInfo::slash_bad_settlement_evidence()
             .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
