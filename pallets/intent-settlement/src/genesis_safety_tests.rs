@@ -1157,3 +1157,204 @@ fn genesis_safety_upgrade_checks_ignore_other_pallet_changes() {
         assert_ok!(<IntentSettlement as Hooks<u64>>::post_upgrade(before));
     });
 }
+
+#[test]
+fn genesis_safety_request_rejects_depth_above_maximum() {
+    new_test_ext().execute_with(|| {
+        let (cid, _, voucher) = vouchered_claim_with_voucher(0xA1, 1_000);
+        let mut evidence = settled_evidence_for(&voucher, crate::MAX_OBSERVED_DEPTH + 1, 123);
+        assert_noop!(
+            IntentSettlement::request_settle(
+                RuntimeOrigin::signed(BOB),
+                cid,
+                evidence.cardano_tx_hash,
+                false,
+                evidence,
+                1
+            ),
+            Error::<Test>::FinalityDepthAboveMaximum
+        );
+        assert_noop!(
+            IntentSettlement::request_batch_settle(
+                RuntimeOrigin::signed(BOB),
+                vec![SettleAttestedBatchEntry {
+                    claim_id: cid,
+                    settled_direct: false,
+                    evidence
+                }]
+                .try_into()
+                .expect("one entry"),
+                1
+            ),
+            Error::<Test>::FinalityDepthAboveMaximum
+        );
+        evidence.observed_at_depth = crate::MAX_OBSERVED_DEPTH;
+        assert_ok!(IntentSettlement::request_settle(
+            RuntimeOrigin::signed(BOB),
+            cid,
+            evidence.cardano_tx_hash,
+            false,
+            evidence,
+            1
+        ));
+    });
+}
+
+/// Files `junk` for the claim from BOB with a bond of 7. Depth `u32::MAX`
+/// is written into storage after filing, as a request stored before the
+/// depth cap would hold it.
+fn file_junk_request(cid: ClaimId, junk: SettlementEvidence) {
+    let mut filed = junk;
+    filed.observed_at_depth = filed.observed_at_depth.min(crate::MAX_OBSERVED_DEPTH);
+    assert_ok!(IntentSettlement::request_settle(
+        RuntimeOrigin::signed(BOB),
+        cid,
+        filed.cardano_tx_hash,
+        false,
+        filed,
+        7
+    ));
+    ClaimSettlementRequests::<Test>::mutate(cid, |request| {
+        request.as_mut().expect("junk request").evidence = junk;
+    });
+}
+
+#[test]
+fn genesis_safety_committee_supersedes_unattestable_junk_and_settles() {
+    for inflate_depth in [true, false] {
+        new_test_ext().execute_with(|| {
+            let (cid, iid, voucher) = vouchered_claim_with_voucher(0xA2, 1_000);
+            let honest = settled_evidence_for(&voucher, 15, 123);
+            let mut junk = honest;
+            if inflate_depth {
+                junk.observed_at_depth = u32::MAX;
+            } else {
+                junk.observed_slot = 999;
+            }
+            let bob_free = Balances::free_balance(BOB);
+            file_junk_request(cid, junk);
+            assert_eq!(Balances::reserved_balance(BOB), 7);
+
+            assert_ok!(IntentSettlement::supersede_settlement_request(
+                RuntimeOrigin::signed(1),
+                cid,
+                false,
+                honest,
+                mock_settle_sigs()
+            )
+            .map_err(|failure| failure.error));
+
+            let claim = Claims::<Test>::get(cid).expect("claim");
+            assert!(claim.settled);
+            assert_eq!(claim.cardano_tx_hash, honest.cardano_tx_hash);
+            assert_eq!(
+                Intents::<Test>::get(iid).expect("intent").status,
+                IntentStatus::Settled
+            );
+            assert!(!ClaimSettlementRequests::<Test>::contains_key(cid));
+            assert!(!BondedClaimRequester::<Test>::contains_key(cid));
+            assert_eq!(Balances::reserved_balance(BOB), 0);
+            assert_eq!(Balances::free_balance(BOB), bob_free);
+            System::assert_has_event(RuntimeEvent::IntentSettlement(
+                Event::SettlementRequestSuperseded {
+                    claim_id: cid,
+                    requester: BOB,
+                },
+            ));
+        });
+    }
+}
+
+#[test]
+fn genesis_safety_supersede_refuses_a_request_with_the_attested_evidence() {
+    new_test_ext().execute_with(|| {
+        let (cid, _, voucher) = vouchered_claim_with_voucher(0xA3, 1_000);
+        let honest = settled_evidence_for(&voucher, 15, 123);
+        file_junk_request(cid, honest);
+        VERIFY_CALLS.with(|count| count.set(0));
+        assert_noop!(
+            IntentSettlement::supersede_settlement_request(
+                RuntimeOrigin::signed(1),
+                cid,
+                false,
+                honest,
+                mock_settle_sigs()
+            )
+            .map_err(|failure| failure.error),
+            Error::<Test>::SupersedeMatchesRequest
+        );
+        assert_eq!(VERIFY_CALLS.with(|count| count.get()), 0);
+    });
+}
+
+#[test]
+fn genesis_safety_supersede_requires_a_committee_threshold() {
+    new_test_ext().execute_with(|| {
+        let (cid, _, voucher) = vouchered_claim_with_voucher(0xA4, 1_000);
+        let honest = settled_evidence_for(&voucher, 15, 123);
+        let mut junk = honest;
+        junk.observed_slot = 999;
+        file_junk_request(cid, junk);
+        let mut forged = mock_settle_sigs();
+        forged[1].1 = [0xFF; 64];
+        for (caller, signatures, error) in [
+            (1, vec![mock_sig_for(1)], Error::<Test>::InsufficientSignatures),
+            (1, forged, Error::<Test>::InvalidSignature),
+            (BOB, mock_settle_sigs(), Error::<Test>::NotCommitteeMember),
+        ] {
+            assert_noop!(
+                IntentSettlement::supersede_settlement_request(
+                    RuntimeOrigin::signed(caller),
+                    cid,
+                    false,
+                    honest,
+                    signatures
+                )
+                .map_err(|failure| failure.error),
+                error
+            );
+        }
+        assert_eq!(
+            ClaimSettlementRequests::<Test>::get(cid).expect("junk stays").evidence,
+            junk
+        );
+        assert_eq!(Balances::reserved_balance(BOB), 7);
+    });
+}
+
+#[test]
+fn genesis_safety_supersede_checks_evidence_like_a_request() {
+    new_test_ext().execute_with(|| {
+        let (cid, _, voucher) = vouchered_claim_with_voucher(0xA5, 1_000);
+        let (unrequested, _, other_voucher) = vouchered_claim_with_voucher(0xA6, 1_000);
+        let honest = settled_evidence_for(&voucher, 15, 123);
+        let mut junk = honest;
+        junk.observed_slot = 999;
+        file_junk_request(cid, junk);
+        let mut wrong_amount = honest;
+        wrong_amount.amount_lovelace += 1;
+        let mut too_deep = honest;
+        too_deep.observed_at_depth = crate::MAX_OBSERVED_DEPTH + 1;
+        for (claim_id, evidence, error) in [
+            (cid, wrong_amount, Error::<Test>::SettlementEvidenceMismatch),
+            (cid, too_deep, Error::<Test>::FinalityDepthAboveMaximum),
+            (
+                unrequested,
+                settled_evidence_for(&other_voucher, 15, 123),
+                Error::<Test>::SettlementRequestMissing,
+            ),
+        ] {
+            assert_noop!(
+                IntentSettlement::supersede_settlement_request(
+                    RuntimeOrigin::signed(1),
+                    claim_id,
+                    false,
+                    evidence,
+                    mock_settle_sigs()
+                )
+                .map_err(|failure| failure.error),
+                error
+            );
+        }
+    });
+}

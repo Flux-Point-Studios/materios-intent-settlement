@@ -118,6 +118,12 @@ pub const EXPP_CUTOVER_GRACE: u32 = 50;
 /// `SettlementStorageVersion` written at genesis and by the final migration step.
 pub const SETTLEMENT_STORAGE_VERSION: u32 = 3;
 
+/// Largest `observed_at_depth` that settlement evidence may claim: Cardano's
+/// security parameter k (2160 blocks on mainnet and preprod). A transaction
+/// k blocks deep is immutable, so deeper claims add no finality, and a
+/// requester whose transaction is deeper claims k.
+pub const MAX_OBSERVED_DEPTH: u32 = 2160;
+
 /// Task #266 (mis-sec P0): domain tag for the **attested** `settle_claim`
 /// payload (split into `request_settle` + `attest_settle`). Replaces the
 /// legacy `STCL` tag with a payload that commits to the FAT observation
@@ -1356,6 +1362,12 @@ pub mod pallet {
             requester: T::AccountId,
             missing_amount: u128,
         },
+        /// The committee settled the claim on its own evidence and displaced
+        /// this requester's pending request, refunding its bond.
+        SettlementRequestSuperseded {
+            claim_id: ClaimId,
+            requester: T::AccountId,
+        },
     }
 
     // ---------------------------------------------------------------------
@@ -1621,6 +1633,11 @@ pub mod pallet {
         /// can tell their `u128` input simply doesn't fit the chain's
         /// configured balance width.
         BondAmountConversionOverflow,
+        /// Settlement evidence claims a depth above `MAX_OBSERVED_DEPTH`.
+        FinalityDepthAboveMaximum,
+        /// The pending request already carries this evidence and mode;
+        /// attest it with `attest_settle` instead.
+        SupersedeMatchesRequest,
     }
 
     // ---------------------------------------------------------------------
@@ -1672,11 +1689,27 @@ pub mod pallet {
     // Hooks — bounded TTL sweep
     // ---------------------------------------------------------------------
 
+    #[pallet::extra_constants]
+    impl<T: Config> Pallet<T> {
+        /// See [`MAX_OBSERVED_DEPTH`].
+        #[pallet::constant_name(MaxObservedDepth)]
+        fn max_observed_depth() -> u32 {
+            MAX_OBSERVED_DEPTH
+        }
+    }
+
     #[pallet::hooks]
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T>
     where
         BlockNumberFor<T>: Into<u64> + Copy,
     {
+        fn integrity_test() {
+            assert!(
+                T::MinFinalityDepth::get() <= MAX_OBSERVED_DEPTH,
+                "MinFinalityDepth exceeds MAX_OBSERVED_DEPTH, so no evidence is acceptable"
+            );
+        }
+
         fn on_initialize(n: BlockNumberFor<T>) -> Weight {
             // Convert to u32 block for the expiry key. Saturating-cast avoids
             // panics on tests that burn through block numbers.
@@ -3417,55 +3450,7 @@ pub mod pallet {
                 Error::<T>::SettlementEvidenceMismatch
             );
 
-            // Mainchain genesis pin — preprod attestor's evidence cannot
-            // settle a mainnet claim and vice versa.
-            ensure!(
-                attestation_evidence.mainchain_genesis_hash
-                    == T::MainchainGenesisHash::get(),
-                Error::<T>::WrongMainchainGenesis
-            );
-
-            // Finality depth gate — the attestor's k value must clear the
-            // pallet's freshness floor.
-            ensure!(
-                attestation_evidence.observed_at_depth >= T::MinFinalityDepth::get(),
-                Error::<T>::FinalityDepthBelowMinimum
-            );
-
-            // Claim presence + state checks. We do these BEFORE pinning the
-            // pending-request entry so a request against a wrong/settled
-            // claim never wastes a storage slot.
-            let claim =
-                Claims::<T>::get(claim_id).ok_or(Error::<T>::ClaimNotFound)?;
-            ensure!(!claim.settled, Error::<T>::AlreadySettled);
-
-            // Voucher must exist — the attest-side payload pulls
-            // voucher_digest from `Vouchers[claim_id]`, so an attest_settle
-            // against a missing voucher would fail later. Fail loud here so
-            // the requester gets a clean error.
-            let voucher =
-                Vouchers::<T>::get(claim_id).ok_or(Error::<T>::VoucherMissing)?;
-
-            // Cross-check evidence against the on-chain voucher. We pull the
-            // beneficiary payment-key hash from the CIP-0019 type-0 address
-            // bytes (`addr[1..29]`) — the canonical voucher digest already
-            // depends on this layout via `voucher_canonicalize::
-            // split_type0_address_bytes`, so a misformed address fails the
-            // voucher mint long before we get here.
-            ensure!(
-                attestation_evidence.amount_lovelace == voucher.amount_ada,
-                Error::<T>::SettlementEvidenceMismatch
-            );
-            let (payment_hash, _stake_hash) =
-                crate::voucher_canonicalize::split_type0_address_bytes(
-                    voucher.beneficiary_cardano_addr.as_slice(),
-                )
-                .map_err(|_| Error::<T>::InvalidBeneficiaryAddress)?;
-            ensure!(
-                attestation_evidence.beneficiary_addr_hash == payment_hash,
-                Error::<T>::SettlementEvidenceMismatch
-            );
-
+            Self::checked_settlement_target(claim_id, &attestation_evidence)?;
             Self::store_settlement_request(
                 claim_id,
                 SettlementRequestRecord {
@@ -3557,7 +3542,7 @@ pub mod pallet {
                 // request_settle already cross-checked — a settle that races
                 // an `expire_policy_mirror` could land here with the claim
                 // already terminalized, so re-check.
-                let mut claim = Claims::<T>::get(claim_id).ok_or(Error::<T>::ClaimNotFound)?;
+                let claim = Claims::<T>::get(claim_id).ok_or(Error::<T>::ClaimNotFound)?;
                 ensure!(!claim.settled, Error::<T>::AlreadySettled);
                 let voucher = Vouchers::<T>::get(claim_id).ok_or(Error::<T>::VoucherMissing)?;
 
@@ -3598,27 +3583,12 @@ pub mod pallet {
                     checked,
                 )?;
 
-                // All checks pass — settle the claim. Same NAV / coverage math
-                // as the legacy path; only the trust gate changed.
-                let cardano_tx_hash = request.evidence.cardano_tx_hash;
-                let settled_direct = request.settled_direct;
-                claim.settled = true;
-                claim.settled_direct = settled_direct;
-                claim.cardano_tx_hash = cardano_tx_hash;
-                let intent_id = claim.intent_id;
-                let amount = claim.amount_ada;
-                Claims::<T>::insert(claim_id, claim);
-
-                if let Some(mut intent) = Intents::<T>::get(intent_id) {
-                    intent.status = IntentStatus::Settled;
-                    Intents::<T>::insert(intent_id, intent);
-                }
-                Self::remove_from_pending_batches(intent_id);
-
-                PoolUtilization::<T>::mutate(|u| {
-                    u.outstanding_coverage_ada = u.outstanding_coverage_ada.saturating_sub(amount);
-                    u.total_nav_ada = u.total_nav_ada.saturating_sub(amount);
-                });
+                Self::settle_attested_claim(
+                    claim_id,
+                    claim,
+                    request.evidence.cardano_tx_hash,
+                    request.settled_direct,
+                );
 
                 // Task #84 (mis-sec P1): if a bond was posted on this
                 // request, pin the attested-at block + a (requester, amount)
@@ -3641,14 +3611,88 @@ pub mod pallet {
                 // Consume the pending request — the canonical post-state is
                 // "claim settled, no pending entry."
                 ClaimSettlementRequests::<T>::remove(claim_id);
-
-                Self::deposit_event(Event::ClaimSettled {
-                    claim_id,
-                    cardano_tx_hash,
-                    settled_direct,
-                });
                 Ok(())
             })
+        }
+
+        /// Settles `claim_id` on M-of-N STCA signatures over evidence the
+        /// committee supplies, displacing a pending request whose evidence
+        /// or settlement mode differs. The displaced bond is refunded, not
+        /// slashed: an unattestable request may be honest but wrong, and no
+        /// fraud is alleged. This clears requests that no `FraudProof` can
+        /// slash, such as a wrong slot or an unreachable depth.
+        ///
+        /// The STCA digest is the one `attest_settle` verifies for a
+        /// request carrying the same evidence. The evidence passes the
+        /// checks `request_settle` applies; a request whose evidence and
+        /// mode already match must be attested instead
+        /// (`SupersedeMatchesRequest`).
+        #[pallet::call_index(22)]
+        #[pallet::weight((Weight::from_parts(60_000_000, 0)
+            .saturating_add(T::WeightInfo::release_settlement_bond())
+            .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
+            DispatchClass::Operational, Pays::No))]
+        pub fn supersede_settlement_request(
+            origin: OriginFor<T>,
+            claim_id: ClaimId,
+            settled_direct: bool,
+            evidence: SettlementEvidence,
+            signatures: Vec<(CommitteePubkey, CommitteeSig)>,
+        ) -> DispatchResultWithPostInfo {
+            Self::with_signature_weight(
+                Weight::from_parts(60_000_000, 0)
+                    .saturating_add(T::WeightInfo::release_settlement_bond()),
+                |checked| {
+                    let who = ensure_signed(origin)?;
+                    ensure!(
+                        T::CommitteeMembership::is_member(&who),
+                        Error::<T>::NotCommitteeMember
+                    );
+                    ensure!(
+                        signatures.len() <= T::MaxCommittee::get() as usize,
+                        Error::<T>::TooManySignatures
+                    );
+                    let (claim, voucher) = Self::checked_settlement_target(claim_id, &evidence)?;
+                    let request = ClaimSettlementRequests::<T>::get(claim_id)
+                        .ok_or(Error::<T>::SettlementRequestMissing)?;
+                    ensure!(
+                        request.evidence != evidence || request.settled_direct != settled_direct,
+                        Error::<T>::SupersedeMatchesRequest
+                    );
+
+                    let payload = settle_claim_attested_payload(
+                        &Self::materios_chain_id_bytes(),
+                        &claim_id,
+                        &Self::compute_canonical_voucher_digest(&voucher)?,
+                        &evidence.cardano_tx_hash,
+                        settled_direct,
+                        &evidence.beneficiary_addr_hash,
+                        claim.amount_ada,
+                        evidence.observed_at_depth,
+                        evidence.observed_slot,
+                        &T::MainchainGenesisHash::get(),
+                    );
+                    Self::verify_threshold_signatures::<T::SigVerifier>(
+                        &payload,
+                        &who,
+                        &signatures,
+                        checked,
+                    )?;
+
+                    Self::discard_settlement_request(claim_id, request.clone())?;
+                    Self::deposit_event(Event::SettlementRequestSuperseded {
+                        claim_id,
+                        requester: request.requester,
+                    });
+                    Self::settle_attested_claim(
+                        claim_id,
+                        claim,
+                        evidence.cardano_tx_hash,
+                        settled_direct,
+                    );
+                    Ok(())
+                },
+            )
         }
 
         /// Task #266 (mis-sec P0): batch parallel of `request_settle`. The
@@ -3696,8 +3740,6 @@ pub mod pallet {
                 }
             }
 
-            let mc_genesis = T::MainchainGenesisHash::get();
-            let min_depth = T::MinFinalityDepth::get();
             let now = <frame_system::Pallet<T>>::block_number();
             let count = n as u32;
 
@@ -3707,34 +3749,7 @@ pub mod pallet {
                 _,
             >(|| {
                 for entry in entries.iter() {
-                    // Per-entry mirror of the single-call request_settle
-                    // invariants. Atomic rollback if any fail.
-                    ensure!(
-                        entry.evidence.mainchain_genesis_hash == mc_genesis,
-                        Error::<T>::WrongMainchainGenesis
-                    );
-                    ensure!(
-                        entry.evidence.observed_at_depth >= min_depth,
-                        Error::<T>::FinalityDepthBelowMinimum
-                    );
-                    let claim = Claims::<T>::get(entry.claim_id)
-                        .ok_or(Error::<T>::ClaimNotFound)?;
-                    ensure!(!claim.settled, Error::<T>::AlreadySettled);
-                    let voucher = Vouchers::<T>::get(entry.claim_id)
-                        .ok_or(Error::<T>::VoucherMissing)?;
-                    ensure!(
-                        entry.evidence.amount_lovelace == voucher.amount_ada,
-                        Error::<T>::SettlementEvidenceMismatch
-                    );
-                    let (payment_hash, _stake_hash) =
-                        crate::voucher_canonicalize::split_type0_address_bytes(
-                            voucher.beneficiary_cardano_addr.as_slice(),
-                        )
-                        .map_err(|_| Error::<T>::InvalidBeneficiaryAddress)?;
-                    ensure!(
-                        entry.evidence.beneficiary_addr_hash == payment_hash,
-                        Error::<T>::SettlementEvidenceMismatch
-                    );
+                    Self::checked_settlement_target(entry.claim_id, &entry.evidence)?;
                     Self::store_settlement_request(
                         entry.claim_id,
                         SettlementRequestRecord {
@@ -4982,12 +4997,88 @@ pub mod pallet {
                     Self::request_expired(request.submitted_block),
                     Error::<T>::SettlementRequestAlreadyExists
                 );
-                if request.bond_amount > 0 {
-                    Self::refund_settlement_bond(claim_id, request.requester, request.bond_amount)?;
-                }
-                ClaimSettlementRequests::<T>::remove(claim_id);
+                Self::discard_settlement_request(claim_id, request)?;
             }
             Ok(())
+        }
+
+        /// Removes an unattested request and refunds its bond.
+        fn discard_settlement_request(
+            claim_id: ClaimId,
+            request: SettlementRequestRecord<T::AccountId, BlockNumberFor<T>>,
+        ) -> DispatchResult {
+            if request.bond_amount > 0 {
+                Self::refund_settlement_bond(claim_id, request.requester, request.bond_amount)?;
+            }
+            ClaimSettlementRequests::<T>::remove(claim_id);
+            Ok(())
+        }
+
+        /// Checks evidence for a claim the way every request and supersede
+        /// does, returning the claim and its voucher.
+        fn checked_settlement_target(
+            claim_id: ClaimId,
+            evidence: &SettlementEvidence,
+        ) -> Result<(Claim, Voucher), DispatchError> {
+            ensure!(
+                evidence.mainchain_genesis_hash == T::MainchainGenesisHash::get(),
+                Error::<T>::WrongMainchainGenesis
+            );
+            ensure!(
+                evidence.observed_at_depth >= T::MinFinalityDepth::get(),
+                Error::<T>::FinalityDepthBelowMinimum
+            );
+            ensure!(
+                evidence.observed_at_depth <= MAX_OBSERVED_DEPTH,
+                Error::<T>::FinalityDepthAboveMaximum
+            );
+            let claim = Claims::<T>::get(claim_id).ok_or(Error::<T>::ClaimNotFound)?;
+            ensure!(!claim.settled, Error::<T>::AlreadySettled);
+            let voucher = Vouchers::<T>::get(claim_id).ok_or(Error::<T>::VoucherMissing)?;
+            ensure!(
+                evidence.amount_lovelace == voucher.amount_ada,
+                Error::<T>::SettlementEvidenceMismatch
+            );
+            let (payment_hash, _stake_hash) =
+                crate::voucher_canonicalize::split_type0_address_bytes(
+                    voucher.beneficiary_cardano_addr.as_slice(),
+                )
+                .map_err(|_| Error::<T>::InvalidBeneficiaryAddress)?;
+            ensure!(
+                evidence.beneficiary_addr_hash == payment_hash,
+                Error::<T>::SettlementEvidenceMismatch
+            );
+            Ok((claim, voucher))
+        }
+
+        /// Marks an attested claim settled, retires its intent and releases
+        /// its pool coverage.
+        fn settle_attested_claim(
+            claim_id: ClaimId,
+            mut claim: Claim,
+            cardano_tx_hash: [u8; 32],
+            settled_direct: bool,
+        ) {
+            claim.settled = true;
+            claim.settled_direct = settled_direct;
+            claim.cardano_tx_hash = cardano_tx_hash;
+            let intent_id = claim.intent_id;
+            let amount = claim.amount_ada;
+            Claims::<T>::insert(claim_id, claim);
+            if let Some(mut intent) = Intents::<T>::get(intent_id) {
+                intent.status = IntentStatus::Settled;
+                Intents::<T>::insert(intent_id, intent);
+            }
+            Self::remove_from_pending_batches(intent_id);
+            PoolUtilization::<T>::mutate(|u| {
+                u.outstanding_coverage_ada = u.outstanding_coverage_ada.saturating_sub(amount);
+                u.total_nav_ada = u.total_nav_ada.saturating_sub(amount);
+            });
+            Self::deposit_event(Event::ClaimSettled {
+                claim_id,
+                cardano_tx_hash,
+                settled_direct,
+            });
         }
 
         /// Replaces an expired request, refuses a request instance that was

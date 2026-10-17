@@ -23,12 +23,31 @@ pay twice. Attested bonds retain the separate `BondReleaseDelayBlocks` rule.
 
 A slash records `(claim_id, request_id)` in `SlashedSettlementRequests` and
 removes the pending request. Any other request for the claim, from any
-requester, can be filed and attested immediately, so a junk bond cannot wedge
-a claim. FRV2 binds each allegation to one `request_id`; only an identical
+requester, can be filed and attested immediately, so slashable junk cannot
+wedge a claim. FRV2 binds each allegation to one `request_id`; only an identical
 repost in the slashing block recreates it, and that repost is refused with
 `BondSlashedNoRelease`, so each signed allegation slashes at most once. The
 claim-wide `BondSlashedRequests` map from earlier runtimes is no longer read or
 written; its existing entries no longer block requests.
+
+Some junk cannot be slashed: no `FraudProof` covers a wrong `observed_slot`
+or a depth the transaction never reaches, and watchers defer `TxNotFound` for a
+far-future slot. Such a request can never be attested either, and its
+requester could renew it each TTL. `supersede_settlement_request` closes every
+such shape: the committee supplies its own evidence with M-of-N STCA
+signatures, the same digest `attest_settle` verifies for a request carrying
+that evidence. The evidence passes every `request_settle` check. Any pending
+request whose evidence or settlement mode differs is removed, its bond is
+refunded rather than slashed (it may be honest but unattestable), and the
+claim settles in the same call. A pending request that already carries the
+supplied evidence and mode is refused with `SupersedeMatchesRequest`; it is
+attested with `attest_settle`, which keeps its bond under the release delay.
+
+Evidence may claim at most `MAX_OBSERVED_DEPTH` = 2160 blocks, Cardano's
+security parameter k. A transaction k blocks deep is immutable, so a keeper
+whose transaction is deeper claims 2160. The bound is exposed as the
+`MaxObservedDepth` metadata constant, and `integrity_test` requires
+`MinFinalityDepth` not to exceed it.
 
 Slashing operates only on pending requests; successful attestation consumes
 that request. The post-attestation release delay is a liquidity hold, **not a

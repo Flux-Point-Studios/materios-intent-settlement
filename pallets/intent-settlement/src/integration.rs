@@ -1751,3 +1751,95 @@ fn genesis_safety_fraud_bundle_cannot_slash_a_replacement_request() {
         assert_ne!(requester, bob);
     });
 }
+
+#[test]
+fn genesis_safety_supersede_signatures_bind_the_supplied_evidence() {
+    use crate::pallet::{ClaimSettlementRequests, Claims, Error, Vouchers};
+    use frame_support::assert_noop;
+    new_ext().execute_with(|| {
+        let (alice, _, _) = committee_accounts();
+        let user = user_account();
+        let claim_id = H256::repeat_byte(0x5E);
+        let voucher = Voucher {
+            claim_id,
+            policy_id: H256::repeat_byte(0x99),
+            beneficiary_cardano_addr: BoundedVec::try_from(type0_addr_bytes(0xB1)).unwrap(),
+            amount_ada: 2_000_000,
+            batch_fairness_proof_digest: [0x44; 32],
+            issued_block: 1,
+            expiry_slot_cardano: 100_000,
+            committee_sigs: BoundedVec::default(),
+        };
+        Vouchers::<Testnet>::insert(claim_id, voucher.clone());
+        Claims::<Testnet>::insert(
+            claim_id,
+            Claim {
+                intent_id: H256::repeat_byte(0x5F),
+                policy_id: voucher.policy_id,
+                amount_ada: voucher.amount_ada,
+                issued_block: 1,
+                expiry_slot_cardano: voucher.expiry_slot_cardano,
+                settled: false,
+                settled_direct: false,
+                cardano_tx_hash: [0u8; 32],
+            },
+        );
+        let (payment_hash, _) =
+            crate::voucher_canonicalize::split_type0_address_bytes(&type0_addr_bytes(0xB1))
+                .unwrap();
+        let honest = SettlementEvidence {
+            cardano_tx_hash: [0xDE; 32],
+            observed_at_depth: TestMinFinalityDepth::get(),
+            observed_slot: 12_345_678,
+            beneficiary_addr_hash: payment_hash,
+            amount_lovelace: voucher.amount_ada,
+            mainchain_genesis_hash: TestMainchainGenesisHash::get(),
+        };
+        let mut junk = honest;
+        junk.observed_slot = 1;
+        assert_ok!(IntentSettlement::request_settle(
+            RuntimeOrigin::signed(user),
+            claim_id,
+            junk.cardano_tx_hash,
+            false,
+            junk,
+            1
+        ));
+        let stca = settle_claim_attested_payload(
+            &TEST_CHAIN_ID,
+            &claim_id,
+            &integration_voucher_digest(&voucher),
+            &honest.cardano_tx_hash,
+            false,
+            &payment_hash,
+            voucher.amount_ada,
+            honest.observed_at_depth,
+            honest.observed_slot,
+            &TestMainchainGenesisHash::get(),
+        );
+        let signatures = vec![sign_with("//Alice", &stca), sign_with("//Bob", &stca)];
+        let mut tampered = honest;
+        tampered.observed_at_depth += 1;
+        assert_noop!(
+            IntentSettlement::supersede_settlement_request(
+                RuntimeOrigin::signed(alice.clone()),
+                claim_id,
+                false,
+                tampered,
+                signatures.clone()
+            )
+            .map_err(|failure| failure.error),
+            Error::<Testnet>::InvalidSignature
+        );
+        assert_ok!(IntentSettlement::supersede_settlement_request(
+            RuntimeOrigin::signed(alice),
+            claim_id,
+            false,
+            honest,
+            signatures
+        )
+        .map_err(|failure| failure.error));
+        assert!(Claims::<Testnet>::get(claim_id).unwrap().settled);
+        assert!(!ClaimSettlementRequests::<Testnet>::contains_key(claim_id));
+    });
+}
