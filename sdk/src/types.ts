@@ -148,6 +148,8 @@ export interface KeeperSubmission {
   state: "observed" | "submitting" | "submitted" | "confirmed" | "failed" | "expired";
   feeBumpCount: number;
   lastError?: string;
+  /** Materios block before which the keeper does not retry settling. */
+  retryAtBlock?: BlockNumber;
 }
 
 /** Config knobs for the keeper. */

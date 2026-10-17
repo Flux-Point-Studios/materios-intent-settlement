@@ -9,6 +9,7 @@
  */
 
 import {
+  DispatchFailedError,
   MateriosRpcClient,
   buildSigBundle,
   computeKeeperFeeLovelace,
@@ -27,6 +28,8 @@ import type {
   KeeperConfig,
   Voucher,
   BatchFairnessProof,
+  SettlementEvidence,
+  SettlementRequestView,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
 
 import { KeeperStateStore } from "./state.js";
@@ -84,6 +87,10 @@ export interface KeeperMetrics {
    */
   voucherSigVerifyFailures: number;
   orphanRollbacks: number;
+  /** Settlement extrinsics included in a block whose dispatch failed. */
+  settleDispatchFailures: number;
+  /** Bonds the keeper returned to itself with `release_settlement_bond`. */
+  bondsReleased: number;
   currentlyPaused: boolean;
 }
 
@@ -97,6 +104,8 @@ export class Keeper {
     committeeSigFailures: 0,
     voucherSigVerifyFailures: 0,
     orphanRollbacks: 0,
+    settleDispatchFailures: 0,
+    bondsReleased: 0,
     currentlyPaused: false,
   };
 
@@ -180,8 +189,9 @@ export class Keeper {
     const tip = await this.deps.rpc.getLatestBlockNumber().catch(() => cursor);
     this.deps.state.setCursor(tip);
 
-    // (4) reconcile in-flight submissions (confirmation + settle_claim)
-    await this.reconcileInflight();
+    // (4) settle confirmed payouts on Materios, then return releasable bonds
+    await this.reconcileInflight(tip);
+    await this.releaseBonds(tip);
 
     await this.deps.state.flush();
     return this.metrics;
@@ -411,25 +421,13 @@ export class Keeper {
   }
 
   /**
-   * Task #266 (mis-sec P0): for every "submitted" submission, poll the
-   * Cardano provider until it's confirmed to k-depth, then post the new
-   * two-phase attested-settle pair:
-   *   1. `request_settle(claim_id, tx_hash, settled_direct, evidence)` —
-   *      anyone can submit, the keeper does so as the requester.
-   *   2. `attest_settle(claim_id, signatures)` — committee provides
-   *      M-of-N sigs over the canonical STCA digest. The keeper assembles
-   *      the bundle itself when it's also a committee member (M=1
-   *      interim); the long-term path collects sigs from cert-daemon
-   *      attestors before submitting.
-   *
-   * Replaces the legacy single-call `settle_claim` extrinsic, which
-   * carries no falsifiable evidence and is rejected post-cutover.
-   *
-   * The legacy single-call path is preserved as a fall-back for the
-   * 50-block grace window during the spec-N upgrade — controlled via the
-   * `useAttestedSettlePath` config knob (defaults true).
+   * For every Cardano payout confirmed to depth, drives the claim to
+   * settlement on Materios and marks it settled only once the chain says
+   * so. A request that blocks the claim is attested when it records this
+   * payout, superseded with the keeper's evidence when it does not, and
+   * waited out to its expiry when the keeper cannot supersede alone.
    */
-  private async reconcileInflight(): Promise<void> {
+  private async reconcileInflight(tip: BlockNumber): Promise<void> {
     const subs = Object.values(this.deps.state.snapshot.submissions);
     for (const sub of subs) {
       if (sub.state !== "submitted" || !sub.cardanoTxHash) continue;
@@ -450,11 +448,25 @@ export class Keeper {
       if (!conf.confirmed) continue;
 
       this.metrics.batchesConfirmed += 1;
-      const settledDirect = false;
       try {
-        await this.submitAttestedSettle(sub, conf.txSlot, conf.currentSlot, settledDirect);
-        this.deps.state.markSettled(sub.claimId, sub.cardanoTxHash);
-        this.metrics.batchesSettled += 1;
+        if (sub.retryAtBlock !== undefined && tip < sub.retryAtBlock) {
+          if (await this.deps.rpc.isClaimSettled(sub.claimId)) {
+            this.deps.state.markSettled(sub.claimId, sub.cardanoTxHash);
+            this.metrics.batchesSettled += 1;
+          }
+          continue;
+        }
+        const settled = await this.settleOnMaterios(
+          sub.claimId,
+          sub.cardanoTxHash,
+          conf.txSlot,
+          conf.currentSlot,
+          tip,
+        );
+        if (settled) {
+          this.deps.state.markSettled(sub.claimId, sub.cardanoTxHash);
+          this.metrics.batchesSettled += 1;
+        }
       } catch (err) {
         this.log("error", "attested settle pipeline failed", { claimId: sub.claimId, err });
       }
@@ -462,92 +474,176 @@ export class Keeper {
   }
 
   /**
-   * Task #266 (mis-sec P0): two-phase attested settle.
-   *
-   * Phase 1 (`request_settle`): pin the falsifiable evidence on chain so
-   * any watcher can later prove the requester lied. The keeper builds
-   * `SettlementEvidence` from chain-state-derived facts (voucher amount,
-   * beneficiary payment-key hash, mainchain genesis pinning) so a
-   * malicious requester cannot lie about anything cross-checkable.
-   *
-   * Phase 2 (`attest_settle`): the committee provides M-of-N sigs over
-   * the canonical 209-byte STCA digest. The pallet rebuilds the same
-   * digest from chain state, so every honest attestor sees the same
-   * bytes — bad bundles fail sig-verify locally, never settling a bad
-   * claim.
-   *
-   * @throws if any phase fails or the on-chain voucher is missing
+   * One settlement step for a confirmed payout; returns whether the claim
+   * is settled on chain afterwards.
    */
-  private async submitAttestedSettle(
-    sub: { claimId: ClaimId; cardanoTxHash: HexString | null },
+  private async settleOnMaterios(
+    claimId: ClaimId,
+    cardanoTxHash: HexString,
     txSlot: bigint | null,
     currentSlot: bigint,
-    settledDirect: boolean,
-  ): Promise<void> {
-    if (!sub.cardanoTxHash) {
-      throw new Error("submitAttestedSettle: missing cardanoTxHash");
-    }
+    tip: BlockNumber,
+  ): Promise<boolean> {
+    const rpc = this.deps.rpc;
+    if (await rpc.isClaimSettled(claimId)) return true;
     if (txSlot === null) {
-      throw new Error("submitAttestedSettle: missing Cardano tx slot");
+      throw new Error("settleOnMaterios: missing Cardano tx slot");
     }
-    const voucher = await this.deps.rpc.getVoucher(sub.claimId);
+    const constants = rpc.getSettlementConstants();
+    const voucher = await rpc.getVoucher(claimId);
     if (!voucher) {
-      throw new Error(`voucher missing for claim ${sub.claimId}`);
+      throw new Error(`voucher missing for claim ${claimId}`);
     }
-    // Cardano blocks at ~20s each. Convert slot delta to approximate
-    // blocks for the pallet's `MinFinalityDepth` floor. The cert-daemon's
-    // production path measures actual block count via Ogmios chain
-    // history; this approximation is good enough for the keeper's M=1
-    // interim, since the pallet enforces the floor either way.
-    const slotDelta = currentSlot - txSlot;
-    const approxDepth = Number(slotDelta / 20n);
-    if (approxDepth < this.config.minFinalityDepth) {
-      throw new Error(
-        `depth ${approxDepth} < MinFinalityDepth ${this.config.minFinalityDepth}; deferring`,
-      );
+    // Cardano blocks arrive about every 20 slots; the pallet enforces the
+    // floor and the attestors check the depth against reality.
+    const observedDepth = Number((currentSlot - txSlot) / 20n);
+    if (observedDepth < this.config.minFinalityDepth) {
+      this.log("info", "payout below MinFinalityDepth; deferring", { claimId, observedDepth });
+      return false;
     }
-    // Re-derive payment-key hash from the voucher's CIP-0019 type-0
-    // address. The pallet does the same; mismatch => SettlementEvidenceMismatch.
-    const beneficiaryHash = paymentKeyHashFromBeneficiaryAddr(voucher);
-    const evidence = {
-      cardano_tx_hash: sub.cardanoTxHash,
-      observed_at_depth: approxDepth,
+    const ours: SettlementEvidence = {
+      cardano_tx_hash: cardanoTxHash,
+      observed_at_depth: Math.min(observedDepth, constants.maxObservedDepth),
       observed_slot: txSlot,
-      beneficiary_addr_hash: u8aToHex(beneficiaryHash),
+      beneficiary_addr_hash: u8aToHex(paymentKeyHashFromBeneficiaryAddr(voucher)) as HexString,
       amount_lovelace: voucher.amountAda,
       mainchain_genesis_hash: this.config.mainchainGenesisHash,
     };
 
-    // Phase 1: request_settle. Anyone can post — the keeper's mnemonic
-    // is the typical signer. The extrinsic is permissionless; failure
-    // here is usually an `AlreadySettled` race with another keeper, or
-    // a stale evidence rejection at the chain. Pin state on success.
-    const minimumBondConstant = this.deps.rpc.getApi().consts.intentSettlement?.minSettlementBond;
-    if (!minimumBondConstant) {
-      throw new Error("MinSettlementBond runtime constant unavailable");
+    const pending = await rpc.getSettlementRequest(claimId);
+    let attested = ours;
+    if (pending && tip - pending.submittedBlock <= constants.settlementRequestTtl) {
+      if (!recordsPayout(pending, ours)) {
+        const failure = await this.submitSettlement(
+          "supersedeSettlementRequest",
+          [claimId, false, ours, this.settlementSignatures(claimId, voucher, ours)],
+          claimId,
+        );
+        if (failure === null) return rpc.isClaimSettled(claimId);
+        if (CANNOT_SIGN_ALONE.has(failure)) {
+          this.awaitExpiry(claimId, pending, "a request the keeper cannot supersede blocks the claim");
+        }
+        return false;
+      }
+      attested = pending.evidence;
+    } else {
+      const bond = constants.minSettlementBond > 0n ? constants.minSettlementBond : 1n;
+      const failure = await this.submitSettlement(
+        "requestSettle",
+        [claimId, cardanoTxHash, false, ours, bond],
+        claimId,
+      );
+      if (failure !== null) return false;
+      this.deps.state.trackBond(claimId);
     }
-    const minimumBond = BigInt(minimumBondConstant.toString());
-    const bondAmount = minimumBond > 0n ? minimumBond : 1n;
-    await this.deps.rpc.submitExtrinsic(
-      "intentSettlement",
-      "requestSettle",
-      [sub.claimId, sub.cardanoTxHash, settledDirect, evidence, bondAmount],
+    const failure = await this.submitSettlement(
+      "attestSettle",
+      [claimId, this.settlementSignatures(claimId, voucher, attested)],
+      claimId,
     );
+    if (failure === null) return rpc.isClaimSettled(claimId);
+    const request = CANNOT_SIGN_ALONE.has(failure) ? await rpc.getSettlementRequest(claimId) : null;
+    if (request) this.awaitExpiry(claimId, request, "awaiting the committee's attestation");
+    return false;
+  }
 
-    // Phase 2: attest_settle. The keeper's mnemonic MUST be a current
-    // committee member for the M=1 interim. The bundle here is a single
-    // sig; the settlement-daemon path (B) replaces this with M-of-N
-    // collected sigs from cert-daemon peers.
-    // Rehydrate the voucher's canonical Plutus V3 Data CBOR for the
-    // beneficiary address — the pallet does the same; the digest must
-    // commit to byte-identical CBOR.
+  /**
+   * Stops submitting for `claimId` until `request` expires; until then the
+   * keeper only checks whether the claim has been settled.
+   */
+  private awaitExpiry(claimId: ClaimId, request: SettlementRequestView, reason: string): void {
+    const retryAtBlock =
+      request.submittedBlock + this.deps.rpc.getSettlementConstants().settlementRequestTtl + 1;
+    this.deps.state.updateSubmission(claimId, { retryAtBlock });
+    this.log("info", `${reason}; waiting until the request expires`, { claimId, retryAtBlock });
+  }
+
+  /**
+   * Returns bonds the keeper holds once they are releasable: attested bonds
+   * after `BondReleaseDelayBlocks`, and expired requests for payouts the
+   * keeper is no longer settling. Claims with nothing of the keeper's left
+   * on chain stop being tracked.
+   */
+  private async releaseBonds(tip: BlockNumber): Promise<void> {
+    const rpc = this.deps.rpc;
+    const tracked = this.deps.state.trackedBonds();
+    if (tracked.length === 0) return;
+    const keeper = u8aToHex(rpc.getSigner().publicKey);
+    const constants = rpc.getSettlementConstants();
+    for (const claimId of tracked) {
+      try {
+        const held = await rpc.getAttestedBond(claimId);
+        if (held) {
+          if (held.requester !== keeper) {
+            this.deps.state.untrackBond(claimId);
+          } else if (tip >= held.attestedAt + constants.bondReleaseDelayBlocks) {
+            await this.releaseBond(claimId);
+          }
+          continue;
+        }
+        const pending = await rpc.getSettlementRequest(claimId);
+        if (pending && pending.requester === keeper && pending.bondAmount > 0n) {
+          const expired = tip - pending.submittedBlock > constants.settlementRequestTtl;
+          const settling = this.deps.state.snapshot.submissions[claimId]?.state === "submitted";
+          if (expired && !settling) await this.releaseBond(claimId);
+          continue;
+        }
+        this.deps.state.untrackBond(claimId);
+      } catch (err) {
+        this.log("error", "bond release check failed", { claimId, err });
+      }
+    }
+  }
+
+  private async releaseBond(claimId: ClaimId): Promise<void> {
+    const failure = await this.submitSettlement("releaseSettlementBond", [claimId], claimId);
+    if (failure === null) {
+      this.metrics.bondsReleased += 1;
+      this.deps.state.untrackBond(claimId);
+    } else if (failure === "BondNotReserved") {
+      this.deps.state.untrackBond(claimId);
+    }
+  }
+
+  /**
+   * Submits an `intentSettlement` extrinsic. Returns null when it
+   * dispatched, or the dispatch error's name after logging it; other
+   * failures (RPC, transport) propagate.
+   */
+  private async submitSettlement(method: string, args: unknown[], claimId: ClaimId): Promise<string | null> {
+    try {
+      await this.deps.rpc.submitExtrinsic("intentSettlement", method, args);
+      return null;
+    } catch (err) {
+      if (!(err instanceof DispatchFailedError)) throw err;
+      this.metrics.settleDispatchFailures += 1;
+      const unfunded = err.pallet === "balances" || err.error.startsWith("Token.");
+      this.log(
+        unfunded ? "error" : "warn",
+        unfunded
+          ? "keeper cannot fund the settlement bond; top up the keeper account"
+          : "settlement extrinsic failed in dispatch",
+        { claimId, method, error: err.message },
+      );
+      return err.error;
+    }
+  }
+
+  /**
+   * The keeper's M=1 interim bundle: its own signature over the STCA digest
+   * the pallet rebuilds from `evidence` and the on-chain voucher.
+   */
+  private settlementSignatures(
+    claimId: ClaimId,
+    voucher: Voucher,
+    evidence: SettlementEvidence,
+  ): Array<[HexString, HexString]> {
     const beneficiaryCbor = encodeType0AddressCbor(splitType0AddressBytes(
       typeof voucher.beneficiaryCardanoAddr === "string"
         ? hexToBytes(voucher.beneficiaryCardanoAddr)
         : voucher.beneficiaryCardanoAddr,
     ));
     const voucherDigestHex = voucherDigestWithAddress({
-      // #73: chain-identity tuple bound into the canonical voucher digest.
       materiosChainId: this.config.materiosChainId,
       networkMagic: this.config.networkMagic,
       aegisPolicyV1ScriptHash: this.config.aegisPolicyV1ScriptHash,
@@ -562,29 +658,21 @@ export class Keeper {
     });
     const stcaPayload = settleClaimAttestedPayload({
       materiosChainId: this.config.materiosChainId,
-      claimId: sub.claimId,
+      claimId,
       voucherDigest: voucherDigestHex,
-      cardanoTxHash: sub.cardanoTxHash,
-      settledDirect,
-      beneficiaryAddrHash: u8aToHex(beneficiaryHash),
-      amountLovelace: voucher.amountAda,
-      observedAtDepth: approxDepth,
-      observedSlot: txSlot,
-      mainchainGenesisHash: this.config.mainchainGenesisHash,
+      cardanoTxHash: evidence.cardano_tx_hash,
+      settledDirect: false,
+      beneficiaryAddrHash: evidence.beneficiary_addr_hash,
+      amountLovelace: evidence.amount_lovelace,
+      observedAtDepth: evidence.observed_at_depth,
+      observedSlot: evidence.observed_slot,
+      mainchainGenesisHash: evidence.mainchain_genesis_hash,
     });
-    const bundle = buildSigBundle({
+    return buildSigBundle({
       callerSeed: this.config.keeperMnemonic,
       cosignerSeeds: [],
       payload: stcaPayload,
-    });
-    const signatures = bundle.map(
-      (e) => [u8aToHex(e.pubkey), u8aToHex(e.sig)] as [HexString, HexString],
-    );
-    await this.deps.rpc.submitExtrinsic(
-      "intentSettlement",
-      "attestSettle",
-      [sub.claimId, signatures],
-    );
+    }).map((entry) => [u8aToHex(entry.pubkey), u8aToHex(entry.sig)] as [HexString, HexString]);
   }
 }
 
@@ -595,6 +683,26 @@ export class Keeper {
  * derivation; the keeper must produce byte-identical bytes or the
  * `SettlementEvidence` cross-check fails.
  */
+/** Dispatch errors that mean the keeper's lone signature cannot clear the threshold. */
+const CANNOT_SIGN_ALONE = new Set(["InsufficientSignatures", "NotCommitteeMember", "SignerNotCommitteeMember"]);
+
+/**
+ * Whether a pending request records this payout: the same transaction,
+ * slot, beneficiary, amount and genesis, at a depth the payout has reached.
+ */
+function recordsPayout(pending: SettlementRequestView, ours: SettlementEvidence): boolean {
+  const stored = pending.evidence;
+  return (
+    !pending.settledDirect &&
+    stored.cardano_tx_hash.toLowerCase() === ours.cardano_tx_hash.toLowerCase() &&
+    stored.observed_slot === ours.observed_slot &&
+    stored.observed_at_depth <= ours.observed_at_depth &&
+    stored.beneficiary_addr_hash.toLowerCase() === ours.beneficiary_addr_hash.toLowerCase() &&
+    stored.amount_lovelace === ours.amount_lovelace &&
+    stored.mainchain_genesis_hash.toLowerCase() === ours.mainchain_genesis_hash.toLowerCase()
+  );
+}
+
 function paymentKeyHashFromBeneficiaryAddr(voucher: {
   beneficiaryCardanoAddr: Uint8Array | HexString;
 }): Uint8Array {

@@ -11,6 +11,20 @@ value. Insufficient funds roll back the entire request or batch, including
 refunds of replaced requests. Keepers read the exposed runtime constant and
 submit `max(MinSettlementBond, 1)`.
 
+The reference keeper acts on chain state, not on its own submissions. The SDK
+rejects an included extrinsic whose dispatch failed with `DispatchFailedError`,
+naming the module error. The keeper marks a claim settled only when
+`Claims[claim].settled` is true on chain. For a confirmed payout it files a
+request when none is pending (or the pending one expired), attests a pending
+request that records the same payout, and supersedes any other pending
+request. When its single signature cannot clear the threshold for a supersede
+or an attestation, it stops submitting for that claim until the request
+expires and only checks whether the committee settled it. A bond reserve
+failure is logged as an error naming the unfunded keeper account and leaves the
+claim open. The keeper tracks every claim it bonded and releases the bond once
+`BondReleaseDelayBlocks` have passed after attestation, or once its own request
+expired for a payout it is no longer settling.
+
 A request is fresh while `now - submitted_block <= SettlementRequestTtl`.
 Attestation and slashing use that inclusive boundary. On the next block, an
 unattested request can be replaced by either request extrinsic. Replacement

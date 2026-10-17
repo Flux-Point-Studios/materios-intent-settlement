@@ -55,6 +55,19 @@ describe("KeeperStateStore", () => {
     expect(store.snapshot.cursor).toBe(10);
   });
 
+  it("tracks held bonds across save/load and loads state written before bond tracking", async () => {
+    const store = new KeeperStateStore(file);
+    store.trackBond("0xaaa" as `0x${string}`);
+    store.trackBond("0xbbb" as `0x${string}`);
+    store.untrackBond("0xaaa" as `0x${string}`);
+    await store.flush();
+    expect((await KeeperStateStore.load(file)).trackedBonds()).toEqual(["0xbbb"]);
+
+    const { heldBonds: _, ...older } = store.snapshot;
+    await fs.writeFile(file, JSON.stringify(older));
+    expect((await KeeperStateStore.load(file)).trackedBonds()).toEqual([]);
+  });
+
   it("round-trips through save/load", async () => {
     const store = new KeeperStateStore(file);
     store.recordObservation("0xaaa" as `0x${string}`, 1);
