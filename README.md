@@ -116,7 +116,7 @@ The primitive is intentionally generic — any oracle-marked, M-of-N-attested, b
 
 - **Parametric insurance** (the original target, [Aegis](https://github.com/Flux-Point-Studios) is the reference implementation): `BuyPolicy` intents, payouts triggered by oracle evidence, LP pool with utilization caps via `set_pool_utilization`.
 - **Prediction markets**: a binary feed registered through `pallet-oracle.register_attestor` plus a `BuyPolicy`-shaped intent gives you cryptographically-settled binary markets with Cardano-anchored receipts.
-- **Anything M-of-N + bond + slash**: the `post_settlement_bond` → `slash_bad_settlement_evidence` → `release_settlement_bond` pattern is reusable.
+- **Anything M-of-N + bond + slash**: the bonded `request_settle` → `slash_bad_settlement_evidence` → `release_settlement_bond` pattern is reusable.
 
 ## Architecture in one diagram
 

@@ -11,7 +11,6 @@
 use crate::tests::{new_test_ext, ALICE};
 use crate::types::*;
 use frame_support::{assert_ok, BoundedVec};
-use parity_scale_codec as codec;
 use proptest::prelude::*;
 use sp_core::H256;
 

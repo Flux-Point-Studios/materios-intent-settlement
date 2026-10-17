@@ -9,6 +9,7 @@ include that work in these weights. This pallet has no MOTRA dependency.
 | `post_settlement_bond` | One reserve |
 | `release_settlement_bond` | One unreserve |
 | `slash_bad_settlement_evidence` | Two reserved-balance repatriations |
+| `request_settle`, `request_batch_settle` | Per request: one reserve, plus one unreserve when it replaces an expired bonded request. Their declared weights add `post_settlement_bond` and `release_settlement_bond` per request. |
 
 Materios wraps these base weights with its current MOTRA checkpoint costs.
 Its benchmark, generated weights, proof bounds and raw samples are maintained

@@ -522,10 +522,16 @@ export class Keeper {
     // is the typical signer. The extrinsic is permissionless; failure
     // here is usually an `AlreadySettled` race with another keeper, or
     // a stale evidence rejection at the chain. Pin state on success.
+    const minimumBondConstant = this.deps.rpc.getApi().consts.intentSettlement?.minSettlementBond;
+    if (!minimumBondConstant) {
+      throw new Error("MinSettlementBond runtime constant unavailable");
+    }
+    const minimumBond = BigInt(minimumBondConstant.toString());
+    const bondAmount = minimumBond > 0n ? minimumBond : 1n;
     await this.deps.rpc.submitExtrinsic(
       "intentSettlement",
       "requestSettle",
-      [sub.claimId, sub.cardanoTxHash, settledDirect, evidence],
+      [sub.claimId, sub.cardanoTxHash, settledDirect, evidence, bondAmount],
     );
 
     // Phase 2: attest_settle. The keeper's mnemonic MUST be a current

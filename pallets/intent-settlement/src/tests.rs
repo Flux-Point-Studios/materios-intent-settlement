@@ -353,6 +353,11 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
     let mut ext = sp_io::TestExternalities::new(t);
     ext.execute_with(|| {
         System::set_block_number(1);
+        for who in [1, 2, 3, 100, 101] {
+            let _ = <Balances as frame_support::traits::Currency<u64>>::make_free_balance_be(
+                &who, 10_000_000,
+            );
+        }
         pallet_intent_settlement::pallet::IntentTTL::<Test>::put(600u32);
         pallet_intent_settlement::pallet::ClaimTTL::<Test>::put(28_800u32);
         pallet_intent_settlement::pallet::PoolUtilization::<Test>::put(
@@ -4909,6 +4914,7 @@ fn task266_request_settle_happy_path_pins_evidence() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1
         ));
 
         let pending = pallet_intent_settlement::pallet::ClaimSettlementRequests::<
@@ -4951,6 +4957,7 @@ fn task266_request_settle_rejects_below_finality_depth() {
                 evidence.cardano_tx_hash,
                 false,
                 evidence,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::FinalityDepthBelowMinimum,
         );
@@ -4978,6 +4985,7 @@ fn task266_request_settle_rejects_wrong_mainchain_genesis() {
                 evidence.cardano_tx_hash,
                 false,
                 evidence,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::WrongMainchainGenesis,
         );
@@ -5002,6 +5010,7 @@ fn task266_request_settle_rejects_amount_mismatch() {
                 evidence.cardano_tx_hash,
                 false,
                 evidence,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::SettlementEvidenceMismatch,
         );
@@ -5025,6 +5034,7 @@ fn task266_request_settle_rejects_beneficiary_mismatch() {
                 evidence.cardano_tx_hash,
                 false,
                 evidence,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::SettlementEvidenceMismatch,
         );
@@ -5048,6 +5058,7 @@ fn task266_request_settle_rejects_tx_hash_drift_between_arg_and_evidence() {
                 [0xDEu8; 32], // arg doesn't match evidence.cardano_tx_hash
                 false,
                 evidence,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::SettlementEvidenceMismatch,
         );
@@ -5071,6 +5082,7 @@ fn task266_request_settle_rejects_unknown_claim() {
                 evidence.cardano_tx_hash,
                 false,
                 evidence,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::ClaimNotFound,
         );
@@ -5090,6 +5102,7 @@ fn task266_request_settle_rejects_already_settled_claim() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1
         ));
         assert_ok!(IntentSettlement::attest_settle(
             RuntimeOrigin::signed(1),
@@ -5105,6 +5118,7 @@ fn task266_request_settle_rejects_already_settled_claim() {
                 evidence2.cardano_tx_hash,
                 false,
                 evidence2,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::AlreadySettled,
         );
@@ -5126,6 +5140,7 @@ fn task266_request_settle_rejects_duplicate_pending() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1
         ));
         assert_noop!(
             IntentSettlement::request_settle(
@@ -5134,6 +5149,7 @@ fn task266_request_settle_rejects_duplicate_pending() {
                 evidence.cardano_tx_hash,
                 false,
                 evidence,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::SettlementRequestAlreadyExists,
         );
@@ -5156,6 +5172,7 @@ fn task266_attest_settle_happy_path() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1
         ));
         assert_ok!(IntentSettlement::attest_settle(
             RuntimeOrigin::signed(1),
@@ -5216,6 +5233,7 @@ fn task266_attest_settle_rejects_expired_request() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1
         ));
         // Advance past TTL.
         let ttl = TestSettlementRequestTtl::get();
@@ -5243,6 +5261,7 @@ fn task266_attest_settle_rejects_non_committee_caller() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1
         ));
         assert_noop!(
             IntentSettlement::attest_settle(
@@ -5267,6 +5286,7 @@ fn task266_attest_settle_rejects_below_threshold() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1
         ));
         assert_noop!(
             IntentSettlement::attest_settle(
@@ -5598,6 +5618,7 @@ fn task266_request_batch_settle_happy_path() {
         assert_ok!(IntentSettlement::request_batch_settle(
             RuntimeOrigin::signed(1),
             bv,
+            1
         ));
         // Both pending entries pinned.
         assert!(pallet_intent_settlement::pallet::ClaimSettlementRequests::<Test>::get(
@@ -5633,7 +5654,7 @@ fn task266_request_batch_settle_atomic_revert_on_bad_entry() {
         let bv: BoundedVec<SettleAttestedBatchEntry, MaxSettleBatch> =
             BoundedVec::try_from(entries).unwrap();
         assert_noop!(
-            IntentSettlement::request_batch_settle(RuntimeOrigin::signed(1), bv),
+            IntentSettlement::request_batch_settle(RuntimeOrigin::signed(1), bv, 1),
             pallet_intent_settlement::pallet::Error::<Test>::SettlementEvidenceMismatch,
         );
         // Atomicity: neither pending entry pinned despite c1 being valid.
@@ -5666,6 +5687,7 @@ fn task266_attest_batch_settle_happy_path() {
         assert_ok!(IntentSettlement::request_batch_settle(
             RuntimeOrigin::signed(1),
             bv,
+            1
         ));
         let claim_ids: BoundedVec<ClaimId, MaxSettleBatch> =
             BoundedVec::try_from(vec![c1, c2]).unwrap();
@@ -5717,6 +5739,7 @@ fn task266_attest_batch_settle_rejects_missing_request_for_any_entry() {
         assert_ok!(IntentSettlement::request_batch_settle(
             RuntimeOrigin::signed(1),
             bv,
+            1
         ));
         // c2 has NO pending request. Batch attest must reject.
         let claim_ids: BoundedVec<ClaimId, MaxSettleBatch> =
@@ -5749,6 +5772,7 @@ fn task266_attest_batch_settle_rejects_duplicates() {
         assert_ok!(IntentSettlement::request_batch_settle(
             RuntimeOrigin::signed(1),
             bv,
+            1
         ));
         let claim_ids: BoundedVec<ClaimId, MaxSettleBatch> =
             BoundedVec::try_from(vec![c1, c1]).unwrap();
@@ -6596,13 +6620,13 @@ fn fund_account(who: u64, amount: u128) {
     let _ = pallet_balances::Pallet::<Test>::deposit_creating(&who, amount);
 }
 
-/// Helper: set up a fresh bonded request. ALICE is the requester; she
-/// posts `request_settle` and then bonds via `post_settlement_bond` for
-/// `bond_amount` MATRA. Returns the claim_id + voucher (so caller can
-/// build evidence / fraud proofs).
+/// Helper: set up a fresh bonded request. ALICE is the requester; her
+/// `request_settle` reserves `bond_amount` MATRA. Returns the claim_id +
+/// voucher (so caller can build evidence / fraud proofs).
 fn alice_request_and_bond(seed: u8, claim_amount: u64, bond_amount: u128) -> (ClaimId, Voucher) {
     let (claim_id, _iid, voucher) = vouchered_claim_with_voucher(seed, claim_amount);
     let evidence = settled_evidence_for(&voucher, 15, 12_345);
+    fund_account(ALICE, bond_amount.saturating_mul(10));
     // ALICE submits the request_settle (she's not a committee member, but
     // request_settle is permissionless).
     assert_ok!(IntentSettlement::request_settle(
@@ -6611,12 +6635,7 @@ fn alice_request_and_bond(seed: u8, claim_amount: u64, bond_amount: u128) -> (Cl
         evidence.cardano_tx_hash,
         false,
         evidence,
-    ));
-    fund_account(ALICE, bond_amount.saturating_mul(10));
-    assert_ok!(IntentSettlement::post_settlement_bond(
-        RuntimeOrigin::signed(ALICE),
-        claim_id,
-        bond_amount,
+        bond_amount
     ));
     (claim_id, voucher)
 }
@@ -6719,13 +6738,16 @@ fn post_settlement_bond_happy_path() {
         let (claim_id, _iid, voucher) =
             vouchered_claim_with_voucher(0xB6, 100_000);
         let evidence = settled_evidence_for(&voucher, 15, 1);
-        assert_ok!(IntentSettlement::request_settle(
-            RuntimeOrigin::signed(ALICE),
+        pallet_intent_settlement::pallet::ClaimSettlementRequests::<Test>::insert(
             claim_id,
-            evidence.cardano_tx_hash,
-            false,
-            evidence,
-        ));
+            SettlementRequestRecord {
+                requester: ALICE,
+                evidence,
+                settled_direct: false,
+                submitted_block: 1,
+                bond_amount: 0,
+            },
+        );
         fund_account(ALICE, 10_000_000_000u128);
         let reserved_before =
             pallet_balances::Pallet::<Test>::reserved_balance(&ALICE);
@@ -6768,6 +6790,7 @@ fn post_settlement_bond_rejects_non_requester() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1,
         ));
         fund_account(BOB, 10_000_000_000u128);
         // BOB (not ALICE) tries to bond ALICE's request.
@@ -6808,13 +6831,16 @@ fn post_settlement_bond_rejects_below_min() {
         let (claim_id, _iid, voucher) =
             vouchered_claim_with_voucher(0xBC, 100_000);
         let evidence = settled_evidence_for(&voucher, 15, 1);
-        assert_ok!(IntentSettlement::request_settle(
-            RuntimeOrigin::signed(ALICE),
+        pallet_intent_settlement::pallet::ClaimSettlementRequests::<Test>::insert(
             claim_id,
-            evidence.cardano_tx_hash,
-            false,
-            evidence,
-        ));
+            SettlementRequestRecord {
+                requester: ALICE,
+                evidence,
+                settled_direct: false,
+                submitted_block: 1,
+                bond_amount: 0,
+            },
+        );
         fund_account(ALICE, 10_000u128);
         // amount = 100 < floor 1_000 → BondBelowMinimum.
         assert_noop!(
@@ -6835,7 +6861,7 @@ fn post_settlement_bond_rejects_below_min() {
 fn slash_bad_settlement_evidence_happy_path() {
     new_test_ext().execute_with(|| {
         use pallet_intent_settlement::pallet::{
-            BondSlashedRequests, ClaimSettlementRequests,
+            ClaimSettlementRequests, SlashedSettlementRequests,
         };
         let bond: u128 = 100_000_000u128;
         let (claim_id, voucher) = alice_request_and_bond(0xB9, 100_000, bond);
@@ -6899,8 +6925,10 @@ fn slash_bad_settlement_evidence_happy_path() {
         );
         // Tombstone set.
         assert!(
-            BondSlashedRequests::<Test>::contains_key(claim_id),
-            "BondSlashedRequests must hold the tombstone"
+            SlashedSettlementRequests::<Test>::iter_prefix(claim_id)
+                .next()
+                .is_some(),
+            "SlashedSettlementRequests must hold the request tombstone"
         );
         // SettlementBondSlashed event emitted.
         let found = System::events().into_iter().any(|er| matches!(
@@ -7079,11 +7107,8 @@ fn release_settlement_bond_rejects_on_slashed() {
         // must reject because the bond was slashed.
         System::set_block_number(System::block_number() + 1_000);
         assert_noop!(
-            IntentSettlement::release_settlement_bond(
-                RuntimeOrigin::signed(ALICE),
-                claim_id,
-            ),
-            pallet_intent_settlement::pallet::Error::<Test>::BondSlashedNoRelease,
+            IntentSettlement::release_settlement_bond(RuntimeOrigin::signed(ALICE), claim_id),
+            pallet_intent_settlement::pallet::Error::<Test>::BondNotReserved,
         );
     });
 }

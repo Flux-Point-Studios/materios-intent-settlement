@@ -66,7 +66,7 @@ impl pallet_balances::Config for Testnet {
 }
 
 parameter_types! {
-    pub const MaxCommittee: u32 = 32;
+    pub const MaxCommittee: u32 = 96;
     pub const MaxExpirePerBlock: u32 = 256;
     pub const DefaultIntentTTL: u32 = 600;
     pub const DefaultClaimTTL: u32 = 28_800;
@@ -117,8 +117,17 @@ fn committee_accounts() -> (
 }
 
 pub struct CommitteeFromStorage;
+#[cfg(feature = "runtime-benchmarks")]
+fn benchmark_committee() -> Option<Vec<sp_runtime::AccountId32>> {
+    frame_support::storage::unhashed::get(b":settlement-benchmark-committee")
+}
+
 impl IsCommitteeMember<sp_runtime::AccountId32> for CommitteeFromStorage {
     fn is_member(who: &sp_runtime::AccountId32) -> bool {
+        #[cfg(feature = "runtime-benchmarks")]
+        if let Some(members) = benchmark_committee() {
+            return members.contains(who);
+        }
         let (a, b, c) = committee_accounts();
         who == &a || who == &b || who == &c
     }
@@ -126,6 +135,10 @@ impl IsCommitteeMember<sp_runtime::AccountId32> for CommitteeFromStorage {
         2
     }
     fn member_count() -> u32 {
+        #[cfg(feature = "runtime-benchmarks")]
+        if let Some(members) = benchmark_committee() {
+            return members.len() as u32;
+        }
         3
     }
     fn pubkey_of(who: &sp_runtime::AccountId32) -> CommitteePubkey {
@@ -257,7 +270,13 @@ pub struct IntegrationBenchmarkHelper;
 impl pallet_intent_settlement::BenchmarkHelper<sp_runtime::AccountId32>
     for IntegrationBenchmarkHelper
 {
-    fn whitelist_as_committee(_who: &sp_runtime::AccountId32) {}
+    fn whitelist_as_committee(who: &sp_runtime::AccountId32) {
+        let mut members = benchmark_committee().unwrap_or_default();
+        if !members.contains(who) {
+            members.push(who.clone());
+        }
+        frame_support::storage::unhashed::put(b":settlement-benchmark-committee", &members);
+    }
 }
 
 fn user_account() -> sp_runtime::AccountId32 {
@@ -265,13 +284,19 @@ fn user_account() -> sp_runtime::AccountId32 {
     sp_runtime::AccountId32::from(dave.public().0)
 }
 
-fn new_ext() -> sp_io::TestExternalities {
+pub(crate) fn new_ext() -> sp_io::TestExternalities {
     let t = frame_system::GenesisConfig::<Testnet>::default()
         .build_storage()
         .unwrap();
     let mut ext = sp_io::TestExternalities::new(t);
     ext.execute_with(|| {
         System::set_block_number(1);
+        let (a, b, c) = committee_accounts();
+        for who in [a, b, c, user_account()] {
+            let _ = <Balances as frame_support::traits::Currency<_>>::make_free_balance_be(
+                &who, 10_000_000,
+            );
+        }
         pallet_intent_settlement::pallet::IntentTTL::<Testnet>::put(600u32);
         pallet_intent_settlement::pallet::ClaimTTL::<Testnet>::put(28_800u32);
         pallet_intent_settlement::pallet::PoolUtilization::<Testnet>::put(
@@ -1430,6 +1455,7 @@ fn task266_full_lifecycle_attested_settle_real_sr25519() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1
         ));
 
         // Committee builds the STCA digest from chain state (re-derives

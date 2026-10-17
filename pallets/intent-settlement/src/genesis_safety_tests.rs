@@ -3,6 +3,9 @@ use crate::pallet::*;
 
 fn genesis_ext() -> sp_io::TestExternalities {
     RuntimeGenesisConfig {
+        balances: pallet_balances::GenesisConfig::<Test> {
+            balances: vec![(ALICE, 10_000), (BOB, 10_000)],
+        },
         intent_settlement: GenesisConfig::<Test> {
             pool_utilization: PoolUtilizationParams {
                 target_bps: 5_000,
@@ -80,7 +83,8 @@ fn genesis_safety_upgrade_preserves_post_genesis_audit_state() {
             cid,
             evidence.cardano_tx_hash,
             false,
-            evidence
+            evidence,
+            1
         ));
         assert_ok!(IntentSettlement::attest_settle(
             RuntimeOrigin::signed(1),
@@ -120,7 +124,8 @@ fn genesis_safety_expired_junk_request_can_be_replaced_and_attested() {
             cid,
             evidence.cardano_tx_hash,
             false,
-            evidence
+            evidence,
+            1
         ));
         System::set_block_number(1 + TestSettlementRequestTtl::get() as u64);
         evidence.cardano_tx_hash = [0x33; 32];
@@ -130,7 +135,8 @@ fn genesis_safety_expired_junk_request_can_be_replaced_and_attested() {
                 cid,
                 evidence.cardano_tx_hash,
                 false,
-                evidence
+                evidence,
+                1
             ),
             Error::<Test>::SettlementRequestAlreadyExists
         );
@@ -140,7 +146,8 @@ fn genesis_safety_expired_junk_request_can_be_replaced_and_attested() {
             cid,
             evidence.cardano_tx_hash,
             false,
-            evidence
+            evidence,
+            1
         ));
         assert_ok!(IntentSettlement::attest_settle(
             RuntimeOrigin::signed(1),
@@ -172,7 +179,8 @@ fn genesis_safety_replacement_refunds_old_bonder_in_single_and_batch_paths() {
                         evidence
                     }]
                     .try_into()
-                    .expect("one entry")
+                    .expect("one entry"),
+                    1
                 ));
             } else {
                 assert_ok!(IntentSettlement::request_settle(
@@ -180,14 +188,15 @@ fn genesis_safety_replacement_refunds_old_bonder_in_single_and_batch_paths() {
                     cid,
                     evidence.cardano_tx_hash,
                     false,
-                    evidence
+                    evidence,
+                    1
                 ));
             }
             assert_eq!(Balances::free_balance(ALICE), free + 500);
             assert_eq!(Balances::reserved_balance(ALICE), 0);
             let request = ClaimSettlementRequests::<Test>::get(cid).expect("replacement");
             assert_eq!(request.requester, BOB);
-            assert_eq!(request.bond_amount, 0);
+            assert_eq!(request.bond_amount, 1);
             assert!(!BondedClaimRequester::<Test>::contains_key(cid));
             assert!(!BondedClaimAttestedAt::<Test>::contains_key(cid));
         });
@@ -277,7 +286,7 @@ fn genesis_safety_slash_wins_at_inclusive_ttl_boundary() {
         System::set_block_number(System::block_number() + 1);
         assert_noop!(
             IntentSettlement::release_settlement_bond(RuntimeOrigin::signed(BOB), cid),
-            Error::<Test>::BondSlashedNoRelease
+            Error::<Test>::BondNotReserved
         );
         assert_eq!(Balances::reserved_balance(ALICE), 0);
     });
@@ -441,7 +450,8 @@ fn genesis_safety_batch_replacement_rolls_back_refunds_on_later_failure() {
         assert_noop!(
             IntentSettlement::request_batch_settle(
                 RuntimeOrigin::signed(BOB),
-                entries.try_into().expect("two entries")
+                entries.try_into().expect("two entries"),
+                1
             ),
             Error::<Test>::SettlementRequestAlreadyExists
         );
@@ -684,4 +694,436 @@ fn genesis_safety_signature_weights_cover_measured_runtime_samples() {
     // Two independent StorageValues, each with three conservative trie layers.
     let proof_bound = (4 + 3 * 495) + (2 + 96 * 32 + 3 * 495);
     assert!(crate::signature_weights::threshold_signatures(1).proof_size() >= proof_bound);
+}
+
+#[test]
+fn genesis_safety_honest_keeper_settles_after_junk_bond_slashed() {
+    for batch in [false, true] {
+        new_test_ext().execute_with(|| {
+            let (cid, _, voucher) = vouchered_claim_with_voucher(0x81, 1_000);
+            let mut evidence = settled_evidence_for(&voucher, 15, 123);
+            evidence.cardano_tx_hash = [0xEE; 32];
+            assert_ok!(IntentSettlement::request_settle(
+                RuntimeOrigin::signed(BOB),
+                cid,
+                evidence.cardano_tx_hash,
+                false,
+                evidence,
+                1
+            ));
+
+            fund_account(1, 1);
+            fund_account(
+                TestSettlementTreasuryPalletId::get().into_account_truncating(),
+                1,
+            );
+            assert_ok!(IntentSettlement::slash_bad_settlement_evidence(
+                RuntimeOrigin::signed(1),
+                cid,
+                FraudProof::TxNotFound,
+                mock_settle_sigs()
+            ));
+            assert_eq!(Balances::reserved_balance(BOB), 0);
+            assert_noop!(
+                IntentSettlement::request_settle(
+                    RuntimeOrigin::signed(BOB),
+                    cid,
+                    evidence.cardano_tx_hash,
+                    false,
+                    evidence,
+                    1
+                ),
+                Error::<Test>::BondSlashedNoRelease
+            );
+            // A claim-wide tombstone left by an earlier runtime is inert.
+            BondSlashedRequests::<Test>::insert(cid, ());
+            evidence.cardano_tx_hash = [0x82; 32];
+            if batch {
+                assert_ok!(IntentSettlement::request_batch_settle(
+                    RuntimeOrigin::signed(ALICE),
+                    vec![SettleAttestedBatchEntry {
+                        claim_id: cid,
+                        settled_direct: false,
+                        evidence
+                    }]
+                    .try_into()
+                    .expect("one entry"),
+                    1
+                ));
+            } else {
+                assert_ok!(IntentSettlement::request_settle(
+                    RuntimeOrigin::signed(ALICE),
+                    cid,
+                    evidence.cardano_tx_hash,
+                    false,
+                    evidence,
+                    1
+                ));
+            }
+            assert_ok!(IntentSettlement::attest_settle(
+                RuntimeOrigin::signed(1),
+                cid,
+                mock_settle_sigs()
+            ));
+            assert!(Claims::<Test>::get(cid).expect("claim").settled);
+        });
+    }
+}
+
+#[test]
+fn genesis_safety_single_attestation_duplicate_skips_verification() {
+    new_test_ext().execute_with(|| {
+        let (_, iid, _) = vouchered_claim_with_voucher(0x83, 1_000);
+        Intents::<Test>::mutate(iid, |i| {
+            i.as_mut().expect("intent").status = IntentStatus::Pending
+        });
+        let (pubkey, sig) = mock_sig_for(1);
+        assert_ok!(IntentSettlement::attest_intent(
+            RuntimeOrigin::signed(1),
+            iid,
+            pubkey,
+            sig
+        ));
+        VERIFY_CALLS.with(|count| count.set(0));
+        assert_noop!(
+            IntentSettlement::attest_intent(RuntimeOrigin::signed(1), iid, pubkey, sig),
+            Error::<Test>::DuplicatePubkey
+        );
+        assert_eq!(VERIFY_CALLS.with(|count| count.get()), 0);
+    });
+}
+
+#[test]
+fn genesis_safety_single_attestation_charges_signature() {
+    use frame_support::dispatch::GetDispatchInfo;
+    let (pubkey, sig) = mock_sig_for(1);
+    let weight = crate::Call::<Test>::attest_intent {
+        intent_id: H256::zero(),
+        pubkey,
+        sig,
+    }
+    .get_dispatch_info()
+    .weight;
+    assert!(weight.ref_time() >= crate::signature_weights::threshold_signatures(1).ref_time());
+}
+
+#[test]
+fn genesis_safety_batch_intent_replay_skips_verification() {
+    new_test_ext().execute_with(|| {
+        let (_, iid, _) = vouchered_claim_with_voucher(0x84, 1_000);
+        Intents::<Test>::mutate(iid, |i| {
+            i.as_mut().expect("intent").status = IntentStatus::Attested
+        });
+        VERIFY_CALLS.with(|count| count.set(0));
+        assert_ok!(IntentSettlement::attest_batch_intents(
+            RuntimeOrigin::signed(1),
+            vec![iid].try_into().expect("one intent"),
+            mock_settle_sigs()
+        ));
+        assert_eq!(VERIFY_CALLS.with(|count| count.get()), 0);
+    });
+}
+
+#[test]
+fn genesis_safety_nonmember_slash_skips_verification() {
+    new_test_ext().execute_with(|| {
+        let (cid, _) = alice_request_and_bond(0x85, 1_000, 500);
+        VERIFY_CALLS.with(|count| count.set(0));
+        assert_noop!(
+            IntentSettlement::slash_bad_settlement_evidence(
+                RuntimeOrigin::signed(BOB),
+                cid,
+                FraudProof::TxNotFound,
+                mock_settle_sigs()
+            )
+            .map_err(|error| error.error),
+            Error::<Test>::NotCommitteeMember
+        );
+        assert_eq!(VERIFY_CALLS.with(|count| count.get()), 0);
+    });
+}
+
+#[test]
+fn genesis_safety_late_bond_rejected() {
+    new_test_ext().execute_with(|| {
+        let (cid, _, voucher) = vouchered_claim_with_voucher(0x86, 1_000);
+        let evidence = settled_evidence_for(&voucher, 15, 123);
+        ClaimSettlementRequests::<Test>::insert(
+            cid,
+            SettlementRequestRecord {
+                requester: ALICE,
+                evidence,
+                settled_direct: false,
+                submitted_block: 1,
+                bond_amount: 0,
+            },
+        );
+        fund_account(ALICE, 1_000);
+        System::set_block_number(2 + TestSettlementRequestTtl::get() as u64);
+        assert_noop!(
+            IntentSettlement::post_settlement_bond(RuntimeOrigin::signed(ALICE), cid, 500),
+            Error::<Test>::SettlementRequestExpired
+        );
+    });
+}
+
+#[test]
+fn genesis_safety_reserve_deficit_does_not_block_replacement() {
+    use frame_support::traits::ReservableCurrency;
+    new_test_ext().execute_with(|| {
+        let (cid, voucher) = alice_request_and_bond(0x87, 1_000, 500);
+        let (imbalance, missing) = Balances::slash_reserved(&ALICE, 200);
+        drop(imbalance);
+        assert_eq!(missing, 0);
+        let before = Balances::free_balance(ALICE);
+        System::set_block_number(2 + TestSettlementRequestTtl::get() as u64);
+        let evidence = settled_evidence_for(&voucher, 15, 123);
+        assert_ok!(IntentSettlement::request_settle(
+            RuntimeOrigin::signed(BOB),
+            cid,
+            evidence.cardano_tx_hash,
+            false,
+            evidence,
+            1
+        ));
+        assert_eq!(Balances::free_balance(ALICE), before + 300);
+        assert_eq!(Balances::reserved_balance(ALICE), 0);
+        System::assert_has_event(RuntimeEvent::IntentSettlement(Event::SettlementBondReleased {
+            claim_id: cid,
+            requester: ALICE,
+            amount: 300,
+        }));
+        System::assert_has_event(RuntimeEvent::IntentSettlement(
+            Event::SettlementBondReserveDeficit {
+                claim_id: cid,
+                requester: ALICE,
+                missing_amount: 200,
+            },
+        ));
+    });
+}
+
+#[cfg(feature = "try-runtime")]
+#[test]
+fn genesis_safety_try_state_rejects_unknown_version_and_stale_progress() {
+    use frame_support::traits::Hooks;
+    genesis_ext().execute_with(|| {
+        SettlementStorageVersion::<Test>::put(4);
+        assert!(<IntentSettlement as Hooks<u64>>::try_state(0).is_err());
+        assert!(<IntentSettlement as Hooks<u64>>::pre_upgrade().is_err());
+        SettlementStorageVersion::<Test>::put(3);
+        BondMigrationProgress::<Test>::put(
+            BoundedVec::<ClaimId, frame_support::traits::ConstU32<MAX_SETTLE_BATCH>>::try_from(
+                vec![H256::repeat_byte(1)],
+            )
+            .expect("bounded progress"),
+        );
+        assert!(<IntentSettlement as Hooks<u64>>::try_state(0).is_err());
+    });
+}
+
+#[cfg(feature = "try-runtime")]
+#[test]
+fn genesis_safety_upgrade_checks_preserve_cutovers() {
+    use frame_support::traits::Hooks;
+    for (corrupt_stca, error) in [
+        (true, "STCA cutover changed unexpectedly"),
+        (false, "EXPP cutover changed unexpectedly"),
+    ] {
+        genesis_ext().execute_with(|| {
+            System::set_block_number(100);
+            SettlementStorageVersion::<Test>::put(1);
+            StcaCutoverBlock::<Test>::put(25);
+            PolicyExpireCutoverBlock::<Test>::put(0);
+            let before = <IntentSettlement as Hooks<u64>>::pre_upgrade().expect("valid state");
+            <IntentSettlement as Hooks<u64>>::on_runtime_upgrade();
+            if corrupt_stca {
+                StcaCutoverBlock::<Test>::put(50);
+            } else {
+                PolicyExpireCutoverBlock::<Test>::put(999);
+            }
+            assert_eq!(
+                <IntentSettlement as Hooks<u64>>::post_upgrade(before),
+                Err(error.into())
+            );
+        });
+    }
+}
+
+#[test]
+fn genesis_safety_unbonded_single_request_rejected() {
+    new_test_ext().execute_with(|| {
+        let (cid, _, voucher) = vouchered_claim_with_voucher(0x88, 1_000);
+        let evidence = settled_evidence_for(&voucher, 15, 123);
+        assert_noop!(
+            IntentSettlement::request_settle(
+                RuntimeOrigin::signed(ALICE),
+                cid,
+                evidence.cardano_tx_hash,
+                false,
+                evidence,
+                0
+            ),
+            Error::<Test>::BondBelowMinimum
+        );
+    });
+}
+
+#[test]
+fn genesis_safety_unbonded_batch_request_rejected() {
+    new_test_ext().execute_with(|| {
+        let (cid, _, voucher) = vouchered_claim_with_voucher(0x89, 1_000);
+        let evidence = settled_evidence_for(&voucher, 15, 123);
+        assert_noop!(
+            IntentSettlement::request_batch_settle(
+                RuntimeOrigin::signed(ALICE),
+                vec![SettleAttestedBatchEntry {
+                    claim_id: cid,
+                    settled_direct: false,
+                    evidence
+                }]
+                .try_into()
+                .expect("one entry"),
+                0
+            ),
+            Error::<Test>::BondBelowMinimum
+        );
+    });
+}
+
+#[test]
+fn genesis_safety_request_enforces_configured_minimum() {
+    new_test_ext().execute_with(|| {
+        TestMinSettlementBond::set(100);
+        let (cid, _, voucher) = vouchered_claim_with_voucher(0x90, 1_000);
+        let evidence = settled_evidence_for(&voucher, 15, 123);
+        assert_noop!(
+            IntentSettlement::request_settle(
+                RuntimeOrigin::signed(ALICE),
+                cid,
+                evidence.cardano_tx_hash,
+                false,
+                evidence,
+                1
+            ),
+            Error::<Test>::BondBelowMinimum
+        );
+        TestMinSettlementBond::set(0);
+    });
+}
+
+#[test]
+fn genesis_safety_unfunded_replacement_rolls_back_old_refund() {
+    new_test_ext().execute_with(|| {
+        let (cid, voucher) = alice_request_and_bond(0x91, 1_000, 500);
+        let _ = <Balances as frame_support::traits::Currency<u64>>::make_free_balance_be(&BOB, 0);
+        System::set_block_number(2 + TestSettlementRequestTtl::get() as u64);
+        let evidence = settled_evidence_for(&voucher, 15, 123);
+        assert_noop!(
+            IntentSettlement::request_settle(
+                RuntimeOrigin::signed(BOB),
+                cid,
+                evidence.cardano_tx_hash,
+                false,
+                evidence,
+                1
+            ),
+            pallet_balances::Error::<Test>::InsufficientBalance
+        );
+        assert_eq!(Balances::reserved_balance(ALICE), 500);
+    });
+}
+
+#[test]
+fn genesis_safety_batch_reserves_all_bonds_atomically() {
+    new_test_ext().execute_with(|| {
+        let (first, _, voucher1) = vouchered_claim_with_voucher(0x92, 1_000);
+        let (second, _, voucher2) = vouchered_claim_with_voucher(0x93, 1_000);
+        let _ = <Balances as frame_support::traits::Currency<u64>>::make_free_balance_be(&BOB, 150);
+        let entries = vec![(first, voucher1), (second, voucher2)]
+            .into_iter()
+            .map(|(claim_id, voucher)| SettleAttestedBatchEntry {
+                claim_id,
+                settled_direct: false,
+                evidence: settled_evidence_for(&voucher, 15, 123),
+            })
+            .collect::<Vec<_>>();
+        assert_noop!(
+            IntentSettlement::request_batch_settle(
+                RuntimeOrigin::signed(BOB),
+                entries.try_into().expect("two entries"),
+                100
+            ),
+            pallet_balances::Error::<Test>::InsufficientBalance
+        );
+        assert!(!ClaimSettlementRequests::<Test>::contains_key(first));
+    });
+}
+
+#[cfg(feature = "try-runtime")]
+#[test]
+fn genesis_safety_upgrade_checks_accept_legacy_migrations_and_genesis() {
+    use frame_support::traits::Hooks;
+    for version in 0..=3 {
+        genesis_ext().execute_with(|| {
+            System::set_block_number(100);
+            SettlementStorageVersion::<Test>::put(version);
+            if version > 0 && version < 3 {
+                StcaCutoverBlock::<Test>::put(25);
+            }
+            if version == 2 {
+                PolicyExpireCutoverBlock::<Test>::put(30);
+            }
+            let (_, iid, _) = vouchered_claim_with_voucher(0x94, 1_000);
+            Intents::<Test>::mutate(iid, |intent| {
+                intent.as_mut().expect("intent").status = IntentStatus::Expired
+            });
+            let before = <IntentSettlement as Hooks<u64>>::pre_upgrade().expect("valid pre-state");
+            <IntentSettlement as Hooks<u64>>::on_runtime_upgrade();
+            assert_ok!(<IntentSettlement as Hooks<u64>>::post_upgrade(before));
+            assert_ok!(<IntentSettlement as Hooks<u64>>::try_state(100));
+            assert_eq!(SettlementStorageVersion::<Test>::get(), 3);
+        });
+    }
+}
+
+#[cfg(feature = "try-runtime")]
+#[test]
+fn genesis_safety_try_state_rejects_inconsistent_cutovers() {
+    use frame_support::traits::Hooks;
+    for (version, stca, expp) in [(0, 0, 10), (1, 0, 0), (2, 10, 0), (3, 10, 0), (3, 0, 10)] {
+        genesis_ext().execute_with(|| {
+            SettlementStorageVersion::<Test>::put(version);
+            StcaCutoverBlock::<Test>::put(stca);
+            PolicyExpireCutoverBlock::<Test>::put(expp);
+            assert!(<IntentSettlement as Hooks<u64>>::try_state(100).is_err());
+        });
+    }
+}
+
+#[cfg(feature = "try-runtime")]
+#[test]
+fn genesis_safety_upgrade_checks_reject_settlement_mutation_at_current_version() {
+    use frame_support::traits::Hooks;
+    genesis_ext().execute_with(|| {
+        let before = <IntentSettlement as Hooks<u64>>::pre_upgrade().expect("valid pre-state");
+        <IntentSettlement as Hooks<u64>>::on_runtime_upgrade();
+        PreAuditSettlement::<Test>::insert(H256::repeat_byte(7), true);
+        assert_eq!(
+            <IntentSettlement as Hooks<u64>>::post_upgrade(before),
+            Err("current-version settlement upgrade mutated settlement storage".into())
+        );
+    });
+}
+
+#[cfg(feature = "try-runtime")]
+#[test]
+fn genesis_safety_upgrade_checks_ignore_other_pallet_changes() {
+    use frame_support::traits::Hooks;
+    genesis_ext().execute_with(|| {
+        let before = <IntentSettlement as Hooks<u64>>::pre_upgrade().expect("valid pre-state");
+        <IntentSettlement as Hooks<u64>>::on_runtime_upgrade();
+        sp_io::storage::set(b"other-pallet-upgrade", b"changed");
+        assert_ok!(<IntentSettlement as Hooks<u64>>::post_upgrade(before));
+    });
 }

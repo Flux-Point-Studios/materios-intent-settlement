@@ -185,7 +185,7 @@ describe("E2E happy path — intent → attest → batch → submit → settle",
         }
         return { txHash: ("0x" + "ff".repeat(32)) as HexString, blockHash: null };
       },
-      getApi: () => ({}) as any,
+      getApi: () => ({ consts: { intentSettlement: { minSettlementBond: { toString: () => "500" } } } }) as any,
       getSigner: () => ({}) as any,
     });
     const daemonRpc = makeRpc("daemon");
@@ -281,6 +281,7 @@ describe("E2E happy path — intent → attest → batch → submit → settle",
 
     // Task #266 (mis-sec P0): the attested-settle pair both landed.
     expect(requestSettleArgs).not.toBeNull();
+    expect(requestSettleArgs[4]).toBe(500n);
     expect(requestSettleArgs[0]).toBeTruthy(); // claim_id
     expect(typeof requestSettleArgs[1]).toBe("string"); // cardano_tx_hash
     expect(requestSettleArgs[2]).toBe(false); // settled_direct

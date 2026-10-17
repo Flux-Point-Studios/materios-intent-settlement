@@ -16,6 +16,7 @@ steps:
       - cargo check --workspace --all-targets
       - cargo test --workspace --no-fail-fast
       - cargo check -p pallet-intent-settlement --features runtime-benchmarks
+      - cargo test -p pallet-intent-settlement --features runtime-benchmarks genesis_safety_benchmark_
       - cargo test -p pallet-intent-settlement --features try-runtime
 
   # Advisory, as in the GitHub workflow (continue-on-error).

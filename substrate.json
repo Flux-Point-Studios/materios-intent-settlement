@@ -4,7 +4,7 @@
     {
       "id": "intent-settlement-pallet",
       "name": "Intent settlement pallet",
-      "desc": "Intent settlement on Materios: fresh genesis requires evidence-bound settlement and expiry, expired settlement requests can be replaced with bond refunds, fraud signatures bind each request, and threshold bundles carry measured per-signature weights with post-dispatch refunds. Runtime-defined Currency weights cover reserve, release and slashing bookkeeping.",
+      "desc": "Intent settlement on Materios: requests atomically reserve a positive runtime-minimum bond; request-scoped slash tombstones preserve honest replacement, expired requests refund available reserves with explicit deficit events, fresh genesis closes legacy paths, and FRV2 fraud signatures bind each request. Signature preflight and measured weights bound verification; try-runtime checks version and cutover invariants.",
       "kind": "pallet",
       "paths": [
         "pallets/intent-settlement"
@@ -37,7 +37,7 @@
     {
       "id": "is-keeper",
       "name": "Settlement keeper",
-      "desc": "Off-chain keeper that turns voucher batches into Cardano payout transactions, waits for confirmation and files the settlement back to Materios.",
+      "desc": "Off-chain keeper that turns voucher batches into Cardano payout transactions, waits for confirmation and files bonded settlement requests using the runtime MinSettlementBond constant.",
       "kind": "agent",
       "paths": [
         "keeper"

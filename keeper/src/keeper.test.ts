@@ -177,6 +177,7 @@ function makeValidBfpr(): BatchFairnessProof {
 
 function fakeRpc(overrides: Record<string, any> = {}) {
   return {
+    getApi: () => ({ consts: { intentSettlement: { minSettlementBond: { toString: () => "500" } } } }),
     getPendingBatches: vi.fn().mockResolvedValue([]),
     getVoucher: vi.fn().mockResolvedValue(null),
     getLatestBlockNumber: vi.fn().mockResolvedValue(200),
@@ -246,12 +247,13 @@ describe("Keeper.runOnce — happy path", () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "keeper-"));
   });
 
-  it("observes → submits → confirms → settles an attested+vouchered batch", async () => {
+  it.each([500n, 0n])("observes → submits → confirms → settles with minimum bond %s", async (minimumBond) => {
     const batch = makeBatch(1);
     const { voucher, pubkeys } = makeSignedVoucher(
       batch.intentId as unknown as HexString,
     );
     const rpc = fakeRpc({
+      getApi: () => ({ consts: { intentSettlement: { minSettlementBond: { toString: () => String(minimumBond) } } } }),
       getPendingBatches: vi.fn().mockResolvedValue([batch]),
       getVoucher: vi.fn().mockResolvedValue(voucher),
     });
@@ -286,7 +288,8 @@ describe("Keeper.runOnce — happy path", () => {
     );
     expect(requestCall).toBeDefined();
     const [, , reqArgs] = requestCall!;
-    expect(reqArgs).toHaveLength(4);
+    expect(reqArgs).toHaveLength(5);
+    expect(reqArgs[4]).toBe(minimumBond || 1n);
     // reqArgs[2] = settled_direct boolean — M=1 keeper path is always
     // false; settled_direct=true is reserved for the 10-min direct-path
     // fallback (spec §5.7), not the keeper-batch path.
@@ -321,6 +324,36 @@ describe("Keeper.runOnce — failure modes", () => {
 
   beforeEach(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "keeper-"));
+  });
+
+  it("files no settlement request when the runtime omits MinSettlementBond", async () => {
+    const batch = makeBatch(1);
+    const { voucher, pubkeys } = makeSignedVoucher(
+      batch.intentId as unknown as HexString,
+    );
+    const rpc = fakeRpc({
+      getApi: () => ({ consts: { intentSettlement: {} } }),
+      getPendingBatches: vi.fn().mockResolvedValue([batch]),
+      getVoucher: vi.fn().mockResolvedValue(voucher),
+    });
+    const state = new KeeperStateStore(path.join(tmpDir, "st.json"));
+    const keeper = new Keeper(baseConfig, {
+      rpc: rpc as any,
+      cardano: fakeCardano(),
+      state,
+      keeperCardanoAddr: "addr_test1keeper",
+      policyScriptCbor: PLACEHOLDER_CBOR,
+      fetchFairnessProof: async () => makeValidBfpr(),
+      fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
+      logger: () => {},
+    });
+
+    await keeper.runOnce();
+    const metrics = await keeper.runOnce();
+
+    expect(metrics.batchesSettled).toBe(0);
+    expect(rpc.submitExtrinsic.mock.calls.some((c) => c[1] === "requestSettle")).toBe(false);
+    expect(state.snapshot.settledClaims).toEqual({});
   });
 
   it("double-submit idempotency: already-settled claim is skipped", async () => {

@@ -2,6 +2,15 @@
 
 ## Request lifetime
 
+`request_settle` takes a trailing `bond_amount: u128`;
+`request_batch_settle` takes the same trailing amount **per claim**. Both
+reserve the bond atomically with request creation. The amount must be positive
+and at least `Config::MinSettlementBond`, including when that constant is zero.
+The runtime owns the economic minimum; this pallet does not choose a MATRA
+value. Insufficient funds roll back the entire request or batch, including
+refunds of replaced requests. Keepers read the exposed runtime constant and
+submit `max(MinSettlementBond, 1)`.
+
 A request is fresh while `now - submitted_block <= SettlementRequestTtl`.
 Attestation and slashing use that inclusive boundary. On the next block, an
 unattested request can be replaced by either request extrinsic. Replacement
@@ -11,10 +20,29 @@ Batch replacement is atomic, including balance changes and release events.
 Anyone can release an expired, unattested, unslashed bond. The funds always go
 to its recorded requester. The expired request is removed so release cannot
 pay twice. Attested bonds retain the separate `BondReleaseDelayBlocks` rule.
-Slashed claims retain their tombstone and cannot be released or replaced.
+
+A slash records `(claim_id, request_id)` in `SlashedSettlementRequests` and
+removes the pending request. Any other request for the claim, from any
+requester, can be filed and attested immediately, so a junk bond cannot wedge
+a claim. FRV2 binds each allegation to one `request_id`; only an identical
+repost in the slashing block recreates it, and that repost is refused with
+`BondSlashedNoRelease`, so each signed allegation slashes at most once. The
+claim-wide `BondSlashedRequests` map from earlier runtimes is no longer read or
+written; its existing entries no longer block requests.
+
 Slashing operates only on pending requests; successful attestation consumes
-that request. Policy-expiry requests use the same replacement boundary so a
-stale request cannot wedge the EXPP path after the legacy cutover.
+that request. The post-attestation release delay is a liquidity hold, **not a
+fraud-challenge period**: there is no slash path after attestation.
+`post_settlement_bond` exists for unbonded requests stored before request-time
+bonding and refuses a request past its TTL, so no bond is reserved after its
+slash window has closed. Policy-expiry requests use the same replacement
+boundary so a stale request cannot wedge the EXPP path after the legacy
+cutover.
+
+If another Currency consumer depleted the shared reserve, release and
+replacement return only the funds still reserved, emit the actual released
+amount, and report the missing amount in `SettlementBondReserveDeficit`.
+The missing funds do not permanently lock the claim.
 
 There is no automatic expiry sweep. A failed attestation does not remove a
 request. Unused expired requests remain stored until replacement or bonded
@@ -43,7 +71,9 @@ block-number type. The bond amount is excluded so posting the bond does not
 change request identity. Signers must read the current on-chain request and
 use this digest; old `FRAU` signatures are rejected. Deployment requires a
 coordinated update to external slash-watchers and their aggregators before
-enactment. No such deployment is performed by this change.
+enactment. Signers that select FRAU or FRV2 by fingerprinting the
+`slash_bad_settlement_evidence` metadata docs must pin the docs of the
+runtime being enacted. No deployment is performed here.
 
 Cross-language vector (byte fills are repeated to the field width): chain
 `73`, claim `e7`, requester `77`, submitted block `102`, transaction hash `33`,
@@ -62,9 +92,19 @@ of an unscheduled migration. Nonzero cutovers preserve the upgrade grace
 window.
 
 An upgrade over fresh genesis does not relabel STCA settlements or subsequent
-expiries as legacy. Storage encodings and call indices remain unchanged.
-Existing version-3 preprod state needs no data migration for these fixes;
-older versions retain the existing migration sequence.
+expiries as legacy. Call indices and existing storage encodings are preserved.
+The two request calls take the bond argument, so hosts must bump the
+transaction version and upgrade request submitters together. The signed FRV2,
+STCA and EXPP payloads are as specified above. The request-scoped tombstone
+map and the `SettlementBondReserveDeficit` event are appended, so existing
+metadata indices hold. Existing version-3 preprod state needs no data
+migration; older versions retain the existing migration sequence.
+
+Try-runtime pre/post hooks check version progression, cutover preservation and
+legacy audit flags. An upgrade over a chain already at the current version must
+leave every key and value under the pallet's storage prefix unchanged; other
+pallets' storage is out of scope. `try_state` rejects unknown versions,
+inconsistent cutovers and migration progress outside version 2.
 
 ## Signature work and runtime integration
 
@@ -72,6 +112,9 @@ Every threshold-signature dispatch charges a bounded bundle-length component
 in addition to its existing base. Post-dispatch weight retains the base and
 the signatures checked, including on failure. Cheap rejection paths return
 the unused verification budget. Deposit replay checks precede verification.
+Single-intent duplicates, fully replayed intent batches and nonmember slash
+callers also exit before signature verification. Single-intent attestation
+declares the one-signature component plus its storage work.
 
 The verification benchmark must use real sr25519 verification, not the
 benchmark runtime's permissive verifier. Runtime-specific Currency costs
@@ -101,6 +144,13 @@ encoded values are the threshold's `u32` and a 96-member committee. The
 recorded proof is 3,510 bytes. The regression test checks the time and proof
 bounds against the raw samples, and verifies that sampling reaches 96.
 Zero checked signatures add no verification component.
+
+CI executes the signature benchmark with real sr25519 keys and a 96-member
+committee in the integration runtime, in addition to checking the recorded
+timing envelope. It also executes the request, bond, release and slash
+benchmarks there; the slash benchmark reserves a real bond and signs its FRV2
+digest. These native runs prove the benchmarks execute; refreshing timing
+coefficients still requires the Wasm measurement below.
 
 These defaults are measured for Materios' committee adapter with at most 96
 members. A host with another adapter, a larger committee or a more expensive

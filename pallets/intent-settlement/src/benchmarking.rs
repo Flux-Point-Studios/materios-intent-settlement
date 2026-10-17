@@ -5,14 +5,29 @@
 #![cfg(feature = "runtime-benchmarks")]
 
 use super::*;
-use crate::pallet::{Call, Config, IsCommitteeMember};
+use crate::pallet::{BalanceOf, Call, Config, IsCommitteeMember};
 use frame_benchmarking::v2::*;
-use frame_support::traits::Get;
+use frame_support::traits::{Currency, Get, ReservableCurrency};
 use frame_system::pallet_prelude::BlockNumberFor;
 use frame_system::RawOrigin;
+use sp_runtime::traits::{AccountIdConversion, Saturating};
 use sp_std::vec::Vec;
 
 const MAX_BATCH_BENCH: u32 = 256;
+
+/// Sets `who`'s free balance to `amount` plus the existential deposit and
+/// returns `amount` as a Currency balance.
+fn fund_bond<T: Config>(who: &T::AccountId, amount: u128) -> BalanceOf<T> {
+    let amount: BalanceOf<T> = amount
+        .try_into()
+        .ok()
+        .expect("benchmark bond fits Currency balance");
+    let _ = T::Currency::make_free_balance_be(
+        who,
+        amount.saturating_add(T::Currency::minimum_balance()),
+    );
+    amount
+}
 
 /// Build a vouchered claim under a synthetic id for the given index. Uses
 /// pallet-internal storage writes directly (we're not measuring the
@@ -75,6 +90,40 @@ where
 )]
 mod benchmarks {
     use super::*;
+
+    #[cfg(test)]
+    fn execute_in_integration_runtime(benchmark: fn() -> Result<(), BenchmarkError>) {
+        let mut ext = crate::integration::new_ext();
+        ext.register_extension(sp_keystore::KeystoreExt::new(
+            sp_keystore::testing::MemoryKeystore::new(),
+        ));
+        ext.execute_with(|| {
+            frame_support::assert_ok!(benchmark());
+        });
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn genesis_safety_benchmark_threshold_signatures_executes() {
+        execute_in_integration_runtime(
+            Pallet::<crate::integration::Testnet>::test_benchmark_threshold_signatures,
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn genesis_safety_benchmark_bond_lifecycle_executes() {
+        type Runtime = crate::integration::Testnet;
+        for benchmark in [
+            Pallet::<Runtime>::test_benchmark_request_settle,
+            Pallet::<Runtime>::test_benchmark_request_batch_settle,
+            Pallet::<Runtime>::test_benchmark_post_settlement_bond,
+            Pallet::<Runtime>::test_benchmark_release_settlement_bond,
+            Pallet::<Runtime>::test_benchmark_slash_bad_settlement_evidence,
+        ] {
+            execute_in_integration_runtime(benchmark);
+        }
+    }
 
     /// Includes full-committee decoding and real crypto even when the host
     /// runtime uses BenchAllowAnyVerifier for its other benchmarks.
@@ -418,6 +467,8 @@ mod benchmarks {
             mainchain_genesis_hash: mc_g,
         };
         let caller: T::AccountId = whitelisted_caller();
+        let bond = T::MinSettlementBond::get().max(1);
+        fund_bond::<T>(&caller, bond);
 
         #[extrinsic_call]
         _(
@@ -426,6 +477,7 @@ mod benchmarks {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            bond,
         );
     }
 
@@ -624,8 +676,11 @@ mod benchmarks {
             T::MaxSettleBatch,
         > = frame_support::BoundedVec::try_from(entries).unwrap();
 
+        let bond = T::MinSettlementBond::get().max(1);
+        fund_bond::<T>(&caller, bond.saturating_mul(n.into()));
+
         #[extrinsic_call]
-        _(RawOrigin::Signed(caller), bv);
+        _(RawOrigin::Signed(caller), bv, bond);
     }
 
     /// Bench `attest_batch_settle` across Linear<1, MAX_BATCH_BENCH>. The
@@ -1026,9 +1081,11 @@ mod benchmarks {
                 bond_amount: 0u128,
             },
         );
+        let bond = T::MinSettlementBond::get().max(1);
+        fund_bond::<T>(&caller, bond);
 
         #[extrinsic_call]
-        _(RawOrigin::Signed(caller), claim_id, 0u128);
+        _(RawOrigin::Signed(caller), claim_id, bond);
     }
 
     /// Bench `release_settlement_bond` — phase 2 of the #84 lifecycle.
@@ -1041,28 +1098,25 @@ mod benchmarks {
         id_bytes[..4].copy_from_slice(b"REBN");
         let claim_id = ClaimId::from(id_bytes);
         let caller: T::AccountId = whitelisted_caller();
-        // Pin the attested-at slot at block 0 so the BondReleaseDelayBlocks
-        // gate is satisfied on the bench-time block number (which is
-        // arbitrarily large by the time the extrinsic runs).
-        BondedClaimAttestedAt::<T>::insert(
-            claim_id,
-            BlockNumberFor::<T>::from(0u32),
-        );
-        BondedClaimRequester::<T>::insert(claim_id, (caller.clone(), 0u128));
+        BondedClaimAttestedAt::<T>::insert(claim_id, BlockNumberFor::<T>::from(0u32));
+        frame_system::Pallet::<T>::set_block_number(T::BondReleaseDelayBlocks::get().into());
+        let bond = T::MinSettlementBond::get().max(1);
+        T::Currency::reserve(&caller, fund_bond::<T>(&caller, bond)).expect("funded bond");
+        BondedClaimRequester::<T>::insert(claim_id, (caller.clone(), bond));
 
         #[extrinsic_call]
         _(RawOrigin::Signed(caller), claim_id);
     }
 
-    /// Bench `slash_bad_settlement_evidence` — phase 1.5 of the #84
-    /// lifecycle. Pre-seeds a bonded pending request so the call
-    /// exercises the sig-verify + repatriate_reserved + storage
-    /// cleanup costs. The fraud_proof carries a concrete
-    /// `WrongAmount { actual_lovelace }` so the internal-consistency
-    /// gate fires the slash path.
+    /// Bench `slash_bad_settlement_evidence` against a reserved bond of at
+    /// least 2, so a split such as Materios' 50% pays both the watcher and
+    /// the treasury, with one valid FRV2 signature from the calling
+    /// committee member. Further signatures are charged by
+    /// `threshold_signatures`.
     #[benchmark]
     fn slash_bad_settlement_evidence() {
-        use crate::pallet::{ClaimSettlementRequests, Claims, Vouchers};
+        use crate::pallet::{ClaimSettlementRequests, Claims, MinSignerThreshold, Vouchers};
+        use parity_scale_codec::Decode;
         let mut id_bytes = [0u8; 32];
         id_bytes[..4].copy_from_slice(b"SLBE");
         let claim_id = ClaimId::from(id_bytes);
@@ -1120,36 +1174,51 @@ mod benchmarks {
             },
         );
 
-        let caller: T::AccountId = whitelisted_caller();
-        T::BenchmarkHelper::whitelist_as_committee(&caller);
-        let mc_g = T::MainchainGenesisHash::get();
-        let evidence = SettlementEvidence {
-            cardano_tx_hash: [0xFFu8; 32],
-            observed_at_depth: T::MinFinalityDepth::get(),
-            observed_slot: 12_345_678,
-            beneficiary_addr_hash: payment_hash,
-            amount_lovelace: amount,
-            mainchain_genesis_hash: mc_g,
-        };
-        ClaimSettlementRequests::<T>::insert(
-            claim_id,
-            SettlementRequestRecord::<T::AccountId, BlockNumberFor<T>> {
-                requester: caller.clone(),
-                evidence,
-                settled_direct: false,
-                submitted_block: <frame_system::Pallet<T>>::block_number(),
-                bond_amount: 0u128,
-            },
+        let key_type = sp_core::crypto::KeyTypeId(*b"sett");
+        let public = sp_io::crypto::sr25519_generate(
+            key_type,
+            Some(b"//settlement-slash-benchmark".to_vec()),
         );
+        let caller = T::AccountId::decode(&mut &public.0[..])
+            .expect("runtime account decodes a committee public key");
+        T::BenchmarkHelper::whitelist_as_committee(&caller);
+        MinSignerThreshold::<T>::put(1);
+        let treasury: T::AccountId = T::SettlementTreasuryPalletId::get().into_account_truncating();
+        for receiver in [&caller, &treasury] {
+            let _ = T::Currency::make_free_balance_be(receiver, T::Currency::minimum_balance());
+        }
+        let requester: T::AccountId = account("requester", 0, 0);
+        let bond = T::MinSettlementBond::get().max(2);
+        T::Currency::reserve(&requester, fund_bond::<T>(&requester, bond)).expect("funded bond");
 
+        let record = SettlementRequestRecord::<T::AccountId, BlockNumberFor<T>> {
+            requester,
+            evidence: SettlementEvidence {
+                cardano_tx_hash: [0xFFu8; 32],
+                observed_at_depth: T::MinFinalityDepth::get(),
+                observed_slot: 12_345_678,
+                beneficiary_addr_hash: payment_hash,
+                amount_lovelace: amount,
+                mainchain_genesis_hash: T::MainchainGenesisHash::get(),
+            },
+            settled_direct: false,
+            submitted_block: <frame_system::Pallet<T>>::block_number(),
+            bond_amount: bond,
+        };
         let proof = crate::types::FraudProof::WrongAmount {
             actual_lovelace: (amount as u128).saturating_add(1),
         };
-        let caller_pubkey = T::CommitteeMembership::pubkey_of(&caller);
-        let signatures: sp_std::vec::Vec<(CommitteePubkey, CommitteeSig)> =
-            sp_std::vec![(caller_pubkey, [0u8; 64])];
+        let payload = slash_bad_settlement_evidence_payload(
+            &Pallet::<T>::materios_chain_id_bytes(),
+            &claim_id,
+            &record,
+            &proof,
+        );
+        let signature = sp_io::crypto::sr25519_sign(key_type, &public, &payload)
+            .expect("benchmark key was generated");
+        ClaimSettlementRequests::<T>::insert(claim_id, record);
 
         #[extrinsic_call]
-        _(RawOrigin::Signed(caller), claim_id, proof, signatures);
+        _(RawOrigin::Signed(caller), claim_id, proof, sp_std::vec![(public.0, signature.0)]);
     }
 }

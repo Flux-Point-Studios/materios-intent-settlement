@@ -454,10 +454,10 @@ pub struct SettlementRequestRecord<AccountId, BlockNumber> {
     /// rejects attest_settle calls older than `Config::SettlementRequestTtl`
     /// blocks via `SettlementRequestExpired`.
     pub submitted_block: BlockNumber,
-    /// Task #84 (mis-sec P1): optional bond amount reserved by the requester
-    /// via `post_settlement_bond`. Zero means "no bond posted" — pre-#84
-    /// behaviour. Nonzero means the requester has reserved this many units
-    /// of `Config::Currency` against this claim; a successful
+    /// Bond reserved by the requester together with the request. Zero
+    /// appears only in records stored before request-time bonding, which
+    /// `post_settlement_bond` can bond until their TTL expires. A nonzero
+    /// bond is held in reserve in `Config::Currency`; a successful
     /// `slash_bad_settlement_evidence` repatriates `SlashWatcherShareBps` of
     /// it to the watcher and the rest to the treasury PalletId.
     /// Returned after `BondReleaseDelayBlocks` post-attestation, or when an
