@@ -109,9 +109,13 @@ inconsistent cutovers and migration progress outside version 2.
 ## Signature work and runtime integration
 
 Every threshold-signature dispatch charges a bounded bundle-length component
-in addition to its existing base. Post-dispatch weight retains the base and
-the signatures checked, including on failure. Cheap rejection paths return
-the unused verification budget. Deposit replay checks precede verification.
+in addition to its existing base. Within a bundle, every entry passes the
+duplicate and membership checks before any signature is verified. Post-dispatch
+weight retains the base plus one full signature per entry scanned, including
+on failure: a duplicate or non-member entry stops the scan and refunds the
+entries after it, while an invalid signature is charged for the whole scanned
+bundle. Cheap rejection paths return the unused verification budget. Deposit
+replay checks precede verification.
 Single-intent duplicates, fully replayed intent batches and nonmember slash
 callers also exit before signature verification. Single-intent attestation
 declares the one-signature component plus its storage work.

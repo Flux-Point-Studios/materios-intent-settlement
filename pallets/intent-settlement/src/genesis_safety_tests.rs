@@ -401,9 +401,7 @@ fn genesis_safety_deposit_replay_performs_zero_verifications() {
 fn genesis_safety_post_dispatch_refunds_unchecked_signatures_on_error() {
     use frame_support::{dispatch::GetDispatchInfo, traits::UnfilteredDispatchable};
     new_test_ext().execute_with(|| {
-        let mut signatures = mock_credit_sigs();
-        signatures[0].1 = [0xFF; 64];
-        signatures.push(mock_sig_for(3));
+        let signatures = vec![mock_sig_for(1), mock_sig_for(9), mock_sig_for(2)];
         let call = crate::Call::<Test>::credit_deposit {
             target: ALICE,
             amount_ada: 1,
@@ -414,9 +412,9 @@ fn genesis_safety_post_dispatch_refunds_unchecked_signatures_on_error() {
         VERIFY_CALLS.with(|count| count.set(0));
         let failure = call
             .dispatch_bypass_filter(RuntimeOrigin::signed(1))
-            .expect_err("bad first signature");
-        assert_eq!(failure.error, Error::<Test>::InvalidSignature.into());
-        assert_eq!(VERIFY_CALLS.with(|count| count.get()), 1);
+            .expect_err("non-member second signer");
+        assert_eq!(failure.error, Error::<Test>::SignerNotCommitteeMember.into());
+        assert_eq!(VERIFY_CALLS.with(|count| count.get()), 0);
         assert!(
             failure
                 .post_info
@@ -426,6 +424,30 @@ fn genesis_safety_post_dispatch_refunds_unchecked_signatures_on_error() {
                 < declared.ref_time()
         );
     });
+}
+
+#[test]
+fn genesis_safety_bundle_prescan_precedes_verification() {
+    for (last, error) in [
+        (mock_sig_for(1), Error::<Test>::DuplicateSigner),
+        (mock_sig_for(9), Error::<Test>::SignerNotCommitteeMember),
+    ] {
+        new_test_ext().execute_with(|| {
+            VERIFY_CALLS.with(|count| count.set(0));
+            assert_noop!(
+                IntentSettlement::credit_deposit(
+                    RuntimeOrigin::signed(1),
+                    ALICE,
+                    1,
+                    [0x46; 32],
+                    vec![mock_sig_for(1), mock_sig_for(2), last],
+                )
+                .map_err(|failure| failure.error),
+                error
+            );
+            assert_eq!(VERIFY_CALLS.with(|count| count.get()), 0);
+        });
+    }
 }
 
 #[test]
@@ -493,30 +515,38 @@ fn genesis_safety_attestation_at_ttl_retains_full_release_delay() {
 #[test]
 fn genesis_safety_actual_signature_weight_matches_checked_prefix() {
     use frame_support::{dispatch::GetDispatchInfo, traits::UnfilteredDispatchable};
+    let deposit = |signatures| crate::Call::<Test>::credit_deposit {
+        target: ALICE,
+        amount_ada: 1,
+        cardano_tx_hash: [0x61; 32],
+        signatures,
+    };
+    for rejected_at in 1..3 {
+        new_test_ext().execute_with(|| {
+            let mut signatures = vec![mock_sig_for(1), mock_sig_for(2), mock_sig_for(3)];
+            signatures[rejected_at] = mock_sig_for(9);
+            let scanned = deposit(signatures[..=rejected_at].to_vec())
+                .get_dispatch_info()
+                .weight;
+            let result = deposit(signatures)
+                .dispatch_bypass_filter(RuntimeOrigin::signed(1))
+                .expect_err("non-member signer");
+            assert_eq!(result.error, Error::<Test>::SignerNotCommitteeMember.into());
+            assert_eq!(result.post_info.actual_weight, Some(scanned));
+        });
+    }
     for invalid_at in 0..3 {
         new_test_ext().execute_with(|| {
             let mut signatures = vec![mock_sig_for(1), mock_sig_for(2), mock_sig_for(3)];
             signatures[invalid_at].1 = [0xFF; 64];
-            let call = crate::Call::<Test>::credit_deposit {
-                target: ALICE,
-                amount_ada: 1,
-                cardano_tx_hash: [0x61; 32],
-                signatures: signatures.clone(),
-            };
-            signatures.truncate(invalid_at + 1);
-            let checked_weight = crate::Call::<Test>::credit_deposit {
-                target: ALICE,
-                amount_ada: 1,
-                cardano_tx_hash: [0x61; 32],
-                signatures,
-            }
-            .get_dispatch_info()
-            .weight;
-            let result = call
+            let declared = deposit(signatures.clone()).get_dispatch_info().weight;
+            VERIFY_CALLS.with(|count| count.set(0));
+            let result = deposit(signatures)
                 .dispatch_bypass_filter(RuntimeOrigin::signed(1))
                 .expect_err("bad signature");
             assert_eq!(result.error, Error::<Test>::InvalidSignature.into());
-            assert_eq!(result.post_info.actual_weight, Some(checked_weight));
+            assert_eq!(VERIFY_CALLS.with(|count| count.get()), invalid_at as u32 + 1);
+            assert_eq!(result.post_info.actual_weight, Some(declared));
         });
     }
     new_test_ext().execute_with(|| {

@@ -4919,32 +4919,24 @@ pub mod pallet {
                 signatures.iter().any(|(key, _)| key == &caller_pubkey),
                 Error::<T>::InsufficientSignatures
             );
-            for (pubkey, sig) in signatures.iter() {
+            // Every entry passes the duplicate and membership checks before
+            // any signature is verified. `checked` counts scanned entries and
+            // each is charged a full signature, which covers its scan and its
+            // verification whichever check fails.
+            for (pubkey, _) in signatures.iter() {
                 *checked = checked.saturating_add(1);
-                // Duplicate-signer check (Issue #7: prevent "2-of-2 by one
-                // caller pasting the same sig twice").
                 ensure!(!seen.contains(pubkey), Error::<T>::DuplicateSigner);
-                // Every signer must be a current committee member.
                 let account = T::CommitteeMembership::account_of_pubkey(pubkey)
                     .ok_or(Error::<T>::SignerNotCommitteeMember)?;
                 ensure!(
                     T::CommitteeMembership::is_member(&account),
                     Error::<T>::SignerNotCommitteeMember
                 );
-                // sr25519 verify via T::SigVerifier (pluggable so tests can
-                // swap in a deterministic stub — see `MockSigVerifier` in
-                // tests.rs). Signatures in prod are sr25519 per spec §3.1.
-                if !V::verify(pubkey, sig, payload) {
-                    return Err(Error::<T>::InvalidSignature.into());
-                }
                 seen.push(*pubkey);
             }
-
-            // Effective count of distinct signers must meet the threshold.
-            ensure!(
-                seen.len() as u32 >= effective_threshold,
-                Error::<T>::InsufficientSignatures
-            );
+            for (pubkey, sig) in signatures.iter() {
+                ensure!(V::verify(pubkey, sig, payload), Error::<T>::InvalidSignature);
+            }
             Ok(())
         }
 
