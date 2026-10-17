@@ -106,6 +106,40 @@ export interface CommitteeState {
 }
 
 /** Keeper-side state tracked per voucher (§5.6 idempotency). */
+/** `SettlementEvidence` in the shape the settlement extrinsics take. */
+export interface SettlementEvidence {
+  cardano_tx_hash: HexString;
+  observed_at_depth: number;
+  observed_slot: bigint;
+  beneficiary_addr_hash: HexString;
+  amount_lovelace: bigint;
+  mainchain_genesis_hash: HexString;
+}
+
+/** A pending `ClaimSettlementRequests` row; `requester` is a public key. */
+export interface SettlementRequestView {
+  requester: HexString;
+  submittedBlock: BlockNumber;
+  settledDirect: boolean;
+  bondAmount: bigint;
+  evidence: SettlementEvidence;
+}
+
+/** A bond held after attestation until `release_settlement_bond`. */
+export interface AttestedBond {
+  requester: HexString;
+  amount: bigint;
+  attestedAt: BlockNumber;
+}
+
+/** Runtime constants the settlement keeper depends on. */
+export interface SettlementConstants {
+  minSettlementBond: bigint;
+  settlementRequestTtl: number;
+  bondReleaseDelayBlocks: number;
+  maxObservedDepth: number;
+}
+
 export interface KeeperSubmission {
   claimId: ClaimId;
   cardanoTxHash: HexString | null;

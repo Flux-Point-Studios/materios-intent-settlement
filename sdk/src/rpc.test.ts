@@ -1,5 +1,11 @@
 import { describe, it, expect, vi } from "vitest";
-import { MateriosRpcClient, submitIntent, submitCreditRefund, submitSettleClaim } from "./rpc.js";
+import {
+  DispatchFailedError,
+  MateriosRpcClient,
+  submitIntent,
+  submitCreditRefund,
+  submitSettleClaim,
+} from "./rpc.js";
 
 /**
  * Unit tests for RPC wrapper decoders + extrinsic submission helpers. Full
@@ -160,6 +166,153 @@ describe("MateriosRpcClient", () => {
     await expect(
       client.submitExtrinsic("intentSettlement", "settleClaim", []),
     ).rejects.toThrow();
+  });
+});
+
+function inBlockClient(dispatchError: unknown): MateriosRpcClient {
+  const client = new MateriosRpcClient({ rpcUrl: "ws://stub", signerUri: "//Alice" });
+  const ext = {
+    hash: { toHex: () => "0x" + "ff".repeat(32) },
+    signAndSend: vi.fn().mockImplementation((_signer, _opts, cb) => {
+      setTimeout(
+        () =>
+          cb({
+            status: { isInBlock: true, asInBlock: { toHex: () => "0x" + "11".repeat(32) } },
+            isError: false,
+            dispatchError,
+          }),
+        1,
+      );
+      return Promise.resolve(vi.fn());
+    }),
+  };
+  const api = {
+    tx: { intentSettlement: { requestSettle: () => ext } },
+    rpc: { system: { accountNextIndex: vi.fn().mockResolvedValue({ toNumber: () => 3 }) } },
+    registry: {
+      findMetaError: vi.fn().mockReturnValue({ section: "intentSettlement", name: "SettlementRequestAlreadyExists" }),
+    },
+  };
+  // @ts-expect-error
+  client["api"] = api as any;
+  // @ts-expect-error
+  client["signer"] = { address: "5GrwvaEF" } as any;
+  return client;
+}
+
+describe("dispatch failures", () => {
+  it("rejects an included extrinsic whose dispatch failed, naming the module error", async () => {
+    const client = inBlockClient({ isModule: true, asModule: { index: 2, error: 45 } });
+    const failure = await client
+      .submitExtrinsic("intentSettlement", "requestSettle", [])
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(DispatchFailedError);
+    expect(failure).toMatchObject({
+      call: "intentSettlement.requestSettle",
+      pallet: "intentSettlement",
+      error: "SettlementRequestAlreadyExists",
+      blockHash: "0x" + "11".repeat(32),
+    });
+  });
+
+  it("names non-module dispatch errors by their variant", async () => {
+    const client = inBlockClient({ isModule: false, type: "Token", asToken: { type: "FundsUnavailable" } });
+    await expect(client.submitExtrinsic("intentSettlement", "requestSettle", [])).rejects.toMatchObject({
+      pallet: null,
+      error: "Token.FundsUnavailable",
+    });
+  });
+});
+
+describe("settlement reads", () => {
+  function readClient(query: Record<string, unknown>, consts: Record<string, unknown> = {}): MateriosRpcClient {
+    const client = new MateriosRpcClient({ rpcUrl: "ws://stub" });
+    // @ts-expect-error
+    client["api"] = { query: { intentSettlement: query }, consts: { intentSettlement: consts } } as any;
+    return client;
+  }
+  const codec = (value: unknown) => ({ toString: () => String(value), toNumber: () => Number(value), toHex: () => value });
+  const some = (value: unknown) => ({ isSome: true, isNone: false, unwrap: () => value });
+  const none = { isSome: false, isNone: true };
+
+  it("decodes a pending settlement request with its requester as a public key", async () => {
+    const client = readClient({
+      claimSettlementRequests: vi.fn().mockResolvedValue(
+        some({
+          requester: codec("0x" + "ab".repeat(32)),
+          submittedBlock: codec(7),
+          settledDirect: { isTrue: false },
+          bondAmount: codec(500),
+          evidence: {
+            cardanoTxHash: codec("0x" + "cd".repeat(32)),
+            observedAtDepth: codec(15),
+            observedSlot: codec(123),
+            beneficiaryAddrHash: codec("0x" + "22".repeat(28)),
+            amountLovelace: codec(1000),
+            mainchainGenesisHash: codec("0x" + "65".repeat(32)),
+          },
+        }),
+      ),
+    });
+    await expect(client.getSettlementRequest(("0x" + "01".repeat(32)) as `0x${string}`)).resolves.toEqual({
+      requester: "0x" + "ab".repeat(32),
+      submittedBlock: 7,
+      settledDirect: false,
+      bondAmount: 500n,
+      evidence: {
+        cardano_tx_hash: "0x" + "cd".repeat(32),
+        observed_at_depth: 15,
+        observed_slot: 123n,
+        beneficiary_addr_hash: "0x" + "22".repeat(28),
+        amount_lovelace: 1000n,
+        mainchain_genesis_hash: "0x" + "65".repeat(32),
+      },
+    });
+  });
+
+  it("reports absent requests, unsettled claims and unbonded claims", async () => {
+    const client = readClient({
+      claimSettlementRequests: vi.fn().mockResolvedValue(none),
+      claims: vi.fn().mockResolvedValue(none),
+      bondedClaimRequester: vi.fn().mockResolvedValue(none),
+      bondedClaimAttestedAt: vi.fn().mockResolvedValue(none),
+    });
+    const claim = ("0x" + "01".repeat(32)) as `0x${string}`;
+    await expect(client.getSettlementRequest(claim)).resolves.toBeNull();
+    await expect(client.isClaimSettled(claim)).resolves.toBe(false);
+    await expect(client.getAttestedBond(claim)).resolves.toBeNull();
+  });
+
+  it("reads settled claims and attested bonds", async () => {
+    const client = readClient({
+      claims: vi.fn().mockResolvedValue(some({ settled: { isTrue: true } })),
+      bondedClaimRequester: vi.fn().mockResolvedValue(some([codec("0x" + "ab".repeat(32)), codec(500)])),
+      bondedClaimAttestedAt: vi.fn().mockResolvedValue(some(codec(90))),
+    });
+    const claim = ("0x" + "01".repeat(32)) as `0x${string}`;
+    await expect(client.isClaimSettled(claim)).resolves.toBe(true);
+    await expect(client.getAttestedBond(claim)).resolves.toEqual({
+      requester: "0x" + "ab".repeat(32),
+      amount: 500n,
+      attestedAt: 90,
+    });
+  });
+
+  it("reads the settlement constants and refuses a runtime that lacks one", () => {
+    const complete = {
+      minSettlementBond: codec(0),
+      settlementRequestTtl: codec(2400),
+      bondReleaseDelayBlocks: codec(30),
+      maxObservedDepth: codec(2160),
+    };
+    expect(readClient({}, complete).getSettlementConstants()).toEqual({
+      minSettlementBond: 0n,
+      settlementRequestTtl: 2400,
+      bondReleaseDelayBlocks: 30,
+      maxObservedDepth: 2160,
+    });
+    const { maxObservedDepth: _, ...missing } = complete;
+    expect(() => readClient({}, missing).getSettlementConstants()).toThrow(/maxObservedDepth/);
   });
 });
 

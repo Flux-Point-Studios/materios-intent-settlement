@@ -16,7 +16,38 @@ import type {
   IntentKind,
   AdaLovelace,
   BlockNumber,
+  AttestedBond,
+  SettlementConstants,
+  SettlementRequestView,
 } from "./types.js";
+
+/**
+ * The extrinsic was included in a block, but its dispatch failed. `pallet`
+ * and `error` name a module error (`intentSettlement`,
+ * `SettlementRequestAlreadyExists`); other dispatch errors have a null
+ * pallet and their variant as `error` (`BadOrigin`, `Token.FundsUnavailable`).
+ */
+export class DispatchFailedError extends Error {
+  constructor(
+    readonly call: string,
+    readonly pallet: string | null,
+    readonly error: string,
+    readonly blockHash: HexString,
+  ) {
+    super(`${call} failed in block ${blockHash}: ${pallet ? `${pallet}.` : ""}${error}`);
+    this.name = "DispatchFailedError";
+  }
+}
+
+function describeDispatchError(api: ApiPromise, dispatchError: any): { pallet: string | null; error: string } {
+  if (dispatchError.isModule) {
+    const meta = api.registry.findMetaError(dispatchError.asModule);
+    return { pallet: meta.section, error: meta.name };
+  }
+  const variant = String(dispatchError.type);
+  const inner = dispatchError[`as${variant}`];
+  return { pallet: null, error: inner?.type ? `${variant}.${inner.type}` : variant };
+}
 
 export interface MateriosRpcClientOptions {
   rpcUrl: string;
@@ -203,6 +234,11 @@ export class MateriosRpcClient {
               (result: any) => {
                 if (result?.status?.isInBlock) {
                   const blockHash = result.status.asInBlock.toHex() as HexString;
+                  if (result.dispatchError) {
+                    const { pallet, error } = describeDispatchError(api, result.dispatchError);
+                    done(null, new DispatchFailedError(`${section}.${method}`, pallet, error, blockHash));
+                    return;
+                  }
                   const txHash = ext.hash.toHex() as HexString;
                   done({ txHash, blockHash }, null);
                 } else if (result?.isError) {
@@ -235,6 +271,66 @@ export class MateriosRpcClient {
           reject(e instanceof Error ? e : new Error(String(e)));
         });
     });
+  }
+
+  /** The pending settlement request for a claim, if any. */
+  async getSettlementRequest(claimId: ClaimId): Promise<SettlementRequestView | null> {
+    const stored: any = await (this.getApi().query as any).intentSettlement.claimSettlementRequests(claimId);
+    if (!stored.isSome) return null;
+    const request = stored.unwrap();
+    const evidence = request.evidence;
+    return {
+      requester: request.requester.toHex() as HexString,
+      submittedBlock: request.submittedBlock.toNumber(),
+      settledDirect: request.settledDirect.isTrue,
+      bondAmount: BigInt(request.bondAmount.toString()),
+      evidence: {
+        cardano_tx_hash: evidence.cardanoTxHash.toHex() as HexString,
+        observed_at_depth: evidence.observedAtDepth.toNumber(),
+        observed_slot: BigInt(evidence.observedSlot.toString()),
+        beneficiary_addr_hash: evidence.beneficiaryAddrHash.toHex() as HexString,
+        amount_lovelace: BigInt(evidence.amountLovelace.toString()),
+        mainchain_genesis_hash: evidence.mainchainGenesisHash.toHex() as HexString,
+      },
+    };
+  }
+
+  /** Whether the claim is settled on Materios. */
+  async isClaimSettled(claimId: ClaimId): Promise<boolean> {
+    const stored: any = await (this.getApi().query as any).intentSettlement.claims(claimId);
+    return stored.isSome && stored.unwrap().settled.isTrue;
+  }
+
+  /** The bond held after attestation until its release, if any. */
+  async getAttestedBond(claimId: ClaimId): Promise<AttestedBond | null> {
+    const query: any = (this.getApi().query as any).intentSettlement;
+    const [holder, attestedAt]: any[] = await Promise.all([
+      query.bondedClaimRequester(claimId),
+      query.bondedClaimAttestedAt(claimId),
+    ]);
+    if (!holder.isSome || !attestedAt.isSome) return null;
+    const [requester, amount] = holder.unwrap();
+    return {
+      requester: requester.toHex() as HexString,
+      amount: BigInt(amount.toString()),
+      attestedAt: attestedAt.unwrap().toNumber(),
+    };
+  }
+
+  /** Settlement constants from the connected runtime's metadata. */
+  getSettlementConstants(): SettlementConstants {
+    const consts: any = (this.getApi().consts as any).intentSettlement ?? {};
+    const read = (name: string): any => {
+      const value = consts[name];
+      if (value === undefined) throw new Error(`runtime lacks intentSettlement.${name}`);
+      return value;
+    };
+    return {
+      minSettlementBond: BigInt(read("minSettlementBond").toString()),
+      settlementRequestTtl: read("settlementRequestTtl").toNumber(),
+      bondReleaseDelayBlocks: read("bondReleaseDelayBlocks").toNumber(),
+      maxObservedDepth: read("maxObservedDepth").toNumber(),
+    };
   }
 
   /** Dry-run a call for fee estimation and syntactic validation. */
