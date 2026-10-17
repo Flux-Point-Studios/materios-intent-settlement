@@ -1680,7 +1680,11 @@ fn genesis_safety_fraud_bundle_cannot_slash_a_replacement_request() {
         for account in [&requester, &alice, &treasury] {
             let _ = Balances::deposit_creating(account, 2_000);
         }
-        assert_ok!(Balances::reserve_named(&crate::SETTLEMENT_BOND_RESERVE_ID, &requester, 500));
+        assert_ok!(Balances::reserve_named(
+            &crate::SETTLEMENT_BOND_RESERVE_ID,
+            &requester,
+            500
+        ));
         let mut record = SettlementRequestRecord {
             requester: requester.clone(),
             evidence,

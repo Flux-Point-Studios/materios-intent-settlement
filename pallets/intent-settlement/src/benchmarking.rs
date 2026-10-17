@@ -1044,7 +1044,9 @@ mod benchmarks {
     fn supersede_settlement_request() {
         let (claim_id, evidence) = seed_settleable_claim::<T>(b"SPSD", 0);
         seed_expired_bonded_request::<T>(claim_id, evidence, 0);
-        let intent_id = crate::pallet::Claims::<T>::get(claim_id).expect("seeded claim").intent_id;
+        let intent_id = crate::pallet::Claims::<T>::get(claim_id)
+            .expect("seeded claim")
+            .intent_id;
         crate::pallet::Intents::<T>::insert(
             intent_id,
             Intent {
@@ -1098,5 +1100,4 @@ mod benchmarks {
             sp_std::vec![(public.0, signature.0)],
         );
     }
-
 }

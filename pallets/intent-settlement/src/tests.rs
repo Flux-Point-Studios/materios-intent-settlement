@@ -5523,16 +5523,21 @@ fn task266_migration_flags_existing_settled_claims() {
         // set by legacy settle), the version reaches the current one
         // through every chained step, and both cutovers are scheduled.
         assert!(PreAuditSettlement::<Test>::get(claim_id));
-        assert_eq!(SettlementStorageVersion::<Test>::get(), pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION);
-        let stca_cutover =
-            pallet_intent_settlement::pallet::StcaCutoverBlock::<Test>::get();
+        assert_eq!(
+            SettlementStorageVersion::<Test>::get(),
+            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION
+        );
+        let stca_cutover = pallet_intent_settlement::pallet::StcaCutoverBlock::<Test>::get();
         assert!(stca_cutover > 0u64);
         let expp_cutover =
             pallet_intent_settlement::pallet::PolicyExpireCutoverBlock::<Test>::get();
         assert!(expp_cutover > 0u64);
         // Idempotency: a second invocation must not double-flag.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
-        assert_eq!(SettlementStorageVersion::<Test>::get(), pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION);
+        assert_eq!(
+            SettlementStorageVersion::<Test>::get(),
+            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION
+        );
     });
 }
 
@@ -5597,15 +5602,21 @@ fn task266_migration_truncation_recovers_to_full_progress() {
         assert_eq!(flagged_after_2, 3, "second run drains tail to full flag set");
         // After v0→v1 completes, the same invocation chains every later
         // step, so the terminal version is the current one.
-        assert_eq!(SettlementStorageVersion::<Test>::get(), pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION,
-                   "version reaches the current one after the chained steps complete");
+        assert_eq!(
+            SettlementStorageVersion::<Test>::get(),
+            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION,
+            "version reaches the current one after the chained steps complete"
+        );
         let cutover_after_2 = StcaCutoverBlock::<Test>::get();
         assert_eq!(cutover_after_1, cutover_after_2,
                    "STCA cutover MUST NOT slide between runs");
         // Third run: idempotent — version already current, early-return.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         assert_eq!(StcaCutoverBlock::<Test>::get(), cutover_after_2);
-        assert_eq!(SettlementStorageVersion::<Test>::get(), pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION);
+        assert_eq!(
+            SettlementStorageVersion::<Test>::get(),
+            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION
+        );
     });
 }
 

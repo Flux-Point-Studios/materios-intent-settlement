@@ -1954,10 +1954,15 @@ pub mod pallet {
                     *total = total.saturating_add(bond);
                 }
                 for (requester, bond) in owed {
-                    let reserved: u128 =
-                        T::Currency::reserved_balance_named(&SETTLEMENT_BOND_RESERVE_ID, &requester)
-                            .saturated_into();
-                    ensure!(reserved >= bond, "settlement bonds exceed the settlement reserve");
+                    let reserved: u128 = T::Currency::reserved_balance_named(
+                        &SETTLEMENT_BOND_RESERVE_ID,
+                        &requester,
+                    )
+                    .saturated_into();
+                    ensure!(
+                        reserved >= bond,
+                        "settlement bonds exceed the settlement reserve"
+                    );
                 }
             }
             Ok(())
@@ -3796,59 +3801,56 @@ pub mod pallet {
             evidence: SettlementEvidence,
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
         ) -> DispatchResultWithPostInfo {
-            Self::with_signature_weight(
-                T::WeightInfo::supersede_settlement_request(),
-                |checked| {
-                    let who = ensure_signed(origin)?;
-                    ensure!(
-                        T::CommitteeMembership::is_member(&who),
-                        Error::<T>::NotCommitteeMember
-                    );
-                    ensure!(
-                        signatures.len() <= T::MaxCommittee::get() as usize,
-                        Error::<T>::TooManySignatures
-                    );
-                    let (claim, voucher) = Self::checked_settlement_target(claim_id, &evidence)?;
-                    let request = ClaimSettlementRequests::<T>::get(claim_id)
-                        .ok_or(Error::<T>::SettlementRequestMissing)?;
-                    ensure!(
-                        request.evidence != evidence || request.settled_direct != settled_direct,
-                        Error::<T>::SupersedeMatchesRequest
-                    );
+            Self::with_signature_weight(T::WeightInfo::supersede_settlement_request(), |checked| {
+                let who = ensure_signed(origin)?;
+                ensure!(
+                    T::CommitteeMembership::is_member(&who),
+                    Error::<T>::NotCommitteeMember
+                );
+                ensure!(
+                    signatures.len() <= T::MaxCommittee::get() as usize,
+                    Error::<T>::TooManySignatures
+                );
+                let (claim, voucher) = Self::checked_settlement_target(claim_id, &evidence)?;
+                let request = ClaimSettlementRequests::<T>::get(claim_id)
+                    .ok_or(Error::<T>::SettlementRequestMissing)?;
+                ensure!(
+                    request.evidence != evidence || request.settled_direct != settled_direct,
+                    Error::<T>::SupersedeMatchesRequest
+                );
 
-                    let payload = settle_claim_attested_payload(
-                        &Self::materios_chain_id_bytes(),
-                        &claim_id,
-                        &Self::compute_canonical_voucher_digest(&voucher)?,
-                        &evidence.cardano_tx_hash,
-                        settled_direct,
-                        &evidence.beneficiary_addr_hash,
-                        claim.amount_ada,
-                        evidence.observed_at_depth,
-                        evidence.observed_slot,
-                        &T::MainchainGenesisHash::get(),
-                    );
-                    Self::verify_threshold_signatures::<T::SigVerifier>(
-                        &payload,
-                        &who,
-                        &signatures,
-                        checked,
-                    )?;
+                let payload = settle_claim_attested_payload(
+                    &Self::materios_chain_id_bytes(),
+                    &claim_id,
+                    &Self::compute_canonical_voucher_digest(&voucher)?,
+                    &evidence.cardano_tx_hash,
+                    settled_direct,
+                    &evidence.beneficiary_addr_hash,
+                    claim.amount_ada,
+                    evidence.observed_at_depth,
+                    evidence.observed_slot,
+                    &T::MainchainGenesisHash::get(),
+                );
+                Self::verify_threshold_signatures::<T::SigVerifier>(
+                    &payload,
+                    &who,
+                    &signatures,
+                    checked,
+                )?;
 
-                    Self::discard_settlement_request(claim_id, request.clone())?;
-                    Self::deposit_event(Event::SettlementRequestSuperseded {
-                        claim_id,
-                        requester: request.requester,
-                    });
-                    Self::settle_attested_claim(
-                        claim_id,
-                        claim,
-                        evidence.cardano_tx_hash,
-                        settled_direct,
-                    );
-                    Ok(())
-                },
-            )
+                Self::discard_settlement_request(claim_id, request.clone())?;
+                Self::deposit_event(Event::SettlementRequestSuperseded {
+                    claim_id,
+                    requester: request.requester,
+                });
+                Self::settle_attested_claim(
+                    claim_id,
+                    claim,
+                    evidence.cardano_tx_hash,
+                    settled_direct,
+                );
+                Ok(())
+            })
         }
 
         /// Task #266 (mis-sec P0): batch parallel of `request_settle`. The
@@ -4625,7 +4627,7 @@ pub mod pallet {
                 // shortfall there is reported, never taken from the
                 // requester's other reserves.
                 let repatriate = |beneficiary: &T::AccountId,
-                                      share: BalanceOf<T>|
+                                  share: BalanceOf<T>|
                  -> Result<u128, DispatchError> {
                     if share.is_zero() {
                         return Ok(0);
@@ -5108,7 +5110,10 @@ pub mod pallet {
                 seen.push(*pubkey);
             }
             for (pubkey, sig) in signatures.iter() {
-                ensure!(V::verify(pubkey, sig, payload), Error::<T>::InvalidSignature);
+                ensure!(
+                    V::verify(pubkey, sig, payload),
+                    Error::<T>::InvalidSignature
+                );
             }
             Ok(())
         }

@@ -103,7 +103,10 @@ fn genesis_safety_upgrade_preserves_post_genesis_audit_state() {
             "STCA settlement must retain its audit status"
         );
         assert!(!PreAuditExpiry::<Test>::get(expired_iid));
-        assert_eq!(SettlementStorageVersion::<Test>::get(), crate::SETTLEMENT_STORAGE_VERSION);
+        assert_eq!(
+            SettlementStorageVersion::<Test>::get(),
+            crate::SETTLEMENT_STORAGE_VERSION
+        );
         assert_eq!(StcaCutoverBlock::<Test>::get(), 0);
         assert_eq!(PolicyExpireCutoverBlock::<Test>::get(), 0);
         assert_eq!(
@@ -419,7 +422,10 @@ fn genesis_safety_post_dispatch_refunds_unchecked_signatures_on_error() {
         let failure = call
             .dispatch_bypass_filter(RuntimeOrigin::signed(1))
             .expect_err("non-member second signer");
-        assert_eq!(failure.error, Error::<Test>::SignerNotCommitteeMember.into());
+        assert_eq!(
+            failure.error,
+            Error::<Test>::SignerNotCommitteeMember.into()
+        );
         assert_eq!(VERIFY_CALLS.with(|count| count.get()), 0);
         assert!(
             failure
@@ -551,7 +557,10 @@ fn genesis_safety_actual_signature_weight_matches_checked_prefix() {
                 .dispatch_bypass_filter(RuntimeOrigin::signed(1))
                 .expect_err("bad signature");
             assert_eq!(result.error, Error::<Test>::InvalidSignature.into());
-            assert_eq!(VERIFY_CALLS.with(|count| count.get()), invalid_at as u32 + 1);
+            assert_eq!(
+                VERIFY_CALLS.with(|count| count.get()),
+                invalid_at as u32 + 1
+            );
             assert_eq!(result.post_info.actual_weight, Some(declared));
         });
     }
@@ -924,11 +933,13 @@ fn genesis_safety_reserve_deficit_does_not_block_replacement() {
         ));
         assert_eq!(Balances::free_balance(ALICE), before + 300);
         assert_eq!(Balances::reserved_balance(ALICE), 0);
-        System::assert_has_event(RuntimeEvent::IntentSettlement(Event::SettlementBondReleased {
-            claim_id: cid,
-            requester: ALICE,
-            amount: 300,
-        }));
+        System::assert_has_event(RuntimeEvent::IntentSettlement(
+            Event::SettlementBondReleased {
+                claim_id: cid,
+                requester: ALICE,
+                amount: 300,
+            },
+        ));
         System::assert_has_event(RuntimeEvent::IntentSettlement(
             Event::SettlementBondReserveDeficit {
                 claim_id: cid,
@@ -1131,7 +1142,10 @@ fn genesis_safety_upgrade_checks_accept_legacy_migrations_and_genesis() {
             <IntentSettlement as Hooks<u64>>::on_runtime_upgrade();
             assert_ok!(<IntentSettlement as Hooks<u64>>::post_upgrade(before));
             assert_ok!(<IntentSettlement as Hooks<u64>>::try_state(100));
-            assert_eq!(SettlementStorageVersion::<Test>::get(), crate::SETTLEMENT_STORAGE_VERSION);
+            assert_eq!(
+                SettlementStorageVersion::<Test>::get(),
+                crate::SETTLEMENT_STORAGE_VERSION
+            );
         });
     }
 }
@@ -1325,7 +1339,11 @@ fn genesis_safety_supersede_requires_a_committee_threshold() {
         let mut forged = mock_settle_sigs();
         forged[1].1 = [0xFF; 64];
         for (caller, signatures, error) in [
-            (1, vec![mock_sig_for(1)], Error::<Test>::InsufficientSignatures),
+            (
+                1,
+                vec![mock_sig_for(1)],
+                Error::<Test>::InsufficientSignatures,
+            ),
             (1, forged, Error::<Test>::InvalidSignature),
             (BOB, mock_settle_sigs(), Error::<Test>::NotCommitteeMember),
         ] {
@@ -1342,7 +1360,9 @@ fn genesis_safety_supersede_requires_a_committee_threshold() {
             );
         }
         assert_eq!(
-            ClaimSettlementRequests::<Test>::get(cid).expect("junk stays").evidence,
+            ClaimSettlementRequests::<Test>::get(cid)
+                .expect("junk stays")
+                .evidence,
             junk
         );
         assert_eq!(Balances::reserved_balance(BOB), 7);
@@ -1420,7 +1440,11 @@ fn genesis_safety_refund_never_draws_on_another_pallets_reserve() {
     use frame_support::traits::NamedReservableCurrency;
     new_test_ext().execute_with(|| {
         let (cid, voucher) = alice_request_and_bond(0xB2, 1_000, 500);
-        assert_ok!(Balances::reserve_named(&OTHER_PALLET_RESERVE, &ALICE, 1_000));
+        assert_ok!(Balances::reserve_named(
+            &OTHER_PALLET_RESERVE,
+            &ALICE,
+            1_000
+        ));
         let (imbalance, unslashed) =
             Balances::slash_reserved_named(&crate::SETTLEMENT_BOND_RESERVE_ID, &ALICE, 200);
         drop(imbalance);
@@ -1437,7 +1461,10 @@ fn genesis_safety_refund_never_draws_on_another_pallets_reserve() {
             1
         ));
         assert_eq!(Balances::free_balance(ALICE), free + 300);
-        assert_eq!(Balances::reserved_balance_named(&OTHER_PALLET_RESERVE, &ALICE), 1_000);
+        assert_eq!(
+            Balances::reserved_balance_named(&OTHER_PALLET_RESERVE, &ALICE),
+            1_000
+        );
         assert_eq!(Balances::reserved_balance(ALICE), 1_000);
         System::assert_has_event(RuntimeEvent::IntentSettlement(
             Event::SettlementBondReserveDeficit {
@@ -1454,7 +1481,11 @@ fn genesis_safety_slash_never_draws_on_another_pallets_reserve() {
     use frame_support::traits::NamedReservableCurrency;
     new_test_ext().execute_with(|| {
         let (cid, _) = alice_request_and_bond(0xB3, 1_000, 500);
-        assert_ok!(Balances::reserve_named(&OTHER_PALLET_RESERVE, &ALICE, 1_000));
+        assert_ok!(Balances::reserve_named(
+            &OTHER_PALLET_RESERVE,
+            &ALICE,
+            1_000
+        ));
         let (imbalance, _) =
             Balances::slash_reserved_named(&crate::SETTLEMENT_BOND_RESERVE_ID, &ALICE, 200);
         drop(imbalance);
@@ -1472,16 +1503,21 @@ fn genesis_safety_slash_never_draws_on_another_pallets_reserve() {
         .map_err(|error| error.error));
         assert_eq!(Balances::free_balance(1), watcher_free + 250);
         assert_eq!(Balances::free_balance(treasury), treasury_free + 50);
-        assert_eq!(Balances::reserved_balance_named(&OTHER_PALLET_RESERVE, &ALICE), 1_000);
+        assert_eq!(
+            Balances::reserved_balance_named(&OTHER_PALLET_RESERVE, &ALICE),
+            1_000
+        );
         assert_eq!(Balances::reserved_balance(ALICE), 1_000);
-        System::assert_has_event(RuntimeEvent::IntentSettlement(Event::SettlementBondSlashed {
-            claim_id: cid,
-            requester: ALICE,
-            watcher: 1,
-            watcher_share: 250,
-            treasury_share: 50,
-            fraud_proof: FraudProof::TxNotFound,
-        }));
+        System::assert_has_event(RuntimeEvent::IntentSettlement(
+            Event::SettlementBondSlashed {
+                claim_id: cid,
+                requester: ALICE,
+                watcher: 1,
+                watcher_share: 250,
+                treasury_share: 50,
+                fraud_proof: FraudProof::TxNotFound,
+            },
+        ));
         System::assert_has_event(RuntimeEvent::IntentSettlement(
             Event::SettlementBondReserveDeficit {
                 claim_id: cid,
@@ -1521,7 +1557,10 @@ fn genesis_safety_upgrade_moves_outstanding_bonds_to_the_settlement_reserve() {
 
         <IntentSettlement as OnRuntimeUpgrade>::on_runtime_upgrade();
 
-        assert_eq!(SettlementStorageVersion::<Test>::get(), crate::SETTLEMENT_STORAGE_VERSION);
+        assert_eq!(
+            SettlementStorageVersion::<Test>::get(),
+            crate::SETTLEMENT_STORAGE_VERSION
+        );
         assert_eq!(settlement_reserve(ALICE), 500);
         assert_eq!(Balances::reserved_balance(ALICE), 600);
         assert_eq!(settlement_reserve(BOB), 400);
@@ -1608,7 +1647,8 @@ fn genesis_safety_request_dispatches_declare_their_benchmarked_weights() {
             }
             .get_dispatch_info()
             .weight,
-            Weights::supersede_settlement_request().saturating_add(Weights::threshold_signatures(2))
+            Weights::supersede_settlement_request()
+                .saturating_add(Weights::threshold_signatures(2))
         );
     });
 }
@@ -1655,28 +1695,71 @@ fn genesis_safety_metadata_tags_are_the_tags_each_digest_hashes() {
     let voucher_body =
         canonical_voucher_body_with_address(identity, &zero, &zero, &[0x82], 0, &[0; 32], 0, 0);
     let digests: Vec<(&str, [u8; 32], Vec<u8>)> = vec![
-        ("CreditDepositTag", crate::credit_deposit_payload(&chain, &[0; 32], 0, &[0; 32]), after_chain(&[0; 72])),
-        ("SettleClaimTag", crate::settle_claim_payload(&chain, &zero, &[0; 32], false), after_chain(&[0; 65])),
-        ("RequestVoucherTag", crate::request_voucher_payload(&chain, &zero, &zero, &[0; 32], &[0; 32]), after_chain(&[0; 128])),
-        ("SettleBatchAtomicTag", crate::settle_batch_atomic_payload(&chain, &[]), after_chain(&[0; 4])),
-        ("AttestBatchIntentsTag", crate::attest_batch_intents_payload(&chain, &[]), after_chain(&[0; 4])),
-        ("RequestBatchVouchersTag", crate::request_batch_vouchers_payload(&chain, &[]), after_chain(&[0; 4])),
-        ("SubmitBatchIntentsTag", crate::submit_batch_intents_payload(&chain, &[]), after_chain(&[0; 4])),
+        (
+            "CreditDepositTag",
+            crate::credit_deposit_payload(&chain, &[0; 32], 0, &[0; 32]),
+            after_chain(&[0; 72]),
+        ),
+        (
+            "SettleClaimTag",
+            crate::settle_claim_payload(&chain, &zero, &[0; 32], false),
+            after_chain(&[0; 65]),
+        ),
+        (
+            "RequestVoucherTag",
+            crate::request_voucher_payload(&chain, &zero, &zero, &[0; 32], &[0; 32]),
+            after_chain(&[0; 128]),
+        ),
+        (
+            "SettleBatchAtomicTag",
+            crate::settle_batch_atomic_payload(&chain, &[]),
+            after_chain(&[0; 4]),
+        ),
+        (
+            "AttestBatchIntentsTag",
+            crate::attest_batch_intents_payload(&chain, &[]),
+            after_chain(&[0; 4]),
+        ),
+        (
+            "RequestBatchVouchersTag",
+            crate::request_batch_vouchers_payload(&chain, &[]),
+            after_chain(&[0; 4]),
+        ),
+        (
+            "SubmitBatchIntentsTag",
+            crate::submit_batch_intents_payload(&chain, &[]),
+            after_chain(&[0; 4]),
+        ),
         (
             "AttestSettleTag",
-            crate::settle_claim_attested_payload(&chain, &zero, &[0; 32], &[0; 32], false, &[0; 28], 0, 0, 0, &[0; 32]),
+            crate::settle_claim_attested_payload(
+                &chain, &zero, &[0; 32], &[0; 32], false, &[0; 28], 0, 0, 0, &[0; 32],
+            ),
             after_chain(&[0; 177]),
         ),
-        ("AttestBatchSettleTag", crate::attest_batch_settle_payload(&chain, &[]), after_chain(&[0; 4])),
+        (
+            "AttestBatchSettleTag",
+            crate::attest_batch_settle_payload(&chain, &[]),
+            after_chain(&[0; 4]),
+        ),
         (
             "AttestExpirePolicyTag",
             crate::expire_policy_attested_payload(&chain, &zero, &zero, &[0; 32], 0, 0, &[0; 32]),
             after_chain(&[0; 140]),
         ),
-        ("AttestIntentTag", crate::attest_intent_payload(&chain, &zero), after_chain(&[0; 32])),
+        (
+            "AttestIntentTag",
+            crate::attest_intent_payload(&chain, &zero),
+            after_chain(&[0; 32]),
+        ),
         (
             "SlashSettlementTag",
-            crate::slash_bad_settlement_evidence_payload(&chain, &zero, &request, &FraudProof::TxNotFound),
+            crate::slash_bad_settlement_evidence_payload(
+                &chain,
+                &zero,
+                &request,
+                &FraudProof::TxNotFound,
+            ),
             [
                 after_chain(&[0; 32]),
                 crate::settlement_request_id(&request).to_vec(),
@@ -1689,8 +1772,16 @@ fn genesis_safety_metadata_tags_are_the_tags_each_digest_hashes() {
             compute_intent_id(&[0; 32], 0, &kind, 0).0,
             [vec![0; 40], kind.encode(), vec![0; 4]].concat(),
         ),
-        ("FairnessProofTag", compute_fairness_proof_digest(&proof), proof.encode()),
-        ("CommitteeSetTag", compute_committee_set_digest(&[], 0), vec![0; 5]),
+        (
+            "FairnessProofTag",
+            compute_fairness_proof_digest(&proof),
+            proof.encode(),
+        ),
+        (
+            "CommitteeSetTag",
+            compute_committee_set_digest(&[], 0),
+            vec![0; 5],
+        ),
         (
             "VoucherTag",
             compute_voucher_digest_with_address(identity, &zero, &zero, &[0x82], 0, &[0; 32], 0, 0),
@@ -1698,7 +1789,10 @@ fn genesis_safety_metadata_tags_are_the_tags_each_digest_hashes() {
         ),
     ];
     assert_eq!(
-        metadata.iter().filter(|constant| constant.name.ends_with("Tag")).count(),
+        metadata
+            .iter()
+            .filter(|constant| constant.name.ends_with("Tag"))
+            .count(),
         digests.len()
     );
     for (name, digest, body) in digests {
