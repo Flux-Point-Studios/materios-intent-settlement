@@ -1612,3 +1612,96 @@ fn genesis_safety_request_dispatches_declare_their_benchmarked_weights() {
         );
     });
 }
+
+#[test]
+fn genesis_safety_metadata_tags_are_the_tags_each_digest_hashes() {
+    use crate::voucher_canonicalize::{
+        canonical_voucher_body_with_address, compute_voucher_digest_with_address, ChainIdentity,
+    };
+    use parity_scale_codec::Decode;
+    let metadata = IntentSettlement::pallet_constants_metadata();
+    let tag = |name: &str| -> [u8; 4] {
+        let constant = metadata
+            .iter()
+            .find(|constant| constant.name == name)
+            .unwrap_or_else(|| panic!("metadata constant {name}"));
+        <[u8; 4]>::decode(&mut &constant.value[..]).expect("4-byte tag")
+    };
+    let chain = [0x73u8; 32];
+    let zero = H256::zero();
+    let after_chain = |rest: &[u8]| [&chain[..], rest].concat();
+    let request = SettlementRequestRecord {
+        requester: 7u64,
+        evidence: SettlementEvidence {
+            cardano_tx_hash: [0; 32],
+            observed_at_depth: 0,
+            observed_slot: 0,
+            beneficiary_addr_hash: [0; 28],
+            amount_lovelace: 0,
+            mainchain_genesis_hash: [0; 32],
+        },
+        settled_direct: false,
+        submitted_block: 0u64,
+        bond_amount: 0,
+    };
+    let kind = IntentKind::RefundCredit { amount_ada: 0 };
+    let proof = good_fairness_proof(zero, 0);
+    let identity = ChainIdentity {
+        materios_chain_id: &chain,
+        network_magic: 1,
+        aegis_policy_script_hash: &[0x42; 28],
+        settlement_version: 1,
+    };
+    let voucher_body =
+        canonical_voucher_body_with_address(identity, &zero, &zero, &[0x82], 0, &[0; 32], 0, 0);
+    let digests: Vec<(&str, [u8; 32], Vec<u8>)> = vec![
+        ("CreditDepositTag", crate::credit_deposit_payload(&chain, &[0; 32], 0, &[0; 32]), after_chain(&[0; 72])),
+        ("SettleClaimTag", crate::settle_claim_payload(&chain, &zero, &[0; 32], false), after_chain(&[0; 65])),
+        ("RequestVoucherTag", crate::request_voucher_payload(&chain, &zero, &zero, &[0; 32], &[0; 32]), after_chain(&[0; 128])),
+        ("SettleBatchAtomicTag", crate::settle_batch_atomic_payload(&chain, &[]), after_chain(&[0; 4])),
+        ("AttestBatchIntentsTag", crate::attest_batch_intents_payload(&chain, &[]), after_chain(&[0; 4])),
+        ("RequestBatchVouchersTag", crate::request_batch_vouchers_payload(&chain, &[]), after_chain(&[0; 4])),
+        ("SubmitBatchIntentsTag", crate::submit_batch_intents_payload(&chain, &[]), after_chain(&[0; 4])),
+        (
+            "AttestSettleTag",
+            crate::settle_claim_attested_payload(&chain, &zero, &[0; 32], &[0; 32], false, &[0; 28], 0, 0, 0, &[0; 32]),
+            after_chain(&[0; 177]),
+        ),
+        ("AttestBatchSettleTag", crate::attest_batch_settle_payload(&chain, &[]), after_chain(&[0; 4])),
+        (
+            "AttestExpirePolicyTag",
+            crate::expire_policy_attested_payload(&chain, &zero, &zero, &[0; 32], 0, 0, &[0; 32]),
+            after_chain(&[0; 140]),
+        ),
+        ("AttestIntentTag", crate::attest_intent_payload(&chain, &zero), after_chain(&[0; 32])),
+        (
+            "SlashSettlementTag",
+            crate::slash_bad_settlement_evidence_payload(&chain, &zero, &request, &FraudProof::TxNotFound),
+            [
+                after_chain(&[0; 32]),
+                crate::settlement_request_id(&request).to_vec(),
+                FraudProof::TxNotFound.encode(),
+            ]
+            .concat(),
+        ),
+        (
+            "IntentIdTag",
+            compute_intent_id(&[0; 32], 0, &kind, 0).0,
+            [vec![0; 40], kind.encode(), vec![0; 4]].concat(),
+        ),
+        ("FairnessProofTag", compute_fairness_proof_digest(&proof), proof.encode()),
+        ("CommitteeSetTag", compute_committee_set_digest(&[], 0), vec![0; 5]),
+        (
+            "VoucherTag",
+            compute_voucher_digest_with_address(identity, &zero, &zero, &[0x82], 0, &[0; 32], 0, 0),
+            voucher_body,
+        ),
+    ];
+    assert_eq!(
+        metadata.iter().filter(|constant| constant.name.ends_with("Tag")).count(),
+        digests.len()
+    );
+    for (name, digest, body) in digests {
+        assert_eq!(digest, domain_hash(tag(name), &body), "{name}");
+    }
+}

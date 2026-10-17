@@ -105,6 +105,31 @@ enactment. Signers that select FRAU or FRV2 by fingerprinting the
 `slash_bad_settlement_evidence` metadata docs must pin the docs of the
 runtime being enacted. No deployment is performed here.
 
+Every domain tag the pallet hashes is a `[u8; 4]` metadata constant of
+`IntentSettlement`, so a signer can tell from metadata which digest a runtime
+verifies; a runtime without `SlashSettlementTag` predates these constants.
+Each getter returns the constant its digest function hashes, and a test
+recomputes every digest from its metadata tag.
+
+| Constant | Tag | Digest |
+| --- | --- | --- |
+| `SlashSettlementTag` | `FRV2` | `slash_bad_settlement_evidence` (signed) |
+| `AttestSettleTag` | `STCA` | `attest_settle`, `supersede_settlement_request` (signed) |
+| `AttestBatchSettleTag` | `BSTA` | `attest_batch_settle` (signed) |
+| `AttestExpirePolicyTag` | `EXPP` | `attest_expire_policy` (signed) |
+| `AttestIntentTag` | `INTA` | `attest_intent` (signed) |
+| `AttestBatchIntentsTag` | `ABIN` | `attest_batch_intents` (signed) |
+| `RequestVoucherTag` | `RVCH` | `request_voucher` (signed) |
+| `RequestBatchVouchersTag` | `RVBN` | `request_batch_vouchers` (signed) |
+| `CreditDepositTag` | `CRDP` | `credit_deposit` (signed) |
+| `SettleClaimTag` | `STCL` | legacy `settle_claim` (signed) |
+| `SettleBatchAtomicTag` | `STBA` | legacy `settle_batch_atomic` (signed) |
+| `SubmitBatchIntentsTag` | `SBIN` | `submit_batch_intents` batch digest (unsigned) |
+| `VoucherTag` | `VCHR` | voucher digest, inside RVCH, STCA and BSTA |
+| `FairnessProofTag` | `BFPR` | batch fairness proof digest |
+| `IntentIdTag` | `INTT` | intent id |
+| `CommitteeSetTag` | `CMTT` | committee set digest |
+
 Cross-language vector (byte fills are repeated to the field width): chain
 `73`, claim `e7`, requester `77`, submitted block `102`, transaction hash `33`,
 depth `15`, slot `123`, beneficiary `22`, amount `1000`, mainchain genesis `65`,

@@ -1693,12 +1693,111 @@ pub mod pallet {
     // Hooks — bounded TTL sweep
     // ---------------------------------------------------------------------
 
+    /// Domain tags exposed in metadata so off-chain signers can detect the
+    /// digest protocol a runtime verifies. Each getter returns the constant
+    /// its digest function hashes.
     #[pallet::extra_constants]
     impl<T: Config> Pallet<T> {
         /// See [`MAX_OBSERVED_DEPTH`].
         #[pallet::constant_name(MaxObservedDepth)]
         fn max_observed_depth() -> u32 {
             MAX_OBSERVED_DEPTH
+        }
+
+        /// Committee-signed digest for `credit_deposit`.
+        #[pallet::constant_name(CreditDepositTag)]
+        fn credit_deposit_tag() -> [u8; 4] {
+            *TAG_CRDP
+        }
+
+        /// Committee-signed digest for the legacy `settle_claim`.
+        #[pallet::constant_name(SettleClaimTag)]
+        fn settle_claim_tag() -> [u8; 4] {
+            *TAG_STCL
+        }
+
+        /// Committee-signed digest for `request_voucher`.
+        #[pallet::constant_name(RequestVoucherTag)]
+        fn request_voucher_tag() -> [u8; 4] {
+            *TAG_RVCH
+        }
+
+        /// Committee-signed digest for the legacy `settle_batch_atomic`.
+        #[pallet::constant_name(SettleBatchAtomicTag)]
+        fn settle_batch_atomic_tag() -> [u8; 4] {
+            *TAG_STBA
+        }
+
+        /// Committee-signed digest for `attest_batch_intents`.
+        #[pallet::constant_name(AttestBatchIntentsTag)]
+        fn attest_batch_intents_tag() -> [u8; 4] {
+            *TAG_ABIN
+        }
+
+        /// Committee-signed digest for `request_batch_vouchers`.
+        #[pallet::constant_name(RequestBatchVouchersTag)]
+        fn request_batch_vouchers_tag() -> [u8; 4] {
+            *TAG_RVBN
+        }
+
+        /// Committee-signed STCA digest for `attest_settle` and `supersede_settlement_request`.
+        #[pallet::constant_name(AttestSettleTag)]
+        fn attest_settle_tag() -> [u8; 4] {
+            *TAG_STCA
+        }
+
+        /// Committee-signed digest for `attest_batch_settle`.
+        #[pallet::constant_name(AttestBatchSettleTag)]
+        fn attest_batch_settle_tag() -> [u8; 4] {
+            *TAG_BSTA
+        }
+
+        /// Committee-signed digest for `attest_expire_policy`.
+        #[pallet::constant_name(AttestExpirePolicyTag)]
+        fn attest_expire_policy_tag() -> [u8; 4] {
+            *TAG_EXPP
+        }
+
+        /// Committee-signed digest for `attest_intent`.
+        #[pallet::constant_name(AttestIntentTag)]
+        fn attest_intent_tag() -> [u8; 4] {
+            *TAG_INTA
+        }
+
+        /// Committee-signed digest for `slash_bad_settlement_evidence`; `FRV2` binds the request id.
+        #[pallet::constant_name(SlashSettlementTag)]
+        fn slash_settlement_tag() -> [u8; 4] {
+            *TAG_FRV2
+        }
+
+        /// Unsigned batch digest emitted by `submit_batch_intents`.
+        #[pallet::constant_name(SubmitBatchIntentsTag)]
+        fn submit_batch_intents_tag() -> [u8; 4] {
+            *TAG_SBIN
+        }
+
+        /// Intent id derivation.
+        #[pallet::constant_name(IntentIdTag)]
+        fn intent_id_tag() -> [u8; 4] {
+            *TAG_INTT
+        }
+
+        /// Batch fairness proof digest, bound into voucher digests.
+        #[pallet::constant_name(FairnessProofTag)]
+        fn fairness_proof_tag() -> [u8; 4] {
+            *TAG_BFPR
+        }
+
+        /// Committee set digest for the Cardano mirror.
+        #[pallet::constant_name(CommitteeSetTag)]
+        fn committee_set_tag() -> [u8; 4] {
+            *TAG_CMTT
+        }
+
+        /// Voucher digest, bound into the voucher, STCA and BSTA digests.
+        #[pallet::constant_name(VoucherTag)]
+        fn voucher_tag() -> [u8; 4] {
+            *TAG_VCHR
         }
     }
 
