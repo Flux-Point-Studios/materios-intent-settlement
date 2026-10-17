@@ -473,6 +473,20 @@ describe("Keeper settlement against chain state", () => {
     expect(h.state.isAlreadySettled(h.claimId)).not.toBeNull();
   });
 
+  it("keeps ticking and persisting when the bond sweep cannot read the runtime", async () => {
+    const h = settlementHarness(tmpDir, 28);
+    await h.keeper.runOnce();
+    expect(h.state.trackedBonds()).toEqual([h.claimId]);
+    h.rpc.getSettlementConstants = () => {
+      throw new Error("runtime lacks intentSettlement.bondReleaseDelayBlocks");
+    };
+
+    await expect(h.keeper.runOnce()).resolves.toBeDefined();
+
+    expect(h.logs).toContainEqual({ level: "error", msg: "bond release sweep failed" });
+    expect(h.state.trackedBonds()).toEqual([h.claimId]);
+  });
+
   it("records a claim settled by someone else without submitting", async () => {
     const isConfirmed = vi
       .fn()

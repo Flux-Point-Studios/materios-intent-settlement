@@ -191,7 +191,9 @@ export class Keeper {
 
     // (4) settle confirmed payouts on Materios, then return releasable bonds
     await this.reconcileInflight(tip);
-    await this.releaseBonds(tip);
+    await this.releaseBonds(tip).catch((err: unknown) => {
+      this.log("error", "bond release sweep failed", err);
+    });
 
     await this.deps.state.flush();
     return this.metrics;
