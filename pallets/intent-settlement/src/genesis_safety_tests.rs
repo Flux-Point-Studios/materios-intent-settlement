@@ -103,7 +103,7 @@ fn genesis_safety_upgrade_preserves_post_genesis_audit_state() {
             "STCA settlement must retain its audit status"
         );
         assert!(!PreAuditExpiry::<Test>::get(expired_iid));
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 3);
+        assert_eq!(SettlementStorageVersion::<Test>::get(), crate::SETTLEMENT_STORAGE_VERSION);
         assert_eq!(StcaCutoverBlock::<Test>::get(), 0);
         assert_eq!(PolicyExpireCutoverBlock::<Test>::get(), 0);
         assert_eq!(
@@ -938,7 +938,7 @@ fn genesis_safety_reserve_deficit_does_not_block_replacement() {
 fn genesis_safety_try_state_rejects_unknown_version_and_stale_progress() {
     use frame_support::traits::Hooks;
     genesis_ext().execute_with(|| {
-        SettlementStorageVersion::<Test>::put(4);
+        SettlementStorageVersion::<Test>::put(crate::SETTLEMENT_STORAGE_VERSION + 1);
         assert!(<IntentSettlement as Hooks<u64>>::try_state(0).is_err());
         assert!(<IntentSettlement as Hooks<u64>>::pre_upgrade().is_err());
         SettlementStorageVersion::<Test>::put(3);
@@ -1093,8 +1093,8 @@ fn genesis_safety_batch_reserves_all_bonds_atomically() {
 #[cfg(feature = "try-runtime")]
 #[test]
 fn genesis_safety_upgrade_checks_accept_legacy_migrations_and_genesis() {
-    use frame_support::traits::Hooks;
-    for version in 0..=3 {
+    use frame_support::traits::{Hooks, ReservableCurrency};
+    for version in 0..=crate::SETTLEMENT_STORAGE_VERSION {
         genesis_ext().execute_with(|| {
             System::set_block_number(100);
             SettlementStorageVersion::<Test>::put(version);
@@ -1104,7 +1104,20 @@ fn genesis_safety_upgrade_checks_accept_legacy_migrations_and_genesis() {
             if version == 2 {
                 PolicyExpireCutoverBlock::<Test>::put(30);
             }
-            let (_, iid, _) = vouchered_claim_with_voucher(0x94, 1_000);
+            let (cid, iid, voucher) = vouchered_claim_with_voucher(0x94, 1_000);
+            if version == 3 {
+                assert_ok!(Balances::reserve(&ALICE, 500));
+                ClaimSettlementRequests::<Test>::insert(
+                    cid,
+                    SettlementRequestRecord {
+                        requester: ALICE,
+                        evidence: settled_evidence_for(&voucher, 15, 123),
+                        settled_direct: false,
+                        submitted_block: 100,
+                        bond_amount: 500,
+                    },
+                );
+            }
             Intents::<Test>::mutate(iid, |intent| {
                 intent.as_mut().expect("intent").status = IntentStatus::Expired
             });
@@ -1112,7 +1125,7 @@ fn genesis_safety_upgrade_checks_accept_legacy_migrations_and_genesis() {
             <IntentSettlement as Hooks<u64>>::on_runtime_upgrade();
             assert_ok!(<IntentSettlement as Hooks<u64>>::post_upgrade(before));
             assert_ok!(<IntentSettlement as Hooks<u64>>::try_state(100));
-            assert_eq!(SettlementStorageVersion::<Test>::get(), 3);
+            assert_eq!(SettlementStorageVersion::<Test>::get(), crate::SETTLEMENT_STORAGE_VERSION);
         });
     }
 }
@@ -1121,7 +1134,15 @@ fn genesis_safety_upgrade_checks_accept_legacy_migrations_and_genesis() {
 #[test]
 fn genesis_safety_try_state_rejects_inconsistent_cutovers() {
     use frame_support::traits::Hooks;
-    for (version, stca, expp) in [(0, 0, 10), (1, 0, 0), (2, 10, 0), (3, 10, 0), (3, 0, 10)] {
+    for (version, stca, expp) in [
+        (0, 0, 10),
+        (1, 0, 0),
+        (2, 10, 0),
+        (3, 10, 0),
+        (3, 0, 10),
+        (4, 10, 0),
+        (4, 0, 10),
+    ] {
         genesis_ext().execute_with(|| {
             SettlementStorageVersion::<Test>::put(version);
             StcaCutoverBlock::<Test>::put(stca);
@@ -1356,5 +1377,180 @@ fn genesis_safety_supersede_checks_evidence_like_a_request() {
                 error
             );
         }
+    });
+}
+
+const OTHER_PALLET_RESERVE: [u8; 8] = *b"otherpal";
+
+fn settlement_reserve(who: u64) -> u128 {
+    use frame_support::traits::NamedReservableCurrency;
+    Balances::reserved_balance_named(&crate::SETTLEMENT_BOND_RESERVE_ID, &who)
+}
+
+#[test]
+fn genesis_safety_bonds_are_held_under_the_settlement_reserve_id() {
+    new_test_ext().execute_with(|| {
+        let (cid, _) = alice_request_and_bond(0xB1, 1_000, 500);
+        assert_eq!(settlement_reserve(ALICE), 500);
+        assert_ok!(IntentSettlement::attest_settle(
+            RuntimeOrigin::signed(1),
+            cid,
+            mock_settle_sigs()
+        )
+        .map_err(|error| error.error));
+        assert_eq!(settlement_reserve(ALICE), 500);
+        System::set_block_number(System::block_number() + TestBondReleaseDelayBlocks::get() as u64);
+        assert_ok!(IntentSettlement::release_settlement_bond(
+            RuntimeOrigin::signed(BOB),
+            cid
+        ));
+        assert_eq!(settlement_reserve(ALICE), 0);
+        assert_eq!(Balances::reserved_balance(ALICE), 0);
+    });
+}
+
+#[test]
+fn genesis_safety_refund_never_draws_on_another_pallets_reserve() {
+    use frame_support::traits::NamedReservableCurrency;
+    new_test_ext().execute_with(|| {
+        let (cid, voucher) = alice_request_and_bond(0xB2, 1_000, 500);
+        assert_ok!(Balances::reserve_named(&OTHER_PALLET_RESERVE, &ALICE, 1_000));
+        let (imbalance, unslashed) =
+            Balances::slash_reserved_named(&crate::SETTLEMENT_BOND_RESERVE_ID, &ALICE, 200);
+        drop(imbalance);
+        assert_eq!(unslashed, 0);
+        let free = Balances::free_balance(ALICE);
+        System::set_block_number(2 + TestSettlementRequestTtl::get() as u64);
+        let evidence = settled_evidence_for(&voucher, 15, 123);
+        assert_ok!(IntentSettlement::request_settle(
+            RuntimeOrigin::signed(BOB),
+            cid,
+            evidence.cardano_tx_hash,
+            false,
+            evidence,
+            1
+        ));
+        assert_eq!(Balances::free_balance(ALICE), free + 300);
+        assert_eq!(Balances::reserved_balance_named(&OTHER_PALLET_RESERVE, &ALICE), 1_000);
+        assert_eq!(Balances::reserved_balance(ALICE), 1_000);
+        System::assert_has_event(RuntimeEvent::IntentSettlement(
+            Event::SettlementBondReserveDeficit {
+                claim_id: cid,
+                requester: ALICE,
+                missing_amount: 200,
+            },
+        ));
+    });
+}
+
+#[test]
+fn genesis_safety_slash_never_draws_on_another_pallets_reserve() {
+    use frame_support::traits::NamedReservableCurrency;
+    new_test_ext().execute_with(|| {
+        let (cid, _) = alice_request_and_bond(0xB3, 1_000, 500);
+        assert_ok!(Balances::reserve_named(&OTHER_PALLET_RESERVE, &ALICE, 1_000));
+        let (imbalance, _) =
+            Balances::slash_reserved_named(&crate::SETTLEMENT_BOND_RESERVE_ID, &ALICE, 200);
+        drop(imbalance);
+        fund_account(1, 1);
+        let treasury: u64 = TestSettlementTreasuryPalletId::get().into_account_truncating();
+        fund_account(treasury, 1);
+        let watcher_free = Balances::free_balance(1);
+        let treasury_free = Balances::free_balance(treasury);
+        assert_ok!(IntentSettlement::slash_bad_settlement_evidence(
+            RuntimeOrigin::signed(1),
+            cid,
+            FraudProof::TxNotFound,
+            mock_settle_sigs()
+        )
+        .map_err(|error| error.error));
+        assert_eq!(Balances::free_balance(1), watcher_free + 250);
+        assert_eq!(Balances::free_balance(treasury), treasury_free + 50);
+        assert_eq!(Balances::reserved_balance_named(&OTHER_PALLET_RESERVE, &ALICE), 1_000);
+        assert_eq!(Balances::reserved_balance(ALICE), 1_000);
+        System::assert_has_event(RuntimeEvent::IntentSettlement(Event::SettlementBondSlashed {
+            claim_id: cid,
+            requester: ALICE,
+            watcher: 1,
+            watcher_share: 250,
+            treasury_share: 50,
+            fraud_proof: FraudProof::TxNotFound,
+        }));
+        System::assert_has_event(RuntimeEvent::IntentSettlement(
+            Event::SettlementBondReserveDeficit {
+                claim_id: cid,
+                requester: ALICE,
+                missing_amount: 200,
+            },
+        ));
+    });
+}
+
+#[test]
+fn genesis_safety_upgrade_moves_outstanding_bonds_to_the_settlement_reserve() {
+    use frame_support::traits::{OnRuntimeUpgrade, ReservableCurrency};
+    new_test_ext().execute_with(|| {
+        let (pending, _, voucher) = vouchered_claim_with_voucher(0xB4, 1_000);
+        let (attested, _, _) = vouchered_claim_with_voucher(0xB5, 1_000);
+        SettlementStorageVersion::<Test>::put(3);
+        StcaCutoverBlock::<Test>::put(25);
+        PolicyExpireCutoverBlock::<Test>::put(25);
+        fund_account(ALICE, 1_000);
+        assert_ok!(Balances::reserve(&ALICE, 500));
+        assert_ok!(Balances::reserve(&ALICE, 100));
+        ClaimSettlementRequests::<Test>::insert(
+            pending,
+            SettlementRequestRecord {
+                requester: ALICE,
+                evidence: settled_evidence_for(&voucher, 15, 123),
+                settled_direct: false,
+                submitted_block: 1,
+                bond_amount: 500,
+            },
+        );
+        fund_account(BOB, 1_000);
+        assert_ok!(Balances::reserve(&BOB, 400));
+        BondedClaimAttestedAt::<Test>::insert(attested, 1);
+        BondedClaimRequester::<Test>::insert(attested, (BOB, 400));
+
+        <IntentSettlement as OnRuntimeUpgrade>::on_runtime_upgrade();
+
+        assert_eq!(SettlementStorageVersion::<Test>::get(), crate::SETTLEMENT_STORAGE_VERSION);
+        assert_eq!(settlement_reserve(ALICE), 500);
+        assert_eq!(Balances::reserved_balance(ALICE), 600);
+        assert_eq!(settlement_reserve(BOB), 400);
+        assert_eq!(Balances::reserved_balance(BOB), 400);
+        let root = sp_io::storage::root(sp_runtime::StateVersion::V1);
+        <IntentSettlement as OnRuntimeUpgrade>::on_runtime_upgrade();
+        assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), root);
+
+        System::set_block_number(1 + TestBondReleaseDelayBlocks::get() as u64);
+        assert_ok!(IntentSettlement::release_settlement_bond(
+            RuntimeOrigin::signed(ALICE),
+            attested
+        ));
+        assert_eq!(Balances::reserved_balance(BOB), 0);
+        System::set_block_number(2 + TestSettlementRequestTtl::get() as u64);
+        assert_ok!(IntentSettlement::release_settlement_bond(
+            RuntimeOrigin::signed(BOB),
+            pending
+        ));
+        assert_eq!(Balances::reserved_balance(ALICE), 100);
+    });
+}
+
+#[cfg(feature = "try-runtime")]
+#[test]
+fn genesis_safety_try_state_rejects_an_unbacked_settlement_bond() {
+    use frame_support::traits::{Hooks, NamedReservableCurrency};
+    new_test_ext().execute_with(|| {
+        let (_, _) = alice_request_and_bond(0xB6, 1_000, 500);
+        SettlementStorageVersion::<Test>::put(crate::SETTLEMENT_STORAGE_VERSION);
+        assert_ok!(<IntentSettlement as Hooks<u64>>::try_state(1));
+        Balances::unreserve_named(&crate::SETTLEMENT_BOND_RESERVE_ID, &ALICE, 1);
+        assert_eq!(
+            <IntentSettlement as Hooks<u64>>::try_state(1),
+            Err("settlement bonds exceed the settlement reserve".into())
+        );
     });
 }

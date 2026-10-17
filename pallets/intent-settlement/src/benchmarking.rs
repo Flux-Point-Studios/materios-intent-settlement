@@ -7,7 +7,7 @@
 use super::*;
 use crate::pallet::{BalanceOf, Call, Config, IsCommitteeMember};
 use frame_benchmarking::v2::*;
-use frame_support::traits::{Currency, Get, ReservableCurrency};
+use frame_support::traits::{Currency, Get, NamedReservableCurrency};
 use frame_system::pallet_prelude::BlockNumberFor;
 use frame_system::RawOrigin;
 use sp_runtime::traits::{AccountIdConversion, Saturating};
@@ -1101,7 +1101,8 @@ mod benchmarks {
         BondedClaimAttestedAt::<T>::insert(claim_id, BlockNumberFor::<T>::from(0u32));
         frame_system::Pallet::<T>::set_block_number(T::BondReleaseDelayBlocks::get().into());
         let bond = T::MinSettlementBond::get().max(1);
-        T::Currency::reserve(&caller, fund_bond::<T>(&caller, bond)).expect("funded bond");
+        T::Currency::reserve_named(&SETTLEMENT_BOND_RESERVE_ID, &caller, fund_bond::<T>(&caller, bond))
+            .expect("funded bond");
         BondedClaimRequester::<T>::insert(claim_id, (caller.clone(), bond));
 
         #[extrinsic_call]
@@ -1189,7 +1190,8 @@ mod benchmarks {
         }
         let requester: T::AccountId = account("requester", 0, 0);
         let bond = T::MinSettlementBond::get().max(2);
-        T::Currency::reserve(&requester, fund_bond::<T>(&requester, bond)).expect("funded bond");
+        T::Currency::reserve_named(&SETTLEMENT_BOND_RESERVE_ID, &requester, fund_bond::<T>(&requester, bond))
+            .expect("funded bond");
 
         let record = SettlementRequestRecord::<T::AccountId, BlockNumberFor<T>> {
             requester,

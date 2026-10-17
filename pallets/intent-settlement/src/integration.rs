@@ -63,6 +63,7 @@ impl pallet_balances::Config for Testnet {
     type AccountStore = System;
     type Balance = u128;
     type ExistentialDeposit = ExistentialDeposit;
+    type ReserveIdentifier = [u8; 8];
 }
 
 parameter_types! {
@@ -1654,7 +1655,7 @@ fn genesis_safety_fraud_bundle_cannot_slash_a_replacement_request() {
     use crate::pallet::{ClaimSettlementRequests, Error};
     use frame_support::{
         assert_noop,
-        traits::{Currency, ReservableCurrency},
+        traits::{Currency, NamedReservableCurrency},
     };
     use sp_runtime::traits::AccountIdConversion;
     new_ext().execute_with(|| {
@@ -1679,7 +1680,7 @@ fn genesis_safety_fraud_bundle_cannot_slash_a_replacement_request() {
         for account in [&requester, &alice, &treasury] {
             let _ = Balances::deposit_creating(account, 2_000);
         }
-        assert_ok!(Balances::reserve(&requester, 500));
+        assert_ok!(Balances::reserve_named(&crate::SETTLEMENT_BOND_RESERVE_ID, &requester, 500));
         let mut record = SettlementRequestRecord {
             requester: requester.clone(),
             evidence,

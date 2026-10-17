@@ -58,10 +58,21 @@ slash window has closed. Policy-expiry requests use the same replacement
 boundary so a stale request cannot wedge the EXPP path after the legacy
 cutover.
 
-If another Currency consumer depleted the shared reserve, release and
-replacement return only the funds still reserved, emit the actual released
-amount, and report the missing amount in `SettlementBondReserveDeficit`.
-The missing funds do not permanently lock the claim.
+Bonds are held in the Balances named reserve `SETTLEMENT_BOND_RESERVE_ID`
+(`b"settbond"`). Refund, release and slash move funds only out of that reserve,
+so the pallet never takes more than its own outstanding bonds from an account
+and never draws on another pallet's named reserve. If the settlement reserve is
+short, release and replacement return what it holds, a slash pays the watcher
+first and the treasury from what remains, and the shortfall is reported in
+`SettlementBondReserveDeficit`; `SettlementBondReleased` and
+`SettlementBondSlashed` carry the amounts actually moved. A shortfall never
+locks the claim.
+
+Balances keeps one reserved total per account, and named reserves are
+bookkeeping on top of it. An anonymous `slash_reserved` or root
+`force_unreserve` against the account can therefore still consume funds that
+back a named reserve; no Currency or hold API in this Balances version isolates
+against that. Holds share the same total, so they would not help.
 
 There is no automatic expiry sweep. A failed attestation does not remove a
 request. Unused expired requests remain stored until replacement or bonded
@@ -104,7 +115,7 @@ settled-direct `false`, proof `TxNotFound` (SCALE discriminant `01`).
 
 ## Genesis and upgrades
 
-Fresh genesis writes settlement storage version 3 and both cutovers at block
+Fresh genesis writes settlement storage version 4 and both cutovers at block
 zero. A zero cutover is immediately closed when its migration version is
 already present. On an older chain, a zero cutover keeps its existing meaning
 of an unscheduled migration. Nonzero cutovers preserve the upgrade grace
@@ -114,16 +125,25 @@ An upgrade over fresh genesis does not relabel STCA settlements or subsequent
 expiries as legacy. Call indices and existing storage encodings are preserved.
 The two request calls take the bond argument, so hosts must bump the
 transaction version and upgrade request submitters together. The signed FRV2,
-STCA and EXPP payloads are as specified above. The request-scoped tombstone
-map and the `SettlementBondReserveDeficit` event are appended, so existing
-metadata indices hold. Existing version-3 preprod state needs no data
-migration; older versions retain the existing migration sequence.
+STCA and EXPP payloads are as specified above. New storage, events, errors and
+calls are appended, so existing metadata indices hold.
+
+The v3→v4 step moves every outstanding bond, pending or attested, from the
+anonymous reserve to the settlement named reserve in one pass. It must not
+truncate, because the named reserve cannot refund an anonymous bond; its
+length is the number of outstanding bonds, which is zero at a fresh genesis and
+was zero on preprod at spec 239. A bond that cannot be moved in full is
+reported in `SettlementBondReserveDeficit`. Older versions run the earlier
+steps first in the same upgrade. The host runtime needs no Balances change when
+`ReserveIdentifier` is `[u8; 8]` and `MaxReserves` is at least one, as on
+Materios.
 
 Try-runtime pre/post hooks check version progression, cutover preservation and
 legacy audit flags. An upgrade over a chain already at the current version must
 leave every key and value under the pallet's storage prefix unchanged; other
 pallets' storage is out of scope. `try_state` rejects unknown versions,
-inconsistent cutovers and migration progress outside version 2.
+inconsistent cutovers, migration progress outside version 2 and, at version 4,
+any requester whose outstanding bonds exceed their settlement reserve.
 
 ## Signature work and runtime integration
 

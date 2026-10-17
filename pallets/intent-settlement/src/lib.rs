@@ -116,7 +116,11 @@ pub const STCA_CUTOVER_GRACE: u32 = 50;
 pub const EXPP_CUTOVER_GRACE: u32 = 50;
 
 /// `SettlementStorageVersion` written at genesis and by the final migration step.
-pub const SETTLEMENT_STORAGE_VERSION: u32 = 3;
+pub const SETTLEMENT_STORAGE_VERSION: u32 = 4;
+
+/// Balances named-reserve identifier holding every settlement bond. Refunds
+/// and slashes move at most this reserve's amount, never another pallet's.
+pub const SETTLEMENT_BOND_RESERVE_ID: [u8; 8] = *b"settbond";
 
 /// Largest `observed_at_depth` that settlement evidence may claim: Cardano's
 /// security parameter k (2160 blocks on mainnet and preprod). A transaction
@@ -655,7 +659,7 @@ pub mod pallet {
     use frame_support::{
         dispatch::DispatchResultWithPostInfo,
         pallet_prelude::*,
-        traits::{tokens::BalanceStatus, Currency, ReservableCurrency},
+        traits::{tokens::BalanceStatus, Currency, NamedReservableCurrency, ReservableCurrency},
         BoundedVec, PalletId,
     };
     use frame_system::pallet_prelude::*;
@@ -822,12 +826,11 @@ pub mod pallet {
         #[pallet::constant]
         type MainchainGenesisHash: Get<[u8; 32]>;
 
-        /// Task #84 (mis-sec P1): reservable-currency surface used by
-        /// `post_settlement_bond` / `release_settlement_bond` /
-        /// `slash_bad_settlement_evidence`. In prod this wires to the
-        /// runtime's native balances (`pallet_balances`); in tests we wire
-        /// the same `pallet_balances` against the mock runtime.
-        type Currency: ReservableCurrency<Self::AccountId>;
+        /// Currency holding settlement bonds under the
+        /// `SETTLEMENT_BOND_RESERVE_ID` named reserve. `pallet_balances`
+        /// qualifies when its `ReserveIdentifier` is `[u8; 8]` and
+        /// `MaxReserves` is at least one.
+        type Currency: NamedReservableCurrency<Self::AccountId, ReserveIdentifier = [u8; 8]>;
 
         /// Task #84 (mis-sec P1): basis-point share of a slashed bond paid
         /// out to the watcher who proved the fraud. `5000` (= 50%) is the
@@ -1063,8 +1066,9 @@ pub mod pallet {
     /// flags + legacy settle_claim path live); v1 = post-fix (legacy
     /// settlements grandfathered, STCA path live + cutover scheduled);
     /// v2 = post-#267 (legacy expire_policy_mirror grandfathered + EXPP
-    /// path live + expire-cutover scheduled); v3 includes settlement bonds.
-    /// Fresh genesis starts at v3 with both legacy paths already closed.
+    /// path live + expire-cutover scheduled); v3 includes settlement bonds;
+    /// v4 holds them under `SETTLEMENT_BOND_RESERVE_ID`. Fresh genesis
+    /// starts at `SETTLEMENT_STORAGE_VERSION` with both legacy paths closed.
     #[pallet::storage]
     pub type SettlementStorageVersion<T: Config> = StorageValue<_, u32, ValueQuery>;
 
@@ -1841,11 +1845,26 @@ pub mod pallet {
                     0 => expp.is_zero(),
                     1 => !stca.is_zero(),
                     2 => !stca.is_zero() && !expp.is_zero(),
-                    SETTLEMENT_STORAGE_VERSION => stca.is_zero() == expp.is_zero(),
+                    3 | SETTLEMENT_STORAGE_VERSION => stca.is_zero() == expp.is_zero(),
                     _ => false,
                 },
                 "settlement cutovers inconsistent with storage version"
             );
+            if version == SETTLEMENT_STORAGE_VERSION {
+                let mut owed = alloc::collections::BTreeMap::<T::AccountId, u128>::new();
+                let pending = ClaimSettlementRequests::<T>::iter_values()
+                    .map(|request| (request.requester, request.bond_amount));
+                for (requester, bond) in pending.chain(BondedClaimRequester::<T>::iter_values()) {
+                    let total = owed.entry(requester).or_default();
+                    *total = total.saturating_add(bond);
+                }
+                for (requester, bond) in owed {
+                    let reserved: u128 =
+                        T::Currency::reserved_balance_named(&SETTLEMENT_BOND_RESERVE_ID, &requester)
+                            .saturated_into();
+                    ensure!(reserved >= bond, "settlement bonds exceed the settlement reserve");
+                }
+            }
             Ok(())
         }
 
@@ -2070,8 +2089,54 @@ pub mod pallet {
                     });
                 } else {
                     BondMigrationProgress::<T>::kill();
-                    SettlementStorageVersion::<T>::put(SETTLEMENT_STORAGE_VERSION);
+                    SettlementStorageVersion::<T>::put(3u32);
                 }
+            }
+
+            // ----- v3 → v4: bonds move to the settlement named reserve ---
+            //
+            // Every outstanding bond, pending or attested, is unreserved
+            // from the anonymous pool and reserved again under
+            // `SETTLEMENT_BOND_RESERVE_ID` in one pass. The pass must not
+            // truncate: a refund through the named reserve cannot return
+            // an anonymous bond. Its length is the number of outstanding
+            // bonds, zero at a fresh genesis.
+            let current = SettlementStorageVersion::<T>::get();
+            if current == 3 {
+                let pending = ClaimSettlementRequests::<T>::iter()
+                    .filter(|(_, request)| request.bond_amount > 0)
+                    .map(|(claim_id, request)| (claim_id, request.requester, request.bond_amount));
+                let attested = BondedClaimRequester::<T>::iter()
+                    .map(|(claim_id, (requester, bond))| (claim_id, requester, bond));
+                let bonds: Vec<_> = pending.chain(attested).collect();
+                total = total.saturating_add(T::DbWeight::get().reads(bonds.len() as u64 + 2));
+                for (claim_id, requester, bond) in bonds {
+                    total = total.saturating_add(T::DbWeight::get().reads_writes(2, 3));
+                    let named = bond
+                        .try_into()
+                        .ok()
+                        .map(|balance: BalanceOf<T>| {
+                            let moved =
+                                balance.saturating_sub(T::Currency::unreserve(&requester, balance));
+                            match T::Currency::reserve_named(
+                                &SETTLEMENT_BOND_RESERVE_ID,
+                                &requester,
+                                moved,
+                            ) {
+                                Ok(()) => moved.saturated_into::<u128>(),
+                                Err(_) => 0,
+                            }
+                        })
+                        .unwrap_or(0);
+                    if named < bond {
+                        Self::deposit_event(Event::SettlementBondReserveDeficit {
+                            claim_id,
+                            requester,
+                            missing_amount: bond - named,
+                        });
+                    }
+                }
+                SettlementStorageVersion::<T>::put(SETTLEMENT_STORAGE_VERSION);
             }
 
             total
@@ -4469,30 +4534,36 @@ pub mod pallet {
                     .try_into()
                     .map_err(|_| Error::<T>::BondAmountConversionOverflow)?;
 
-                // Atomic phase: repatriate both halves under one storage
-                // layer so a partial slash doesn't leave funds in a
-                // half-reserved state.
-                frame_support::storage::with_storage_layer::<(), sp_runtime::DispatchError, _>(
-                    || {
-                        if !watcher_balance.is_zero() {
-                            T::Currency::repatriate_reserved(
-                                &requester,
-                                &who,
-                                watcher_balance,
-                                BalanceStatus::Free,
-                            )?;
-                        }
-                        if !treasury_balance.is_zero() {
-                            T::Currency::repatriate_reserved(
-                                &requester,
-                                &treasury_account,
-                                treasury_balance,
-                                BalanceStatus::Free,
-                            )?;
-                        }
-                        Ok(())
-                    },
-                )?;
+                // Each share moves only out of the settlement reserve; a
+                // shortfall there is reported, never taken from the
+                // requester's other reserves.
+                let repatriate = |beneficiary: &T::AccountId,
+                                      share: BalanceOf<T>|
+                 -> Result<u128, DispatchError> {
+                    if share.is_zero() {
+                        return Ok(0);
+                    }
+                    let unpaid = T::Currency::repatriate_reserved_named(
+                        &SETTLEMENT_BOND_RESERVE_ID,
+                        &requester,
+                        beneficiary,
+                        share,
+                        BalanceStatus::Free,
+                    )?;
+                    Ok(share.saturating_sub(unpaid).saturated_into())
+                };
+                let watcher_paid = repatriate(&who, watcher_balance)?;
+                let treasury_paid = repatriate(&treasury_account, treasury_balance)?;
+                let missing_amount = bond_u128
+                    .saturating_sub(watcher_paid)
+                    .saturating_sub(treasury_paid);
+                if missing_amount > 0 {
+                    Self::deposit_event(Event::SettlementBondReserveDeficit {
+                        claim_id,
+                        requester: requester.clone(),
+                        missing_amount,
+                    });
+                }
 
                 // Tombstone + cleanup. Removing the pending request makes
                 // attest_settle error with SettlementRequestMissing, which
@@ -4508,8 +4579,8 @@ pub mod pallet {
                     claim_id,
                     requester,
                     watcher: who,
-                    watcher_share: watcher_share_u128,
-                    treasury_share: treasury_share_u128,
+                    watcher_share: watcher_paid,
+                    treasury_share: treasury_paid,
                     fraud_proof,
                 });
                 Ok(())
@@ -5112,7 +5183,7 @@ pub mod pallet {
             let balance: BalanceOf<T> = amount
                 .try_into()
                 .map_err(|_| Error::<T>::BondAmountConversionOverflow)?;
-            T::Currency::reserve(requester, balance)?;
+            T::Currency::reserve_named(&SETTLEMENT_BOND_RESERVE_ID, requester, balance)?;
             Self::deposit_event(Event::SettlementBondPosted {
                 claim_id,
                 requester: requester.clone(),
@@ -5129,7 +5200,9 @@ pub mod pallet {
             let balance: BalanceOf<T> = bond_amount
                 .try_into()
                 .map_err(|_| Error::<T>::BondAmountConversionOverflow)?;
-            let missing_amount: u128 = T::Currency::unreserve(&requester, balance).saturated_into();
+            let missing_amount: u128 =
+                T::Currency::unreserve_named(&SETTLEMENT_BOND_RESERVE_ID, &requester, balance)
+                    .saturated_into();
             if missing_amount > 0 {
                 Self::deposit_event(Event::SettlementBondReserveDeficit {
                     claim_id,

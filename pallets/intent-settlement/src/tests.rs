@@ -61,6 +61,7 @@ impl pallet_balances::Config for Test {
     type AccountStore = System;
     type Balance = u128;
     type ExistentialDeposit = ExistentialDeposit;
+    type ReserveIdentifier = [u8; 8];
 }
 
 parameter_types! {
@@ -5505,11 +5506,10 @@ fn task266_migration_flags_existing_settled_claims() {
         // Run the migration via the on_runtime_upgrade hook.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         // Post-migration: settled claim is flagged (idempotent — already
-        // set by legacy settle), version bumped to 3 (chained v0→v1→v2→v3,
-        // adding the #84 bond_amount field migration), both cutovers
-        // scheduled.
+        // set by legacy settle), the version reaches the current one
+        // through every chained step, and both cutovers are scheduled.
         assert!(PreAuditSettlement::<Test>::get(claim_id));
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 3u32);
+        assert_eq!(SettlementStorageVersion::<Test>::get(), pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION);
         let stca_cutover =
             pallet_intent_settlement::pallet::StcaCutoverBlock::<Test>::get();
         assert!(stca_cutover > 0u64);
@@ -5518,7 +5518,7 @@ fn task266_migration_flags_existing_settled_claims() {
         assert!(expp_cutover > 0u64);
         // Idempotency: a second invocation must not double-flag.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 3u32);
+        assert_eq!(SettlementStorageVersion::<Test>::get(), pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION);
     });
 }
 
@@ -5581,18 +5581,17 @@ fn task266_migration_truncation_recovers_to_full_progress() {
             .filter(|cid| PreAuditSettlement::<Test>::get(*cid))
             .count();
         assert_eq!(flagged_after_2, 3, "second run drains tail to full flag set");
-        // Task #84 update: after v0→v1 completes, the same invocation
-        // chains v1→v2→v3 (the bond_amount field migration), so the
-        // terminal version is 3 not 2.
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 3u32,
-                   "version bumps to 3 after chained v0→v1→v2→v3 completes");
+        // After v0→v1 completes, the same invocation chains every later
+        // step, so the terminal version is the current one.
+        assert_eq!(SettlementStorageVersion::<Test>::get(), pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION,
+                   "version reaches the current one after the chained steps complete");
         let cutover_after_2 = StcaCutoverBlock::<Test>::get();
         assert_eq!(cutover_after_1, cutover_after_2,
                    "STCA cutover MUST NOT slide between runs");
-        // Third run: idempotent — version already 3, early-return.
+        // Third run: idempotent — version already current, early-return.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         assert_eq!(StcaCutoverBlock::<Test>::get(), cutover_after_2);
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 3u32);
+        assert_eq!(SettlementStorageVersion::<Test>::get(), pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION);
     });
 }
 
@@ -6536,13 +6535,11 @@ fn task267_migration_flags_existing_expired_intents() {
             !PreAuditExpiry::<Test>::get(iid),
             "TTL sweep does NOT flag (only legacy expire_policy_mirror does); the migration is what catches these"
         );
-        // Run the migration. Version starts at 0; this chains all the
-        // way through v0→v1→v2→v3 in one call (the #84 bond_amount
-        // field migration adds the v3 step). Post: PreAuditExpiry
-        // flagged, version = 3.
+        // Run the migration. Version starts at 0; this chains every step
+        // in one call. Post: PreAuditExpiry flagged, version current.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         assert!(PreAuditExpiry::<Test>::get(iid));
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 3u32);
+        assert_eq!(SettlementStorageVersion::<Test>::get(), pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION);
         let cutover =
             pallet_intent_settlement::pallet::PolicyExpireCutoverBlock::<Test>::get();
         assert!(cutover > 0u64);
@@ -6682,8 +6679,8 @@ fn bond_v2_to_v3_migration_fills_zero() {
         assert_eq!(row2.bond_amount, 0u128, "row 2 bond defaults to zero");
         assert_eq!(
             SettlementStorageVersion::<Test>::get(),
-            3u32,
-            "version bumps to 3 after v2→v3 walk completes"
+            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION,
+            "the v2→v3 walk completes and chains into the later steps"
         );
     });
 }
@@ -6721,12 +6718,12 @@ fn bond_v2_to_v3_truncation_recovery() {
             2u32,
             "version stays at 2 on truncation"
         );
-        // Second run: drains the tail, bumps to 3.
+        // Second run: drains the tail and chains into the later steps.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         assert_eq!(
             SettlementStorageVersion::<Test>::get(),
-            3u32,
-            "version bumps to 3 after second run drains the tail"
+            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION,
+            "the second run drains the tail"
         );
     });
 }
@@ -7162,6 +7159,7 @@ mod max_submit_batch_boundary {
         type AccountStore = System;
         type Balance = u128;
         type ExistentialDeposit = ExistentialDeposit;
+        type ReserveIdentifier = [u8; 8];
     }
 
     parameter_types! {
