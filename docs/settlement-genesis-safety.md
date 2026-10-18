@@ -220,7 +220,7 @@ bundle. Cheap rejection paths return the unused verification budget. Deposit
 replay checks precede verification.
 Single-intent duplicates, fully replayed intent batches and nonmember slash
 callers also exit before signature verification. Single-intent attestation
-declares the one-signature component plus its storage work.
+declares its measured base plus the one-signature component.
 
 The verification benchmark must use real sr25519 verification, not the
 benchmark runtime's permissive verifier. Runtime-specific Currency costs
@@ -228,6 +228,29 @@ remain in the host's `WeightInfo`; see [Currency integration](motra-checkpoint-w
 
 Materios PR #68 must re-pin both settlement-repository dependencies to this
 PR's merge commit and repeat its runtime integration checks before merging.
+
+### Measured base weights
+
+Every dispatch that touches `PendingBatches` declares a measured `WeightInfo`
+base. That covers `submit_intent`, `request_credit_refund`,
+`submit_batch_intents`, `attest_intent`, `attest_batch_intents`,
+`request_voucher`, `request_batch_vouchers`, `attest_settle`,
+`attest_batch_settle`, `attest_expire_policy`, the `on_initialize` expiry
+sweep (`expire_intents`) and the bond and request calls. `PendingBatches` is a
+single `StorageValue` of up to `MaxPendingBatches` ids, decoded and re-encoded
+on every push or removal. Each benchmark therefore fills it to capacity with
+its own intents last. A batch component runs up to the smaller of the batch
+bound and `MaxPendingBatches`, because every intent a batch moves is in
+`PendingBatches`. Threshold-signature calls report the same base after
+dispatch, so a rejection refunds only the signatures it did not check. Each
+benchmark asserts that its call reached the measured branch.
+
+The remaining hand-weighted calls do constant work. `credit_deposit`,
+`request_expire_policy` and the root setters touch single map entries. The
+legacy `settle_claim`, `settle_batch_atomic` and `expire_policy_mirror` reject
+at their first check from genesis, and 50 blocks after their cutover on an
+upgraded chain; `settle_batch_atomic` keeps its earlier measurement for that
+reason.
 
 ### Recorded signature weights
 
@@ -253,8 +276,8 @@ Zero checked signatures add no verification component.
 
 CI executes the signature benchmark with real sr25519 keys and a 96-member
 committee in the integration runtime, in addition to checking the recorded
-timing envelope. It also executes the request, bond, release and slash
-benchmarks there; the slash benchmark reserves a real bond and signs its FRV2
+timing envelope. It also executes every measured settlement benchmark
+there; the slash benchmark reserves a real bond and signs its FRV2
 digest. These native runs prove the benchmarks execute; refreshing timing
 coefficients still requires the Wasm measurement below.
 

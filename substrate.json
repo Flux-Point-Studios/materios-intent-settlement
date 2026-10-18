@@ -4,7 +4,7 @@
     {
       "id": "intent-settlement-pallet",
       "name": "Intent settlement pallet",
-      "desc": "Intent settlement on Materios: requests reserve a positive runtime-minimum bond in a named Balances reserve; slash tombstones are request-scoped, and an M-of-N committee supersede settles claims that unslashable junk would block. Expired requests refund with explicit deficit events, fresh genesis closes legacy paths, FRV2 binds each fraud allegation to its request, and every digest tag is a metadata constant. Bundles are scanned before verification, bond paths carry measured weights, and try-runtime checks versions, cutovers and bond backing.",
+      "desc": "Intent settlement on Materios: requests reserve a positive runtime-minimum bond in a named Balances reserve; slash tombstones are request-scoped, and an M-of-N committee supersede settles claims that unslashable junk would block. Expired requests refund with explicit deficit events, fresh genesis closes legacy paths, FRV2 binds each fraud allegation to its request, and every digest tag is a metadata constant. Bundles are scanned before verification, every dispatch that touches `PendingBatches`, the expiry sweep and the bond paths carry measured weights, and try-runtime checks versions, cutovers and bond backing.",
       "kind": "pallet",
       "paths": [
         "pallets/intent-settlement"
@@ -37,7 +37,7 @@
     {
       "id": "is-keeper",
       "name": "Settlement keeper",
-      "desc": "Off-chain keeper that turns voucher batches into Cardano payout transactions, waits for confirmation and settles them on Materios from chain state: it files bonded requests, attests or supersedes blocking requests, marks claims settled only when the chain does, and releases its bonds.",
+      "desc": "Off-chain keeper that turns voucher batches into Cardano payout transactions, waits for confirmation and settles them on Materios from chain state: it files bonded requests, attests or supersedes blocking requests, keeps a confirmed payout through provider errors, marks claims settled only on finalized chain state, and records its bonds before filing so it releases them across restarts.",
       "kind": "agent",
       "paths": [
         "keeper"
@@ -51,7 +51,7 @@
     {
       "id": "is-sdk",
       "name": "Intent settlement SDK",
-      "desc": "TypeScript client for building, signing and submitting settlement intents; rejects extrinsics whose dispatch failed and reads settlement requests, attested bonds and runtime constants.",
+      "desc": "TypeScript client for building, signing and submitting settlement intents; rejects every extrinsic whose success is not proven (dispatch failure, pool rejection, timeout) and reads best and finalized settlement state, settlement requests, attested bonds and runtime constants.",
       "kind": "toolkit",
       "paths": [
         "sdk"

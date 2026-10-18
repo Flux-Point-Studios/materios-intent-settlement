@@ -1799,3 +1799,201 @@ fn genesis_safety_metadata_tags_are_the_tags_each_digest_hashes() {
         assert_eq!(digest, domain_hash(tag(name), &body), "{name}");
     }
 }
+
+#[test]
+fn genesis_safety_intent_and_settlement_dispatches_declare_their_benchmarked_weights() {
+    use crate::weights::WeightInfo;
+    use frame_support::dispatch::GetDispatchInfo;
+    type Weights = <Test as crate::Config>::WeightInfo;
+    let weight = |call: crate::Call<Test>| call.get_dispatch_info().weight;
+    let signatures = mock_settle_sigs();
+    let with_signatures = |base: frame_support::weights::Weight| {
+        base.saturating_add(Weights::threshold_signatures(signatures.len() as u32))
+    };
+    new_test_ext().execute_with(|| {
+        let (cid, iid, voucher) = vouchered_claim_with_voucher(0x33, 1_000);
+        let kind = bp(0x33, 1, 1_000);
+        let proof = good_fairness_proof(iid, 1_000);
+        assert_eq!(
+            weight(crate::Call::submit_intent { kind: kind.clone() }),
+            Weights::submit_intent()
+        );
+        assert_eq!(
+            weight(crate::Call::request_credit_refund { amount_ada: 1 }),
+            Weights::request_credit_refund()
+        );
+        let (pubkey, sig) = mock_sig_for(1);
+        assert_eq!(
+            weight(crate::Call::attest_intent {
+                intent_id: iid,
+                pubkey,
+                sig
+            }),
+            Weights::attest_intent().saturating_add(Weights::threshold_signatures(1))
+        );
+        assert_eq!(
+            weight(crate::Call::request_voucher {
+                claim_id: cid,
+                intent_id: iid,
+                voucher: voucher.clone(),
+                fairness_proof: proof.clone(),
+                signatures: signatures.clone(),
+            }),
+            with_signatures(Weights::request_voucher())
+        );
+        assert_eq!(
+            weight(crate::Call::attest_settle {
+                claim_id: cid,
+                signatures: signatures.clone()
+            }),
+            with_signatures(Weights::attest_settle())
+        );
+        assert_eq!(
+            weight(crate::Call::attest_expire_policy {
+                intent_id: iid,
+                signatures: signatures.clone()
+            }),
+            with_signatures(Weights::attest_expire_policy())
+        );
+        for n in [1u32, 7] {
+            let entries =
+                |make: &dyn Fn() -> SubmitIntentEntry| (0..n).map(|_| make()).collect::<Vec<_>>();
+            assert_eq!(
+                weight(crate::Call::submit_batch_intents {
+                    entries: entries(&|| SubmitIntentEntry { kind: kind.clone() })
+                        .try_into()
+                        .expect("bounded"),
+                }),
+                Weights::submit_batch_intents(n)
+            );
+            assert_eq!(
+                weight(crate::Call::attest_batch_intents {
+                    intent_ids: vec![iid; n as usize].try_into().expect("bounded"),
+                    signatures: signatures.clone(),
+                }),
+                with_signatures(Weights::attest_batch_intents(n))
+            );
+            assert_eq!(
+                weight(crate::Call::request_batch_vouchers {
+                    entries: (0..n)
+                        .map(|_| RequestVoucherEntry {
+                            claim_id: cid,
+                            intent_id: iid,
+                            voucher: voucher.clone(),
+                            fairness_proof: proof.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .expect("bounded"),
+                    signatures: signatures.clone(),
+                }),
+                with_signatures(Weights::request_batch_vouchers(n))
+            );
+            assert_eq!(
+                weight(crate::Call::attest_batch_settle {
+                    claim_ids: vec![cid; n as usize].try_into().expect("bounded"),
+                    signatures: signatures.clone(),
+                }),
+                with_signatures(Weights::attest_batch_settle(n))
+            );
+        }
+    });
+}
+
+#[test]
+fn genesis_safety_expiry_sweep_reports_its_benchmarked_weight() {
+    use crate::weights::WeightInfo;
+    use frame_support::traits::Hooks;
+    type Weights = <Test as crate::Config>::WeightInfo;
+    new_test_ext().execute_with(|| {
+        let block = 50u64;
+        let (_, iid, _) = vouchered_claim_with_voucher(0x34, 1_000);
+        ExpiryQueue::<Test>::insert(
+            block as u32,
+            BoundedVec::try_from(vec![iid, iid]).expect("two ids"),
+        );
+        assert_eq!(
+            <IntentSettlement as Hooks<u64>>::on_initialize(block),
+            Weights::expire_intents(2)
+        );
+        assert_eq!(
+            <IntentSettlement as Hooks<u64>>::on_initialize(block),
+            Weights::expire_intents(0)
+        );
+    });
+}
+
+#[test]
+fn genesis_safety_rejected_committee_calls_report_their_benchmarked_base() {
+    use crate::weights::WeightInfo;
+    use frame_support::traits::UnfilteredDispatchable;
+    type Weights = <Test as crate::Config>::WeightInfo;
+    new_test_ext().execute_with(|| {
+        let (cid, iid, voucher) = vouchered_claim_with_voucher(0x35, 1_000);
+        let proof = good_fairness_proof(iid, 1_000);
+        let signatures = mock_settle_sigs();
+        let unchecked = |base: frame_support::weights::Weight| {
+            Some(base.saturating_add(Weights::threshold_signatures(0)))
+        };
+        let entry = RequestVoucherEntry {
+            claim_id: cid,
+            intent_id: iid,
+            voucher: voucher.clone(),
+            fairness_proof: proof.clone(),
+        };
+        let cases: Vec<(crate::Call<Test>, frame_support::weights::Weight)> = vec![
+            (
+                crate::Call::request_voucher {
+                    claim_id: cid,
+                    intent_id: iid,
+                    voucher,
+                    fairness_proof: proof,
+                    signatures: signatures.clone(),
+                },
+                Weights::request_voucher(),
+            ),
+            (
+                crate::Call::attest_batch_intents {
+                    intent_ids: vec![iid; 3].try_into().expect("bounded"),
+                    signatures: signatures.clone(),
+                },
+                Weights::attest_batch_intents(3),
+            ),
+            (
+                crate::Call::request_batch_vouchers {
+                    entries: vec![entry; 3].try_into().expect("bounded"),
+                    signatures: signatures.clone(),
+                },
+                Weights::request_batch_vouchers(3),
+            ),
+            (
+                crate::Call::attest_settle {
+                    claim_id: cid,
+                    signatures: signatures.clone(),
+                },
+                Weights::attest_settle(),
+            ),
+            (
+                crate::Call::attest_batch_settle {
+                    claim_ids: vec![cid; 3].try_into().expect("bounded"),
+                    signatures: signatures.clone(),
+                },
+                Weights::attest_batch_settle(3),
+            ),
+            (
+                crate::Call::attest_expire_policy {
+                    intent_id: iid,
+                    signatures,
+                },
+                Weights::attest_expire_policy(),
+            ),
+        ];
+        for (call, base) in cases {
+            let result = call
+                .dispatch_bypass_filter(RuntimeOrigin::signed(BOB))
+                .expect_err("non-member origin");
+            assert_eq!(result.error, Error::<Test>::NotCommitteeMember.into());
+            assert_eq!(result.post_info.actual_weight, unchecked(base));
+        }
+    });
+}

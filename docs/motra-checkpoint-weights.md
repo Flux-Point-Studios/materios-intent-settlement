@@ -13,6 +13,8 @@ include that work in these weights. This pallet has no MOTRA dependency.
 | `request_batch_settle(n)` | Per entry, as `request_settle` |
 | `supersede_settlement_request` | One unreserve for the displaced bond |
 
+The intent, voucher, attestation and expiry dispatches do no Currency work.
+
 The default `SubstrateWeight` for these six dispatches is measured against the
 Materios runtime, whose Balances account store runs MOTRA accrual checkpoints,
 so its reads, writes and time already include that checkpoint work. A host

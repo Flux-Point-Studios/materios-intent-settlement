@@ -302,6 +302,52 @@ impl crate::weights::WeightInfo for BondWeights {
     fn supersede_settlement_request() -> frame_support::weights::Weight {
         frame_support::weights::Weight::from_parts(60_006, 37)
     }
+
+    fn submit_intent() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(70_007, 41)
+    }
+
+    fn request_credit_refund() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(80_008, 43)
+    }
+
+    fn submit_batch_intents(n: u32) -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(90_009, 47).saturating_mul(n.into())
+    }
+
+    fn attest_intent() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(100_010, 53)
+    }
+
+    fn attest_batch_intents(n: u32) -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(110_011, 59).saturating_mul(n.into())
+    }
+
+    fn request_voucher() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(120_012, 61)
+    }
+
+    fn request_batch_vouchers(n: u32) -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(130_013, 67).saturating_mul(n.into())
+    }
+
+    fn attest_settle() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(140_014, 71)
+    }
+
+    fn attest_batch_settle(n: u32) -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(150_015, 73).saturating_mul(n.into())
+    }
+
+    fn attest_expire_policy() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(160_016, 79)
+    }
+
+    fn expire_intents(n: u32) -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(3, 1).saturating_add(
+            frame_support::weights::Weight::from_parts(170_017, 83).saturating_mul(n.into()),
+        )
+    }
 }
 
 #[test]

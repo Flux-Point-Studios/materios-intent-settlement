@@ -1813,10 +1813,9 @@ pub mod pallet {
             // Convert to u32 block for the expiry key. Saturating-cast avoids
             // panics on tests that burn through block numbers.
             let n_u32: u32 = n.into().try_into().unwrap_or(u32::MAX);
-            let mut total = Weight::from_parts(10_000, 0);
             let to_expire = ExpiryQueue::<T>::take(n_u32);
+            let total = T::WeightInfo::expire_intents(to_expire.len() as u32);
             for intent_id in to_expire {
-                total = total.saturating_add(Weight::from_parts(10_000, 0));
                 if let Some(mut intent) = Intents::<T>::get(intent_id) {
                     if matches!(
                         intent.status,
@@ -2257,7 +2256,7 @@ pub mod pallet {
         /// expiry, and (for `BuyPolicy`/`RefundCredit`) atomically debits
         /// `Credits[who]` by the premium/refund amount.
         #[pallet::call_index(0)]
-        #[pallet::weight(Weight::from_parts(500_000_000, 0))]
+        #[pallet::weight(T::WeightInfo::submit_intent())]
         pub fn submit_intent(origin: OriginFor<T>, kind: IntentKind) -> DispatchResult {
             let who = ensure_signed(origin)?;
             Self::do_submit_intent(who, kind).map(|_| ())
@@ -2283,9 +2282,8 @@ pub mod pallet {
         ///   block can't race past threshold mid-mutation: the second call
         ///   either sees the first's committed state or rolls back atomically.
         #[pallet::call_index(1)]
-        #[pallet::weight((Weight::from_parts(50_000_000, 0)
-            .saturating_add(T::WeightInfo::threshold_signatures(1))
-            .saturating_add(T::DbWeight::get().reads_writes(4, 4)), DispatchClass::Operational, Pays::No))]
+        #[pallet::weight((T::WeightInfo::attest_intent()
+            .saturating_add(T::WeightInfo::threshold_signatures(1)), DispatchClass::Operational, Pays::No))]
         pub fn attest_intent(
             origin: OriginFor<T>,
             intent_id: IntentId,
@@ -2386,7 +2384,7 @@ pub mod pallet {
         /// signature is gone; keepers must upgrade in lockstep with the
         /// runtime spec bump.
         #[pallet::call_index(2)]
-        #[pallet::weight((Weight::from_parts(100_000_000, 0)
+        #[pallet::weight((T::WeightInfo::request_voucher()
             .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
             DispatchClass::Operational, Pays::No))]
         pub fn request_voucher(
@@ -2397,7 +2395,7 @@ pub mod pallet {
             fairness_proof: BatchFairnessProof,
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
         ) -> DispatchResultWithPostInfo {
-            Self::with_signature_weight(Weight::from_parts(100_000_000, 0), |checked| {
+            Self::with_signature_weight(T::WeightInfo::request_voucher(), |checked| {
                 let who = ensure_signed(origin)?;
                 ensure!(
                     T::CommitteeMembership::is_member(&who),
@@ -2533,7 +2531,7 @@ pub mod pallet {
         /// Sugar wrapper around `submit_intent(IntentKind::RefundCredit { .. })`.
         /// Enforces `Credits[who] >= amount`.
         #[pallet::call_index(3)]
-        #[pallet::weight(Weight::from_parts(500_000_000, 0))]
+        #[pallet::weight(T::WeightInfo::request_credit_refund())]
         pub fn request_credit_refund(
             origin: OriginFor<T>,
             amount_ada: AdaLovelace,
@@ -3051,16 +3049,8 @@ pub mod pallet {
         /// Atomic semantics: any per-intent failure (intent not found,
         /// terminal status mismatch, duplicate intent_id within the batch)
         /// reverts every storage mutation in this call.
-        ///
-        /// Cost model:
-        /// - Base ~50M ref_time (M-of-N sig-verify pass)
-        /// - Plus N * ~3M ref_time (per-intent storage read for `Intents`,
-        ///   one storage write each for `Intents` + `AttestationSigs`).
-        /// - At N=256 the per-intent cost ~768M dwarfs the sig-verify
-        ///   pass — but it's still ~3x cheaper than the legacy 768
-        ///   `attest_intent` calls each at ~50M = 38B total.
         #[pallet::call_index(11)]
-        #[pallet::weight((Weight::from_parts(50_000_000u64.saturating_add((intent_ids.len() as u64).saturating_mul(3_000_000)), 0)
+        #[pallet::weight((T::WeightInfo::attest_batch_intents(intent_ids.len() as u32)
             .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
             DispatchClass::Operational, Pays::No))]
         pub fn attest_batch_intents(
@@ -3069,11 +3059,7 @@ pub mod pallet {
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
         ) -> DispatchResultWithPostInfo {
             Self::with_signature_weight(
-                Weight::from_parts(
-                    50_000_000u64
-                        .saturating_add((intent_ids.len() as u64).saturating_mul(3_000_000)),
-                    0,
-                ),
+                T::WeightInfo::attest_batch_intents(intent_ids.len() as u32),
                 |checked| {
                     let who = ensure_signed(origin)?;
                     ensure!(
@@ -3242,18 +3228,8 @@ pub mod pallet {
         /// status, claim already vouchered, invalid fairness proof, digest
         /// mismatch, duplicate claim_id within batch, coverage overflow)
         /// reverts every storage mutation in this call.
-        ///
-        /// Cost model:
-        /// - Base ~50M ref_time (M-of-N sig-verify + duplicate-claim scan)
-        /// - Plus N * ~10M ref_time (per-entry voucher_digest +
-        ///   bfpr_digest computation + storage writes for `Claims`,
-        ///   `Vouchers`, `Intents`, `PendingBatches` removal,
-        ///   `outstanding_coverage_ada` increment).
-        /// - At N=256 ~2.6B ref_time. Versus 256 single `request_voucher`
-        ///   calls at ~100M each = 25.6B ref_time, the batch path is
-        ///   ~10x cheaper.
         #[pallet::call_index(12)]
-        #[pallet::weight((Weight::from_parts(50_000_000u64.saturating_add((entries.len() as u64).saturating_mul(10_000_000)), 0)
+        #[pallet::weight((T::WeightInfo::request_batch_vouchers(entries.len() as u32)
             .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
             DispatchClass::Operational, Pays::No))]
         pub fn request_batch_vouchers(
@@ -3262,10 +3238,7 @@ pub mod pallet {
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
         ) -> DispatchResultWithPostInfo {
             Self::with_signature_weight(
-                Weight::from_parts(
-                    50_000_000u64.saturating_add((entries.len() as u64).saturating_mul(10_000_000)),
-                    0,
-                ),
+                T::WeightInfo::request_batch_vouchers(entries.len() as u32),
                 |checked| {
                     let who = ensure_signed(origin)?;
                     ensure!(
@@ -3456,43 +3429,8 @@ pub mod pallet {
         /// Backward compatibility: the existing 1-arg `submit_intent` is
         /// unchanged. Callers can mix single and batch in the same block.
         ///
-        /// Cost model:
-        /// - Base ~50M ref_time (signature verify + envelope decode)
-        /// - Plus N*~5M ref_time (per-entry pool-utilization check +
-        ///   IntentId derivation + storage writes for `Intents`, `Nonces`,
-        ///   `PendingBatches`, `ExpiryQueue`)
-        /// - Plus the standard `submit_intent` per-call weight (500M from
-        ///   the legacy single-call) but consumed ONCE per batch, not per
-        ///   entry — that's the throughput unlock.
         #[pallet::call_index(10)]
-        #[pallet::weight({
-            // Base weight ~50M (single-call submit_intent's amortised cost)
-            // plus per-entry storage cost ~5M. Tuned to match the sublinear
-            // pattern proven in PR #27 (settle_batch_atomic) — actual numbers
-            // are pinned by the runtime-benchmarks recipe in benchmarking.rs.
-            //
-            // Task #221 (PR #28 pre-merge security review): proof_size is no
-            // longer 0. Per-entry proof footprint ~5KB worst case (one
-            // `Intents::insert` value + one `Nonces::mutate` + one
-            // `PendingBatches::try_push` + one `ExpiryQueue::insert` + the
-            // SCALE-encoded `IntentKind` itself, dominated by BuyPolicy's
-            // 114-byte beneficiary_cardano_addr). Plus a 16KB base for the
-            // M-of-N free zone, header reads, and pool-utilization fetch.
-            // The bench-cli wiring (#190) is still pending so this remains
-            // a hand-tuned upper bound — the runtime-benchmarks pass will
-            // replace this whole expression with the generated WeightInfo
-            // entry when #190 lands. Until then, this estimate keeps the
-            // per-block normal-class budget honest at N=256
-            // (~16KB + 256*5KB ~1.3MB proof_size, well under the 5MB limit
-            // documented in types.rs::MAX_SUBMIT_BATCH).
-            const BASE_PROOF_SIZE: u64 = 16_384;
-            const PER_ENTRY_PROOF_SIZE: u64 = 5_120;
-            let n = entries.len() as u64;
-            Weight::from_parts(
-                50_000_000u64.saturating_add(n.saturating_mul(5_000_000)),
-                BASE_PROOF_SIZE.saturating_add(n.saturating_mul(PER_ENTRY_PROOF_SIZE)),
-            )
-        })]
+        #[pallet::weight(T::WeightInfo::submit_batch_intents(entries.len() as u32))]
         pub fn submit_batch_intents(
             origin: OriginFor<T>,
             entries: BoundedVec<SubmitIntentEntry, <T as Config>::MaxSubmitBatch>,
@@ -3664,7 +3602,7 @@ pub mod pallet {
         /// committee attestation. Fraud slashing only applies while the
         /// request is pending; attestation consumes that request.
         #[pallet::call_index(14)]
-        #[pallet::weight((Weight::from_parts(60_000_000, 0)
+        #[pallet::weight((T::WeightInfo::attest_settle()
             .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
             DispatchClass::Operational, Pays::No))]
         pub fn attest_settle(
@@ -3672,7 +3610,7 @@ pub mod pallet {
             claim_id: ClaimId,
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
         ) -> DispatchResultWithPostInfo {
-            Self::with_signature_weight(Weight::from_parts(60_000_000, 0), |checked| {
+            Self::with_signature_weight(T::WeightInfo::attest_settle(), |checked| {
                 let who = ensure_signed(origin)?;
                 ensure!(
                     T::CommitteeMembership::is_member(&who),
@@ -3933,7 +3871,7 @@ pub mod pallet {
         /// `attest_settle`, applied per-entry. Atomic rollback on first
         /// failure.
         #[pallet::call_index(16)]
-        #[pallet::weight((Weight::from_parts(60_000_000u64.saturating_add((claim_ids.len() as u64).saturating_mul(15_000_000)), 0)
+        #[pallet::weight((T::WeightInfo::attest_batch_settle(claim_ids.len() as u32)
             .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
             DispatchClass::Operational, Pays::No))]
         pub fn attest_batch_settle(
@@ -3942,11 +3880,7 @@ pub mod pallet {
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
         ) -> DispatchResultWithPostInfo {
             Self::with_signature_weight(
-                Weight::from_parts(
-                    60_000_000u64
-                        .saturating_add((claim_ids.len() as u64).saturating_mul(15_000_000)),
-                    0,
-                ),
+                T::WeightInfo::attest_batch_settle(claim_ids.len() as u32),
                 |checked| {
                     let who = ensure_signed(origin)?;
                     ensure!(
@@ -4286,7 +4220,7 @@ pub mod pallet {
         /// `IntentExpired{reason=PolicyExpiredOnCardano}` is the canonical
         /// event for indexers.
         #[pallet::call_index(18)]
-        #[pallet::weight((Weight::from_parts(55_000_000, 0)
+        #[pallet::weight((T::WeightInfo::attest_expire_policy()
             .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
             DispatchClass::Operational, Pays::No))]
         pub fn attest_expire_policy(
@@ -4294,7 +4228,7 @@ pub mod pallet {
             intent_id: IntentId,
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
         ) -> DispatchResultWithPostInfo {
-            Self::with_signature_weight(Weight::from_parts(55_000_000, 0), |checked| {
+            Self::with_signature_weight(T::WeightInfo::attest_expire_policy(), |checked| {
                 let who = ensure_signed(origin)?;
                 ensure!(
                     T::CommitteeMembership::is_member(&who),

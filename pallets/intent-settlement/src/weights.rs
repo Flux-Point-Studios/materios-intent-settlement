@@ -9,18 +9,24 @@
 //!
 //! `settle_batch_atomic`: CLI 43.0.0, 2026-05-14, steps 10, repeat 5.
 //!
-//! The bond and request slots: CLI 43.0.0, 2026-10-17, steps 20, repeat 20,
+//! Every other slot: CLI 43.0.0, 2026-10-18, steps 20, repeat 20,
 //! `--output-analysis max`, Compiled Wasm, AMD Ryzen 7 7730U. Each benchmark
-//! measures its call's costliest branch with real reserved bonds; see
-//! `benchmarking.rs`:
+//! measures its call's costliest branch, with real reserved bonds and a full
+//! `PendingBatches`; see `benchmarking.rs`:
 //!   frame-omni-bencher v1 benchmark pallet
 //!     --runtime <materios_runtime.wasm built with runtime-benchmarks>
 //!     --pallet pallet_intent_settlement
-//!     --extrinsic request_settle,request_batch_settle,
-//!                 supersede_settlement_request,post_settlement_bond,
-//!                 release_settlement_bond,slash_bad_settlement_evidence
+//!     --extrinsic request_settle,supersede_settlement_request,
+//!                 post_settlement_bond,release_settlement_bond,
+//!                 slash_bad_settlement_evidence,submit_intent,
+//!                 request_credit_refund,attest_intent,request_voucher,
+//!                 attest_settle,attest_expire_policy
 //!     --steps 20 --repeat 20 --output-analysis max
 //!     --genesis-builder runtime --genesis-builder-preset development
+//!   and again with
+//!     --extrinsic request_batch_settle,submit_batch_intents,
+//!                 attest_batch_intents,request_batch_vouchers,
+//!                 attest_batch_settle,expire_intents
 
 #![cfg_attr(rustfmt, rustfmt_skip)]
 #![allow(unused_parens)]
@@ -55,6 +61,39 @@ pub trait WeightInfo {
     /// claim's intent last in a full `PendingBatches`, excluding threshold
     /// verification.
     fn supersede_settlement_request() -> Weight;
+    /// `submit_intent` with a BuyPolicy into a nearly full `PendingBatches`
+    /// and expiry slot.
+    fn submit_intent() -> Weight;
+    /// `request_credit_refund` into a nearly full `PendingBatches` and
+    /// expiry slot.
+    fn request_credit_refund() -> Weight;
+    /// `submit_batch_intents` with `n` BuyPolicy entries filling
+    /// `PendingBatches` and one expiry slot.
+    fn submit_batch_intents(n: u32) -> Weight;
+    /// The threshold-crossing `attest_intent` with a full committee bundle,
+    /// excluding signature verification.
+    fn attest_intent() -> Weight;
+    /// `attest_batch_intents` over `n` pending intents, excluding threshold
+    /// verification.
+    fn attest_batch_intents(n: u32) -> Weight;
+    /// `request_voucher` with a full-size fairness proof and the intent last
+    /// in a full `PendingBatches`, excluding threshold verification.
+    fn request_voucher() -> Weight;
+    /// `request_batch_vouchers` with `n` such entries, excluding threshold
+    /// verification.
+    fn request_batch_vouchers(n: u32) -> Weight;
+    /// `attest_settle` on a bonded request with the intent last in a full
+    /// `PendingBatches`, excluding threshold verification.
+    fn attest_settle() -> Weight;
+    /// `attest_batch_settle` with `n` such requests, excluding threshold
+    /// verification.
+    fn attest_batch_settle(n: u32) -> Weight;
+    /// `attest_expire_policy` with the intent last in a full `PendingBatches`,
+    /// excluding threshold verification.
+    fn attest_expire_policy() -> Weight;
+    /// The `on_initialize` expiry sweep over `n` pending BuyPolicy intents,
+    /// each removed from a full `PendingBatches`.
+    fn expire_intents(n: u32) -> Weight;
 }
 
 /// Base dispatch costs. Threshold-signature work is charged separately by
@@ -99,10 +138,10 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
     /// Proof: `Motra::AccrualCheckpoint` (`max_values`: None, `max_size`: Some(68), added: 2543, mode: `MaxEncodedLen`)
     fn post_settlement_bond() -> Weight {
         // Proof Size summary in bytes:
-        //  Measured:  `889`
+        //  Measured:  `922`
         //  Estimated: `4714`
-        // Minimum execution time: 54_143_000 picoseconds.
-        Weight::from_parts(55_205_000, 0)
+        // Minimum execution time: 64_042_000 picoseconds.
+        Weight::from_parts(65_896_000, 0)
             .saturating_add(Weight::from_parts(0, 4714))
             .saturating_add(T::DbWeight::get().reads(4))
             .saturating_add(T::DbWeight::get().writes(3))
@@ -123,10 +162,10 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
     /// Proof: `IntentSettlement::SlashedSettlementRequests` (`max_values`: None, `max_size`: Some(96), added: 2571, mode: `MaxEncodedLen`)
     fn slash_bad_settlement_evidence() -> Weight {
         // Proof Size summary in bytes:
-        //  Measured:  `1373`
+        //  Measured:  `1406`
         //  Estimated: `8799`
-        // Minimum execution time: 109_798_000 picoseconds.
-        Weight::from_parts(113_426_000, 0)
+        // Minimum execution time: 129_326_000 picoseconds.
+        Weight::from_parts(137_823_000, 0)
             .saturating_add(Weight::from_parts(0, 8799))
             .saturating_add(T::DbWeight::get().reads(9))
             .saturating_add(T::DbWeight::get().writes(8))
@@ -145,10 +184,10 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
     /// Proof: `IntentSettlement::BondedClaimRequester` (`max_values`: None, `max_size`: Some(96), added: 2571, mode: `MaxEncodedLen`)
     fn release_settlement_bond() -> Weight {
         // Proof Size summary in bytes:
-        //  Measured:  `896`
+        //  Measured:  `929`
         //  Estimated: `4714`
-        // Minimum execution time: 59_954_000 picoseconds.
-        Weight::from_parts(61_648_000, 0)
+        // Minimum execution time: 71_786_000 picoseconds.
+        Weight::from_parts(73_219_000, 0)
             .saturating_add(Weight::from_parts(0, 4714))
             .saturating_add(T::DbWeight::get().reads(5))
             .saturating_add(T::DbWeight::get().writes(6))
@@ -173,10 +212,10 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
     /// Proof: `IntentSettlement::BondedClaimAttestedAt` (`max_values`: None, `max_size`: Some(52), added: 2527, mode: `MaxEncodedLen`)
     fn request_settle() -> Weight {
         // Proof Size summary in bytes:
-        //  Measured:  `1347`
+        //  Measured:  `4452`
         //  Estimated: `8438`
-        // Minimum execution time: 100_842_000 picoseconds.
-        Weight::from_parts(103_847_000, 0)
+        // Minimum execution time: 118_796_000 picoseconds.
+        Weight::from_parts(120_780_000, 0)
             .saturating_add(Weight::from_parts(0, 8438))
             .saturating_add(T::DbWeight::get().reads(9))
             .saturating_add(T::DbWeight::get().writes(8))
@@ -202,13 +241,13 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
     /// The range of component `n` is `[1, 256]`.
     fn request_batch_settle(n: u32, ) -> Weight {
         // Proof Size summary in bytes:
-        //  Measured:  `89 + n * (916 ±0)`
+        //  Measured:  `122 + n * (3988 ±0)`
         //  Estimated: `4714 + n * (5828 ±0)`
-        // Minimum execution time: 104_409_000 picoseconds.
-        Weight::from_parts(105_902_000, 0)
+        // Minimum execution time: 124_226_000 picoseconds.
+        Weight::from_parts(125_018_000, 0)
             .saturating_add(Weight::from_parts(0, 4714))
-            // Standard Error: 318_710
-            .saturating_add(Weight::from_parts(82_253_632, 0).saturating_mul(n.into()))
+            // Standard Error: 356_474
+            .saturating_add(Weight::from_parts(95_455_444, 0).saturating_mul(n.into()))
             .saturating_add(T::DbWeight::get().reads(2))
             .saturating_add(T::DbWeight::get().reads((7_u64).saturating_mul(n.into())))
             .saturating_add(T::DbWeight::get().writes(2))
@@ -243,13 +282,298 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
     /// Proof: `IntentSettlement::BondedClaimAttestedAt` (`max_values`: None, `max_size`: Some(52), added: 2527, mode: `MaxEncodedLen`)
     fn supersede_settlement_request() -> Weight {
         // Proof Size summary in bytes:
-        //  Measured:  `321715`
+        //  Measured:  `324922`
         //  Estimated: `321487`
-        // Minimum execution time: 1_213_227_000 picoseconds.
-        Weight::from_parts(1_307_978_000, 0)
+        // Minimum execution time: 1_433_037_000 picoseconds.
+        Weight::from_parts(1_451_803_000, 0)
             .saturating_add(Weight::from_parts(0, 321487))
             .saturating_add(T::DbWeight::get().reads(11))
             .saturating_add(T::DbWeight::get().writes(10))
+    }
+    /// Storage: `IntentSettlement::Credits` (r:1 w:1)
+    /// Proof: `IntentSettlement::Credits` (`max_values`: None, `max_size`: Some(56), added: 2531, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PoolUtilization` (r:1 w:0)
+    /// Proof: `IntentSettlement::PoolUtilization` (`max_values`: Some(1), `max_size`: Some(24), added: 519, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Nonces` (r:1 w:1)
+    /// Proof: `IntentSettlement::Nonces` (`max_values`: None, `max_size`: Some(56), added: 2531, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::IntentTTL` (r:1 w:0)
+    /// Proof: `IntentSettlement::IntentTTL` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Intents` (r:1 w:1)
+    /// Proof: `IntentSettlement::Intents` (`max_values`: None, `max_size`: Some(644), added: 3119, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PendingBatches` (r:1 w:1)
+    /// Proof: `IntentSettlement::PendingBatches` (`max_values`: Some(1), `max_size`: Some(320002), added: 320497, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::ExpiryQueue` (r:1 w:1)
+    /// Proof: `IntentSettlement::ExpiryQueue` (`max_values`: None, `max_size`: Some(8214), added: 10689, mode: `MaxEncodedLen`)
+    fn submit_intent() -> Weight {
+        // Proof Size summary in bytes:
+        //  Measured:  `320377`
+        //  Estimated: `321487`
+        // Minimum execution time: 1_340_882_000 picoseconds.
+        Weight::from_parts(1_365_428_000, 0)
+            .saturating_add(Weight::from_parts(0, 321487))
+            .saturating_add(T::DbWeight::get().reads(7))
+            .saturating_add(T::DbWeight::get().writes(5))
+    }
+    /// Storage: `IntentSettlement::Credits` (r:1 w:1)
+    /// Proof: `IntentSettlement::Credits` (`max_values`: None, `max_size`: Some(56), added: 2531, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Nonces` (r:1 w:1)
+    /// Proof: `IntentSettlement::Nonces` (`max_values`: None, `max_size`: Some(56), added: 2531, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::IntentTTL` (r:1 w:0)
+    /// Proof: `IntentSettlement::IntentTTL` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Intents` (r:1 w:1)
+    /// Proof: `IntentSettlement::Intents` (`max_values`: None, `max_size`: Some(644), added: 3119, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PendingBatches` (r:1 w:1)
+    /// Proof: `IntentSettlement::PendingBatches` (`max_values`: Some(1), `max_size`: Some(320002), added: 320497, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::ExpiryQueue` (r:1 w:1)
+    /// Proof: `IntentSettlement::ExpiryQueue` (`max_values`: None, `max_size`: Some(8214), added: 10689, mode: `MaxEncodedLen`)
+    fn request_credit_refund() -> Weight {
+        // Proof Size summary in bytes:
+        //  Measured:  `320366`
+        //  Estimated: `321487`
+        // Minimum execution time: 1_349_338_000 picoseconds.
+        Weight::from_parts(1_357_664_000, 0)
+            .saturating_add(Weight::from_parts(0, 321487))
+            .saturating_add(T::DbWeight::get().reads(6))
+            .saturating_add(T::DbWeight::get().writes(5))
+    }
+    /// Storage: `IntentSettlement::Credits` (r:1 w:1)
+    /// Proof: `IntentSettlement::Credits` (`max_values`: None, `max_size`: Some(56), added: 2531, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PoolUtilization` (r:1 w:0)
+    /// Proof: `IntentSettlement::PoolUtilization` (`max_values`: Some(1), `max_size`: Some(24), added: 519, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Nonces` (r:1 w:1)
+    /// Proof: `IntentSettlement::Nonces` (`max_values`: None, `max_size`: Some(56), added: 2531, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::IntentTTL` (r:1 w:0)
+    /// Proof: `IntentSettlement::IntentTTL` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Intents` (r:256 w:256)
+    /// Proof: `IntentSettlement::Intents` (`max_values`: None, `max_size`: Some(644), added: 3119, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PendingBatches` (r:1 w:1)
+    /// Proof: `IntentSettlement::PendingBatches` (`max_values`: Some(1), `max_size`: Some(320002), added: 320497, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::ExpiryQueue` (r:1 w:1)
+    /// Proof: `IntentSettlement::ExpiryQueue` (`max_values`: None, `max_size`: Some(8214), added: 10689, mode: `MaxEncodedLen`)
+    /// The range of component `n` is `[1, 256]`.
+    fn submit_batch_intents(n: u32, ) -> Weight {
+        // Proof Size summary in bytes:
+        //  Measured:  `320409`
+        //  Estimated: `321487 + n * (3119 ±0)`
+        // Minimum execution time: 1_516_736_000 picoseconds.
+        Weight::from_parts(179_079_057, 0)
+            .saturating_add(Weight::from_parts(0, 321487))
+            // Standard Error: 3_955_333
+            .saturating_add(Weight::from_parts(1_372_138_048, 0).saturating_mul(n.into()))
+            .saturating_add(T::DbWeight::get().reads(6))
+            .saturating_add(T::DbWeight::get().reads((1_u64).saturating_mul(n.into())))
+            .saturating_add(T::DbWeight::get().writes(4))
+            .saturating_add(T::DbWeight::get().writes((1_u64).saturating_mul(n.into())))
+            .saturating_add(Weight::from_parts(0, 3119).saturating_mul(n.into()))
+    }
+    /// Storage: `OrinqReceipts::CommitteeMembers` (r:1 w:0)
+    /// Proof: `OrinqReceipts::CommitteeMembers` (`max_values`: Some(1), `max_size`: Some(3074), added: 3569, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Intents` (r:1 w:1)
+    /// Proof: `IntentSettlement::Intents` (`max_values`: None, `max_size`: Some(644), added: 3119, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PendingAttestations` (r:1 w:1)
+    /// Proof: `IntentSettlement::PendingAttestations` (`max_values`: None, `max_size`: Some(9266), added: 11741, mode: `MaxEncodedLen`)
+    /// Storage: `OrinqReceipts::AttestationThreshold` (r:1 w:0)
+    /// Proof: `OrinqReceipts::AttestationThreshold` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::AttestationSigs` (r:0 w:1)
+    /// Proof: `IntentSettlement::AttestationSigs` (`max_values`: None, `max_size`: Some(9266), added: 11741, mode: `MaxEncodedLen`)
+    fn attest_intent() -> Weight {
+        // Proof Size summary in bytes:
+        //  Measured:  `9957`
+        //  Estimated: `12731`
+        // Minimum execution time: 69_332_000 picoseconds.
+        Weight::from_parts(70_614_000, 0)
+            .saturating_add(Weight::from_parts(0, 12731))
+            .saturating_add(T::DbWeight::get().reads(4))
+            .saturating_add(T::DbWeight::get().writes(3))
+    }
+    /// Storage: `OrinqReceipts::CommitteeMembers` (r:1 w:0)
+    /// Proof: `OrinqReceipts::CommitteeMembers` (`max_values`: Some(1), `max_size`: Some(3074), added: 3569, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Intents` (r:256 w:256)
+    /// Proof: `IntentSettlement::Intents` (`max_values`: None, `max_size`: Some(644), added: 3119, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::MinSignerThreshold` (r:1 w:0)
+    /// Proof: `IntentSettlement::MinSignerThreshold` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PendingAttestations` (r:0 w:256)
+    /// Proof: `IntentSettlement::PendingAttestations` (`max_values`: None, `max_size`: Some(9266), added: 11741, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::AttestationSigs` (r:0 w:256)
+    /// Proof: `IntentSettlement::AttestationSigs` (`max_values`: None, `max_size`: Some(9266), added: 11741, mode: `MaxEncodedLen`)
+    /// The range of component `n` is `[1, 256]`.
+    fn attest_batch_intents(n: u32, ) -> Weight {
+        // Proof Size summary in bytes:
+        //  Measured:  `487 + n * (274 ±0)`
+        //  Estimated: `4559 + n * (3119 ±0)`
+        // Minimum execution time: 58_521_000 picoseconds.
+        Weight::from_parts(60_455_000, 0)
+            .saturating_add(Weight::from_parts(0, 4559))
+            // Standard Error: 127_002
+            .saturating_add(Weight::from_parts(15_793_050, 0).saturating_mul(n.into()))
+            .saturating_add(T::DbWeight::get().reads(2))
+            .saturating_add(T::DbWeight::get().reads((1_u64).saturating_mul(n.into())))
+            .saturating_add(T::DbWeight::get().writes((3_u64).saturating_mul(n.into())))
+            .saturating_add(Weight::from_parts(0, 3119).saturating_mul(n.into()))
+    }
+    /// Storage: `OrinqReceipts::CommitteeMembers` (r:1 w:0)
+    /// Proof: `OrinqReceipts::CommitteeMembers` (`max_values`: Some(1), `max_size`: Some(3074), added: 3569, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Vouchers` (r:1 w:1)
+    /// Proof: `IntentSettlement::Vouchers` (`max_values`: None, `max_size`: Some(3353), added: 5828, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Intents` (r:1 w:1)
+    /// Proof: `IntentSettlement::Intents` (`max_values`: None, `max_size`: Some(644), added: 3119, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::MinSignerThreshold` (r:1 w:0)
+    /// Proof: `IntentSettlement::MinSignerThreshold` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PoolUtilization` (r:1 w:1)
+    /// Proof: `IntentSettlement::PoolUtilization` (`max_values`: Some(1), `max_size`: Some(24), added: 519, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PendingBatches` (r:1 w:1)
+    /// Proof: `IntentSettlement::PendingBatches` (`max_values`: Some(1), `max_size`: Some(320002), added: 320497, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Claims` (r:0 w:1)
+    /// Proof: `IntentSettlement::Claims` (`max_values`: None, `max_size`: Some(166), added: 2641, mode: `MaxEncodedLen`)
+    fn request_voucher() -> Weight {
+        // Proof Size summary in bytes:
+        //  Measured:  `320803`
+        //  Estimated: `321487`
+        // Minimum execution time: 1_410_093_000 picoseconds.
+        Weight::from_parts(1_426_835_000, 0)
+            .saturating_add(Weight::from_parts(0, 321487))
+            .saturating_add(T::DbWeight::get().reads(6))
+            .saturating_add(T::DbWeight::get().writes(5))
+    }
+    /// Storage: `OrinqReceipts::CommitteeMembers` (r:1 w:0)
+    /// Proof: `OrinqReceipts::CommitteeMembers` (`max_values`: Some(1), `max_size`: Some(3074), added: 3569, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Vouchers` (r:256 w:256)
+    /// Proof: `IntentSettlement::Vouchers` (`max_values`: None, `max_size`: Some(3353), added: 5828, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::MinSignerThreshold` (r:1 w:0)
+    /// Proof: `IntentSettlement::MinSignerThreshold` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Intents` (r:256 w:256)
+    /// Proof: `IntentSettlement::Intents` (`max_values`: None, `max_size`: Some(644), added: 3119, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PoolUtilization` (r:1 w:1)
+    /// Proof: `IntentSettlement::PoolUtilization` (`max_values`: Some(1), `max_size`: Some(24), added: 519, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PendingBatches` (r:1 w:1)
+    /// Proof: `IntentSettlement::PendingBatches` (`max_values`: Some(1), `max_size`: Some(320002), added: 320497, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Claims` (r:0 w:256)
+    /// Proof: `IntentSettlement::Claims` (`max_values`: None, `max_size`: Some(166), added: 2641, mode: `MaxEncodedLen`)
+    /// The range of component `n` is `[1, 256]`.
+    fn request_batch_vouchers(n: u32, ) -> Weight {
+        // Proof Size summary in bytes:
+        //  Measured:  `320532 + n * (274 ±0)`
+        //  Estimated: `321487 + n * (5828 ±0)`
+        // Minimum execution time: 1_451_152_000 picoseconds.
+        Weight::from_parts(1_463_916_000, 0)
+            .saturating_add(Weight::from_parts(0, 321487))
+            // Standard Error: 2_997_502
+            .saturating_add(Weight::from_parts(1_462_021_898, 0).saturating_mul(n.into()))
+            .saturating_add(T::DbWeight::get().reads(4))
+            .saturating_add(T::DbWeight::get().reads((2_u64).saturating_mul(n.into())))
+            .saturating_add(T::DbWeight::get().writes(2))
+            .saturating_add(T::DbWeight::get().writes((3_u64).saturating_mul(n.into())))
+            .saturating_add(Weight::from_parts(0, 5828).saturating_mul(n.into()))
+    }
+    /// Storage: `OrinqReceipts::CommitteeMembers` (r:1 w:0)
+    /// Proof: `OrinqReceipts::CommitteeMembers` (`max_values`: Some(1), `max_size`: Some(3074), added: 3569, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::ClaimSettlementRequests` (r:1 w:1)
+    /// Proof: `IntentSettlement::ClaimSettlementRequests` (`max_values`: None, `max_size`: Some(213), added: 2688, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Claims` (r:1 w:1)
+    /// Proof: `IntentSettlement::Claims` (`max_values`: None, `max_size`: Some(166), added: 2641, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Vouchers` (r:1 w:0)
+    /// Proof: `IntentSettlement::Vouchers` (`max_values`: None, `max_size`: Some(3353), added: 5828, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::MinSignerThreshold` (r:1 w:0)
+    /// Proof: `IntentSettlement::MinSignerThreshold` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Intents` (r:1 w:1)
+    /// Proof: `IntentSettlement::Intents` (`max_values`: None, `max_size`: Some(644), added: 3119, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PendingBatches` (r:1 w:1)
+    /// Proof: `IntentSettlement::PendingBatches` (`max_values`: Some(1), `max_size`: Some(320002), added: 320497, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PoolUtilization` (r:1 w:1)
+    /// Proof: `IntentSettlement::PoolUtilization` (`max_values`: Some(1), `max_size`: Some(24), added: 519, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::BondedClaimRequester` (r:0 w:1)
+    /// Proof: `IntentSettlement::BondedClaimRequester` (`max_values`: None, `max_size`: Some(96), added: 2571, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::BondedClaimAttestedAt` (r:0 w:1)
+    /// Proof: `IntentSettlement::BondedClaimAttestedAt` (`max_values`: None, `max_size`: Some(52), added: 2527, mode: `MaxEncodedLen`)
+    fn attest_settle() -> Weight {
+        // Proof Size summary in bytes:
+        //  Measured:  `324551`
+        //  Estimated: `321487`
+        // Minimum execution time: 1_365_509_000 picoseconds.
+        Weight::from_parts(1_401_027_000, 0)
+            .saturating_add(Weight::from_parts(0, 321487))
+            .saturating_add(T::DbWeight::get().reads(8))
+            .saturating_add(T::DbWeight::get().writes(7))
+    }
+    /// Storage: `OrinqReceipts::CommitteeMembers` (r:1 w:0)
+    /// Proof: `OrinqReceipts::CommitteeMembers` (`max_values`: Some(1), `max_size`: Some(3074), added: 3569, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::ClaimSettlementRequests` (r:256 w:256)
+    /// Proof: `IntentSettlement::ClaimSettlementRequests` (`max_values`: None, `max_size`: Some(213), added: 2688, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Claims` (r:256 w:256)
+    /// Proof: `IntentSettlement::Claims` (`max_values`: None, `max_size`: Some(166), added: 2641, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Vouchers` (r:256 w:0)
+    /// Proof: `IntentSettlement::Vouchers` (`max_values`: None, `max_size`: Some(3353), added: 5828, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::MinSignerThreshold` (r:1 w:0)
+    /// Proof: `IntentSettlement::MinSignerThreshold` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Intents` (r:256 w:256)
+    /// Proof: `IntentSettlement::Intents` (`max_values`: None, `max_size`: Some(644), added: 3119, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PendingBatches` (r:1 w:1)
+    /// Proof: `IntentSettlement::PendingBatches` (`max_values`: Some(1), `max_size`: Some(320002), added: 320497, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PoolUtilization` (r:1 w:1)
+    /// Proof: `IntentSettlement::PoolUtilization` (`max_values`: Some(1), `max_size`: Some(24), added: 519, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::BondedClaimRequester` (r:0 w:256)
+    /// Proof: `IntentSettlement::BondedClaimRequester` (`max_values`: None, `max_size`: Some(96), added: 2571, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::BondedClaimAttestedAt` (r:0 w:256)
+    /// Proof: `IntentSettlement::BondedClaimAttestedAt` (`max_values`: None, `max_size`: Some(52), added: 2527, mode: `MaxEncodedLen`)
+    /// The range of component `n` is `[1, 256]`.
+    fn attest_batch_settle(n: u32, ) -> Weight {
+        // Proof Size summary in bytes:
+        //  Measured:  `320578 + n * (3974 ±0)`
+        //  Estimated: `321487 + n * (5828 ±0)`
+        // Minimum execution time: 1_381_739_000 picoseconds.
+        Weight::from_parts(1_396_928_000, 0)
+            .saturating_add(Weight::from_parts(0, 321487))
+            // Standard Error: 4_085_207
+            .saturating_add(Weight::from_parts(1_412_761_918, 0).saturating_mul(n.into()))
+            .saturating_add(T::DbWeight::get().reads(4))
+            .saturating_add(T::DbWeight::get().reads((4_u64).saturating_mul(n.into())))
+            .saturating_add(T::DbWeight::get().writes(2))
+            .saturating_add(T::DbWeight::get().writes((5_u64).saturating_mul(n.into())))
+            .saturating_add(Weight::from_parts(0, 5828).saturating_mul(n.into()))
+    }
+    /// Storage: `OrinqReceipts::CommitteeMembers` (r:1 w:0)
+    /// Proof: `OrinqReceipts::CommitteeMembers` (`max_values`: Some(1), `max_size`: Some(3074), added: 3569, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PolicyExpireRequests` (r:1 w:1)
+    /// Proof: `IntentSettlement::PolicyExpireRequests` (`max_values`: None, `max_size`: Some(192), added: 2667, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Intents` (r:1 w:1)
+    /// Proof: `IntentSettlement::Intents` (`max_values`: None, `max_size`: Some(644), added: 3119, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::MinSignerThreshold` (r:1 w:0)
+    /// Proof: `IntentSettlement::MinSignerThreshold` (`max_values`: Some(1), `max_size`: Some(4), added: 499, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PendingBatches` (r:1 w:1)
+    /// Proof: `IntentSettlement::PendingBatches` (`max_values`: Some(1), `max_size`: Some(320002), added: 320497, mode: `MaxEncodedLen`)
+    fn attest_expire_policy() -> Weight {
+        // Proof Size summary in bytes:
+        //  Measured:  `321008`
+        //  Estimated: `321487`
+        // Minimum execution time: 1_341_223_000 picoseconds.
+        Weight::from_parts(1_454_117_000, 0)
+            .saturating_add(Weight::from_parts(0, 321487))
+            .saturating_add(T::DbWeight::get().reads(5))
+            .saturating_add(T::DbWeight::get().writes(3))
+    }
+    /// Storage: `IntentSettlement::ExpiryQueue` (r:1 w:1)
+    /// Proof: `IntentSettlement::ExpiryQueue` (`max_values`: None, `max_size`: Some(8214), added: 10689, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Intents` (r:256 w:256)
+    /// Proof: `IntentSettlement::Intents` (`max_values`: None, `max_size`: Some(644), added: 3119, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::Credits` (r:1 w:1)
+    /// Proof: `IntentSettlement::Credits` (`max_values`: None, `max_size`: Some(56), added: 2531, mode: `MaxEncodedLen`)
+    /// Storage: `IntentSettlement::PendingBatches` (r:1 w:1)
+    /// Proof: `IntentSettlement::PendingBatches` (`max_values`: Some(1), `max_size`: Some(320002), added: 320497, mode: `MaxEncodedLen`)
+    /// The range of component `n` is `[1, 256]`.
+    fn expire_intents(n: u32, ) -> Weight {
+        // Proof Size summary in bytes:
+        //  Measured:  `320314 + n * (306 ±0)`
+        //  Estimated: `321487 + n * (3119 ±0)`
+        // Minimum execution time: 1_434_319_000 picoseconds.
+        Weight::from_parts(2_951_822_929, 0)
+            .saturating_add(Weight::from_parts(0, 321487))
+            // Standard Error: 4_422_357
+            .saturating_add(Weight::from_parts(1_344_298_671, 0).saturating_mul(n.into()))
+            .saturating_add(T::DbWeight::get().reads(3))
+            .saturating_add(T::DbWeight::get().reads((1_u64).saturating_mul(n.into())))
+            .saturating_add(T::DbWeight::get().writes(3))
+            .saturating_add(T::DbWeight::get().writes((1_u64).saturating_mul(n.into())))
+            .saturating_add(Weight::from_parts(0, 3119).saturating_mul(n.into()))
     }
 }
 
@@ -283,5 +607,38 @@ impl WeightInfo for () {
     }
     fn supersede_settlement_request() -> Weight {
         Weight::from_parts(620_000_000, 9_000)
+    }
+    fn submit_intent() -> Weight {
+        Weight::from_parts(510_000_000, 11_000)
+    }
+    fn request_credit_refund() -> Weight {
+        Weight::from_parts(520_000_000, 12_000)
+    }
+    fn submit_batch_intents(n: u32) -> Weight {
+        Weight::from_parts(530_000_000, 13_000).saturating_mul(n.into())
+    }
+    fn attest_intent() -> Weight {
+        Weight::from_parts(540_000_000, 14_000)
+    }
+    fn attest_batch_intents(n: u32) -> Weight {
+        Weight::from_parts(550_000_000, 15_000).saturating_mul(n.into())
+    }
+    fn request_voucher() -> Weight {
+        Weight::from_parts(560_000_000, 16_000)
+    }
+    fn request_batch_vouchers(n: u32) -> Weight {
+        Weight::from_parts(570_000_000, 17_000).saturating_mul(n.into())
+    }
+    fn attest_settle() -> Weight {
+        Weight::from_parts(580_000_000, 18_000)
+    }
+    fn attest_batch_settle(n: u32) -> Weight {
+        Weight::from_parts(590_000_000, 19_000).saturating_mul(n.into())
+    }
+    fn attest_expire_policy() -> Weight {
+        Weight::from_parts(600_000_000, 20_000)
+    }
+    fn expire_intents(n: u32) -> Weight {
+        Weight::from_parts(10_000, 0).saturating_add(Weight::from_parts(610_000_000, 21_000).saturating_mul(n.into()))
     }
 }
