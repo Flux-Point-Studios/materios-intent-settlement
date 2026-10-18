@@ -37,6 +37,9 @@ export {
   submitCreditRefund,
   submitSettleClaim,
   MateriosRpcClient,
+  DispatchFailedError,
+  ExtrinsicOutcomeUnknownError,
+  TransactionRejectedError,
 } from "./rpc.js";
 export type { MateriosRpcClientOptions, SettleClaimArgs } from "./rpc.js";
 
@@ -127,6 +130,10 @@ export type {
   CommitteeState,
   KeeperSubmission,
   KeeperConfig,
+  SettlementEvidence,
+  SettlementRequestView,
+  AttestedBond,
+  SettlementConstants,
   CommitteeDaemonConfig,
   DaemonState,
   DirectClaimParams,

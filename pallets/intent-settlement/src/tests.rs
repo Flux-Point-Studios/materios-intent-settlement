@@ -3,6 +3,9 @@
 
 #![cfg(test)]
 
+#[path = "genesis_safety_tests.rs"]
+mod genesis_safety;
+
 use crate as pallet_intent_settlement;
 use crate::pallet::{IsCommitteeMember, VerifyCommitteeSignature};
 use crate::types::*;
@@ -58,6 +61,7 @@ impl pallet_balances::Config for Test {
     type AccountStore = System;
     type Balance = u128;
     type ExistentialDeposit = ExistentialDeposit;
+    type ReserveIdentifier = [u8; 8];
 }
 
 parameter_types! {
@@ -181,8 +185,12 @@ impl IsCommitteeMember<u64> for MockCommittee {
 /// easiest-to-read marker that still lets `test_invalid_signature_rejected`
 /// exercise the rejection path).
 pub struct MockSigVerifier;
+thread_local! {
+    static VERIFY_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 impl VerifyCommitteeSignature for MockSigVerifier {
     fn verify(pubkey: &CommitteePubkey, sig: &CommitteeSig, _msg: &[u8]) -> bool {
+        VERIFY_CALLS.with(|count| count.set(count.get() + 1));
         sig[0] == pubkey[0]
     }
 }
@@ -270,40 +278,80 @@ impl crate::weights::WeightInfo for BondWeights {
     }
 
     fn post_settlement_bond() -> frame_support::weights::Weight {
-        frame_support::weights::Weight::from_parts(648_885_000, 3_533)
+        frame_support::weights::Weight::from_parts(10_001, 17)
     }
 
     fn slash_bad_settlement_evidence() -> frame_support::weights::Weight {
-        frame_support::weights::Weight::from_parts(1_095_540_000, 14_132)
+        frame_support::weights::Weight::from_parts(20_002, 19)
     }
 
     fn release_settlement_bond() -> frame_support::weights::Weight {
-        frame_support::weights::Weight::from_parts(648_885_000, 3_533)
+        frame_support::weights::Weight::from_parts(30_003, 23)
+    }
+
+    fn request_settle() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(40_004, 29)
+    }
+
+    fn request_batch_settle(n: u32) -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(50_005, 31)
+            .saturating_mul(n.into())
+            .saturating_add(frame_support::weights::Weight::from_parts(1, 0))
+    }
+
+    fn supersede_settlement_request() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(60_006, 37)
+    }
+
+    fn submit_intent() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(70_007, 41)
+    }
+
+    fn request_credit_refund() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(80_008, 43)
+    }
+
+    fn submit_batch_intents(n: u32) -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(90_009, 47).saturating_mul(n.into())
+    }
+
+    fn attest_intent() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(100_010, 53)
+    }
+
+    fn attest_batch_intents(n: u32) -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(110_011, 59).saturating_mul(n.into())
+    }
+
+    fn request_voucher() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(120_012, 61)
+    }
+
+    fn request_batch_vouchers(n: u32) -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(130_013, 67).saturating_mul(n.into())
+    }
+
+    fn attest_settle() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(140_014, 71)
+    }
+
+    fn attest_batch_settle(n: u32) -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(150_015, 73).saturating_mul(n.into())
+    }
+
+    fn attest_expire_policy() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(160_016, 79)
+    }
+
+    fn expire_intents(n: u32) -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(3, 1).saturating_add(
+            frame_support::weights::Weight::from_parts(170_017, 83).saturating_mul(n.into()),
+        )
     }
 }
 
 #[test]
-fn bond_weight_examples_use_the_gemtek_checkpoint_benchmark() {
-    use crate::weights::WeightInfo;
-    use frame_support::weights::Weight;
-    let checkpoint = Weight::from_parts(148_885_000, 3_533);
-    let base = Weight::from_parts(500_000_000, 0);
-    assert_eq!(
-        BondWeights::post_settlement_bond(),
-        base.saturating_add(checkpoint)
-    );
-    assert_eq!(
-        BondWeights::release_settlement_bond(),
-        base.saturating_add(checkpoint)
-    );
-    assert_eq!(
-        BondWeights::slash_bad_settlement_evidence(),
-        base.saturating_add(checkpoint.saturating_mul(4))
-    );
-}
-
-#[test]
-fn bond_dispatches_preserve_runtime_weight_class_and_fee_policy() {
+fn bond_dispatches_preserve_configured_weight_and_metadata() {
     use crate::weights::WeightInfo;
     use frame_support::dispatch::{DispatchClass, GetDispatchInfo, Pays};
 
@@ -366,6 +414,11 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
     let mut ext = sp_io::TestExternalities::new(t);
     ext.execute_with(|| {
         System::set_block_number(1);
+        for who in [1, 2, 3, 100, 101] {
+            let _ = <Balances as frame_support::traits::Currency<u64>>::make_free_balance_be(
+                &who, 10_000_000,
+            );
+        }
         pallet_intent_settlement::pallet::IntentTTL::<Test>::put(600u32);
         pallet_intent_settlement::pallet::ClaimTTL::<Test>::put(28_800u32);
         pallet_intent_settlement::pallet::PoolUtilization::<Test>::put(
@@ -718,7 +771,7 @@ fn request_voucher_happy_path() {
             voucher.clone(),
             bfpr.clone(),
             mock_voucher_sigs()
-        ));
+        ).map_err(|error| error.error));
 
         let intent =
             pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
@@ -747,7 +800,7 @@ fn request_voucher_rejects_pending_intent() {
                 voucher,
                 bfpr,
                 mock_voucher_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::IntentStatusMismatch
         );
     });
@@ -770,7 +823,7 @@ fn request_voucher_rejects_bad_pro_rata_scale() {
                 voucher,
                 bfpr,
                 mock_voucher_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InvalidFairnessProof
         );
     });
@@ -793,7 +846,7 @@ fn request_voucher_rejects_awarded_mismatch() {
                 voucher,
                 bfpr,
                 mock_voucher_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InvalidFairnessProof
         );
     });
@@ -821,7 +874,7 @@ fn request_voucher_rejects_awarded_exceeds_pool() {
                 voucher,
                 bfpr,
                 mock_voucher_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InvalidFairnessProof
         );
     });
@@ -843,7 +896,7 @@ fn request_voucher_rejects_digest_mismatch() {
                 voucher,
                 bfpr,
                 mock_voucher_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::FairnessDigestMismatch
         );
     });
@@ -867,7 +920,7 @@ fn request_voucher_rejects_duplicate_claim() {
             voucher1,
             bfpr1,
             mock_voucher_sigs()
-        ));
+        ).map_err(|error| error.error));
 
         // Second attested intent, same claim_id.
         let kind = IntentKind::RequestPayout {
@@ -902,7 +955,7 @@ fn request_voucher_rejects_duplicate_claim() {
                 voucher2,
                 bfpr2,
                 mock_voucher_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::DuplicateVoucher
         );
     });
@@ -926,14 +979,14 @@ fn settle_claim_happy_path_flips_state_idempotently() {
             voucher,
             bfpr,
             mock_voucher_sigs()
-        ));
+        ).map_err(|error| error.error));
         assert_ok!(IntentSettlement::settle_claim(
             RuntimeOrigin::signed(1),
             claim_id,
             [0xFFu8; 32],
             false,
             mock_settle_sigs()
-        ));
+        ).map_err(|error| error.error));
         let claim =
             pallet_intent_settlement::pallet::Claims::<Test>::get(claim_id).unwrap();
         assert!(claim.settled);
@@ -949,7 +1002,7 @@ fn settle_claim_happy_path_flips_state_idempotently() {
             [0xEEu8; 32],
             true,
             mock_settle_sigs()
-        ));
+        ).map_err(|error| error.error));
         let claim2 =
             pallet_intent_settlement::pallet::Claims::<Test>::get(claim_id).unwrap();
         // tx_hash NOT overwritten (idempotent = first-write-wins)
@@ -968,7 +1021,7 @@ fn settle_claim_unknown_id_fails() {
                 [0u8; 32],
                 false,
                 mock_settle_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::ClaimNotFound
         );
     });
@@ -984,7 +1037,7 @@ fn settle_claim_rejects_non_member() {
                 [0u8; 32],
                 false,
                 mock_settle_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::NotCommitteeMember
         );
     });
@@ -1027,7 +1080,7 @@ fn credit_deposit_happy_and_idempotent() {
             1_500_000,
             tx,
             mock_credit_sigs()
-        ));
+        ).map_err(|error| error.error));
         assert_eq!(
             pallet_intent_settlement::pallet::Credits::<Test>::get(ALICE),
             1_500_000
@@ -1039,7 +1092,7 @@ fn credit_deposit_happy_and_idempotent() {
                 1_500_000,
                 tx,
                 mock_credit_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::DepositAlreadyProcessed
         );
     });
@@ -1055,7 +1108,7 @@ fn credit_deposit_rejects_non_member() {
                 1_000,
                 [0u8; 32],
                 mock_credit_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::NotCommitteeMember
         );
     });
@@ -1258,7 +1311,7 @@ fn runtime_api_get_voucher_roundtrip() {
             voucher.clone(),
             bfpr,
             mock_voucher_sigs()
-        ));
+        ).map_err(|error| error.error));
         let got = pallet_intent_settlement::pallet::Pallet::<Test>::get_voucher(
             claim_id,
         )
@@ -1301,7 +1354,7 @@ fn request_voucher_on_nonexistent_intent_errors() {
                 voucher,
                 bfpr,
                 mock_voucher_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::IntentNotFound
         );
     });
@@ -1351,7 +1404,7 @@ fn request_voucher_rejects_non_member() {
                 voucher,
                 bfpr,
                 mock_voucher_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::NotCommitteeMember
         );
     });
@@ -1379,7 +1432,7 @@ fn request_voucher_rejects_parallel_vec_mismatch() {
                 voucher,
                 bfpr,
                 mock_voucher_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InvalidFairnessProof
         );
     });
@@ -1411,7 +1464,7 @@ fn request_voucher_rejects_unsorted_intent_ids() {
                 voucher,
                 bfpr,
                 mock_voucher_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InvalidFairnessProof
         );
     });
@@ -1438,7 +1491,7 @@ fn request_voucher_rejects_bad_block_range() {
                 voucher,
                 bfpr,
                 mock_voucher_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InvalidFairnessProof
         );
     });
@@ -1458,7 +1511,7 @@ fn full_settle_decrements_outstanding_coverage() {
             voucher,
             bfpr,
             mock_voucher_sigs()
-        ));
+        ).map_err(|error| error.error));
         let before =
             pallet_intent_settlement::pallet::PoolUtilization::<Test>::get();
         assert!(before.outstanding_coverage_ada > 0);
@@ -1468,7 +1521,7 @@ fn full_settle_decrements_outstanding_coverage() {
             [0xAA; 32],
             false,
             mock_settle_sigs()
-        ));
+        ).map_err(|error| error.error));
         let after =
             pallet_intent_settlement::pallet::PoolUtilization::<Test>::get();
         assert!(after.outstanding_coverage_ada < before.outstanding_coverage_ada);
@@ -1596,7 +1649,7 @@ fn test_credit_deposit_rejects_signatures_above_max_committee() {
                 1_000,
                 [0xCA; 32],
                 sigs,
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::TooManySignatures
         );
         // No state mutation.
@@ -1624,7 +1677,7 @@ fn test_settle_claim_rejects_signatures_above_max_committee() {
             voucher,
             bfpr,
             mock_voucher_sigs()
-        ));
+        ).map_err(|error| error.error));
         let mut sigs = Vec::with_capacity(33);
         for _ in 0..33 {
             sigs.push(mock_sig_for(1));
@@ -1636,7 +1689,7 @@ fn test_settle_claim_rejects_signatures_above_max_committee() {
                 [0xFF; 32],
                 false,
                 sigs,
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::TooManySignatures
         );
         // Claim still unsettled.
@@ -1665,7 +1718,7 @@ fn test_request_voucher_rejects_signatures_above_max_committee() {
                 voucher,
                 bfpr,
                 sigs,
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::TooManySignatures
         );
         // Voucher not minted.
@@ -1701,7 +1754,7 @@ fn test_settle_claim_decrements_total_nav_ada() {
             voucher,
             bfpr,
             mock_voucher_sigs()
-        ));
+        ).map_err(|error| error.error));
         let nav_before =
             pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
                 .total_nav_ada;
@@ -1719,7 +1772,7 @@ fn test_settle_claim_decrements_total_nav_ada() {
             [0xCD; 32],
             false,
             mock_settle_sigs()
-        ));
+        ).map_err(|error| error.error));
 
         let nav_after =
             pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
@@ -1770,7 +1823,7 @@ fn test_settle_batch_atomic_decrements_total_nav_ada() {
             RuntimeOrigin::signed(1),
             bv,
             sigs,
-        ));
+        ).map_err(|error| error.error));
         let nav_after =
             pallet_intent_settlement::pallet::PoolUtilization::<Test>::get()
                 .total_nav_ada;
@@ -1879,7 +1932,7 @@ fn test_outstanding_coverage_symmetric_accounting() {
             voucher,
             bfpr,
             mock_voucher_sigs()
-        ));
+        ).map_err(|error| error.error));
         let mid = pallet_intent_settlement::pallet::PoolUtilization::<Test>::get();
         assert_eq!(
             mid.outstanding_coverage_ada, per_intent,
@@ -1893,7 +1946,7 @@ fn test_outstanding_coverage_symmetric_accounting() {
             [0xDE; 32],
             false,
             mock_settle_sigs()
-        ));
+        ).map_err(|error| error.error));
         let final_ = pallet_intent_settlement::pallet::PoolUtilization::<Test>::get();
         assert_eq!(
             final_.outstanding_coverage_ada, 0,
@@ -1926,7 +1979,7 @@ fn test_outstanding_coverage_overflow_rejected() {
                 voucher,
                 bfpr,
                 mock_voucher_sigs()
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::CoverageOverflow
         );
         let after = pallet_intent_settlement::pallet::PoolUtilization::<Test>::get();
@@ -2014,7 +2067,7 @@ fn test_pending_batches_index_is_maintained() {
             voucher,
             bfpr,
             mock_voucher_sigs()
-        ));
+        ).map_err(|error| error.error));
         let pb_final =
             pallet_intent_settlement::pallet::PendingBatches::<Test>::get();
         assert_eq!(pb_final.len(), 1);
@@ -2110,7 +2163,7 @@ fn test_credit_deposit_rejects_below_threshold() {
                 1_000_000,
                 [0xAB; 32],
                 vec![mock_sig_for(1)] // only 1 signer
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures
         );
         // Credits unchanged.
@@ -2131,7 +2184,7 @@ fn test_credit_deposit_accepts_threshold() {
             2_000_000,
             [0xCD; 32],
             vec![mock_sig_for(1), mock_sig_for(2)]
-        ));
+        ).map_err(|error| error.error));
         assert_eq!(
             pallet_intent_settlement::pallet::Credits::<Test>::get(ALICE),
             2_000_000
@@ -2153,7 +2206,7 @@ fn test_settle_claim_rejects_below_threshold() {
             voucher,
             bfpr,
             mock_voucher_sigs()
-        ));
+        ).map_err(|error| error.error));
         // Only one signer: rejected.
         assert_noop!(
             IntentSettlement::settle_claim(
@@ -2162,7 +2215,7 @@ fn test_settle_claim_rejects_below_threshold() {
                 [0xFF; 32],
                 false,
                 vec![mock_sig_for(1)]
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures
         );
         // Claim state NOT mutated.
@@ -2184,7 +2237,7 @@ fn test_multisig_duplicate_signers_rejected() {
                 100_000,
                 [0x11; 32],
                 vec![mock_sig_for(1), mock_sig_for(1)]
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::DuplicateSigner
         );
     });
@@ -2203,7 +2256,7 @@ fn test_multisig_caller_must_be_one_of_the_signers() {
                 100_000,
                 [0x22; 32],
                 vec![mock_sig_for(1), mock_sig_for(2)]
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures
         );
     });
@@ -2221,7 +2274,7 @@ fn test_multisig_non_committee_signer_rejected() {
                 100_000,
                 [0x33; 32],
                 vec![mock_sig_for(1), rogue]
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::SignerNotCommitteeMember
         );
     });
@@ -2240,7 +2293,7 @@ fn test_multisig_invalid_signature_rejected() {
                 100_000,
                 [0x44; 32],
                 vec![mock_sig_for(1), bad]
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InvalidSignature
         );
     });
@@ -2574,7 +2627,7 @@ fn vouchered_claim(claim_seed: u8, amount: u64) -> (ClaimId, IntentId) {
         voucher,
         bfpr,
         mock_voucher_sigs(),
-    ));
+    ).map_err(|error| error.error));
     (claim_id, iid)
 }
 
@@ -2612,7 +2665,7 @@ fn batch_atomic_happy_path_settles_all_and_emits_one_event() {
             RuntimeOrigin::signed(1),
             bv,
             sigs,
-        ));
+        ).map_err(|error| error.error));
 
         for c in [c1, c2, c3].iter() {
             let claim =
@@ -2673,7 +2726,7 @@ fn batch_atomic_atomic_revert_on_one_bad_claim() {
                 RuntimeOrigin::signed(1),
                 bv,
                 sigs,
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::ClaimNotFound,
         );
         // Atomic: c1 and c2 NOT settled even though they processed first.
@@ -2705,7 +2758,7 @@ fn batch_atomic_rejects_duplicate_claim_in_batch() {
             BoundedVec::try_from(entries).unwrap();
 
         assert_noop!(
-            IntentSettlement::settle_batch_atomic(RuntimeOrigin::signed(1), bv, sigs),
+            IntentSettlement::settle_batch_atomic(RuntimeOrigin::signed(1), bv, sigs).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::DuplicateClaimInBatch,
         );
     });
@@ -2723,7 +2776,7 @@ fn batch_atomic_rejects_already_settled_claim() {
             [9u8; 32],
             false,
             mock_settle_sigs(),
-        ));
+        ).map_err(|error| error.error));
         // Now try a batch that includes the already-settled c1.
         let entries: Vec<SettleBatchEntry> = vec![
             SettleBatchEntry { claim_id: c1, cardano_tx_hash: [1u8; 32], settled_direct: false },
@@ -2733,7 +2786,7 @@ fn batch_atomic_rejects_already_settled_claim() {
         let bv: BoundedVec<SettleBatchEntry, MaxSettleBatch> =
             BoundedVec::try_from(entries).unwrap();
         assert_noop!(
-            IntentSettlement::settle_batch_atomic(RuntimeOrigin::signed(1), bv, sigs),
+            IntentSettlement::settle_batch_atomic(RuntimeOrigin::signed(1), bv, sigs).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::BatchClaimAlreadySettled,
         );
         // c2 still unsettled (atomic).
@@ -2750,7 +2803,7 @@ fn batch_atomic_rejects_empty_batch() {
             BoundedVec::default();
         let sigs = vec![mock_sig_for(1), mock_sig_for(2)];
         assert_noop!(
-            IntentSettlement::settle_batch_atomic(RuntimeOrigin::signed(1), bv, sigs),
+            IntentSettlement::settle_batch_atomic(RuntimeOrigin::signed(1), bv, sigs).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::EmptyBatch,
         );
     });
@@ -2770,7 +2823,7 @@ fn batch_atomic_rejects_non_committee_caller() {
         assert_noop!(
             IntentSettlement::settle_batch_atomic(
                 RuntimeOrigin::signed(ALICE), bv, sigs
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::NotCommitteeMember,
         );
     });
@@ -2791,7 +2844,7 @@ fn batch_atomic_below_threshold_rejected() {
                 RuntimeOrigin::signed(1),
                 bv,
                 vec![mock_sig_for(1)],
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures,
         );
     });
@@ -2874,7 +2927,7 @@ fn batch_atomic_scales_to_max_batch_size() {
             RuntimeOrigin::signed(1),
             bv,
             sigs,
-        ));
+        ).map_err(|error| error.error));
         for cid in claim_ids.iter() {
             let claim =
                 pallet_intent_settlement::pallet::Claims::<Test>::get(*cid).unwrap();
@@ -2898,7 +2951,7 @@ fn batch_atomic_backward_compat_single_settle_still_works() {
             [0xCAu8; 32],
             true,
             mock_settle_sigs(),
-        ));
+        ).map_err(|error| error.error));
         let claim =
             pallet_intent_settlement::pallet::Claims::<Test>::get(c1).unwrap();
         assert!(claim.settled);
@@ -3058,7 +3111,7 @@ fn test_request_voucher_happy_with_m_of_n_sigs() {
             voucher,
             bfpr,
             vec![mock_sig_for(1), mock_sig_for(2)]
-        ));
+        ).map_err(|error| error.error));
         let intent =
             pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
         assert_eq!(intent.status, IntentStatus::Vouchered);
@@ -3081,7 +3134,7 @@ fn test_request_voucher_below_threshold_rejected() {
                 voucher,
                 bfpr,
                 vec![mock_sig_for(1)]
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures
         );
         // Voucher NOT minted — the new gate fires before any state mutation.
@@ -3107,7 +3160,7 @@ fn test_request_voucher_above_threshold_accepted() {
             voucher,
             bfpr,
             vec![mock_sig_for(1), mock_sig_for(2), mock_sig_for(3)]
-        ));
+        ).map_err(|error| error.error));
         let intent =
             pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
         assert_eq!(intent.status, IntentStatus::Vouchered);
@@ -3130,7 +3183,7 @@ fn test_request_voucher_bad_sig_rejected() {
                 voucher,
                 bfpr,
                 vec![mock_sig_for(1), bad]
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InvalidSignature
         );
     });
@@ -3150,7 +3203,7 @@ fn test_request_voucher_non_committee_signer_rejected() {
                 voucher,
                 bfpr,
                 vec![mock_sig_for(1), rogue]
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::SignerNotCommitteeMember
         );
     });
@@ -3170,7 +3223,7 @@ fn test_request_voucher_duplicate_signer_rejected() {
                 voucher,
                 bfpr,
                 vec![mock_sig_for(1), mock_sig_for(1)]
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::DuplicateSigner
         );
     });
@@ -3194,7 +3247,7 @@ fn test_request_voucher_caller_not_in_bundle_rejected() {
                 voucher,
                 bfpr,
                 vec![mock_sig_for(1), mock_sig_for(2)]
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures
         );
     });
@@ -3387,7 +3440,7 @@ fn attest_batch_happy_path_n_5_emits_per_intent_and_batch_events() {
             RuntimeOrigin::signed(1),
             bv,
             sigs,
-        ));
+        ).map_err(|error| error.error));
         // All 5 intents are now Attested with the bundle stored.
         for iid in iids.iter() {
             let intent =
@@ -3541,7 +3594,7 @@ fn attest_batch_atomic_revert_on_unknown_intent() {
                 RuntimeOrigin::signed(1),
                 bv,
                 sigs,
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::IntentNotFound,
         );
         // No partial transitions.
@@ -3574,7 +3627,7 @@ fn attest_batch_rejects_duplicate_intent_within_batch() {
                 RuntimeOrigin::signed(1),
                 bv,
                 sigs,
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::DuplicateIntentInBatch,
         );
     });
@@ -3614,7 +3667,7 @@ fn attest_batch_already_attested_intents_idempotent_skip() {
             RuntimeOrigin::signed(1),
             bv,
             sigs,
-        ));
+        ).map_err(|error| error.error));
         // BatchIntentsAttested: submitted=4, attested=2 (only the freshes).
         let batch_events: Vec<_> = System::events()
             .into_iter()
@@ -3661,7 +3714,7 @@ fn attest_batch_rejects_terminal_status_intents() {
                 RuntimeOrigin::signed(1),
                 bv,
                 sigs,
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::IntentStatusMismatch,
         );
         // First intent NOT freshly attested (atomic).
@@ -3681,7 +3734,7 @@ fn attest_batch_rejects_empty_batch() {
                 RuntimeOrigin::signed(1),
                 bv,
                 sigs,
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::EmptyAttestBatch,
         );
     });
@@ -3700,7 +3753,7 @@ fn attest_batch_rejects_non_committee_caller() {
                 RuntimeOrigin::signed(ALICE),
                 bv,
                 sigs,
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::NotCommitteeMember,
         );
     });
@@ -3771,7 +3824,7 @@ fn attest_batch_below_threshold_rejected() {
                 RuntimeOrigin::signed(1),
                 bv,
                 vec![mock_sig_for(1)],
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures,
         );
     });
@@ -3836,7 +3889,7 @@ fn attest_batch_scales_within_pending_batches_bound() {
             RuntimeOrigin::signed(1),
             bv,
             sigs,
-        ));
+        ).map_err(|error| error.error));
         for iid in iids.iter() {
             let intent =
                 pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
@@ -4043,7 +4096,7 @@ fn request_batch_vouchers_happy_path_n_3() {
             RuntimeOrigin::signed(1),
             bv,
             rvbn_sigs(),
-        ));
+        ).map_err(|error| error.error));
 
         // Each intent now Vouchered, claims + vouchers stored, outstanding
         // coverage incremented by 3 * amount.
@@ -4115,7 +4168,7 @@ fn request_batch_vouchers_atomic_revert_on_invalid_fairness_proof() {
                 RuntimeOrigin::signed(1),
                 bv,
                 rvbn_sigs(),
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InvalidFairnessProof,
         );
         // No partial mutations.
@@ -4156,7 +4209,7 @@ fn request_batch_vouchers_rejects_duplicate_claim_in_batch() {
                 RuntimeOrigin::signed(1),
                 bv,
                 rvbn_sigs(),
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::DuplicateClaimInVoucherBatch,
         );
     });
@@ -4190,7 +4243,7 @@ fn request_batch_vouchers_rejects_pending_intent_in_batch() {
                 RuntimeOrigin::signed(1),
                 bv,
                 rvbn_sigs(),
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::IntentStatusMismatch,
         );
     });
@@ -4205,7 +4258,7 @@ fn request_batch_vouchers_rejects_empty_batch() {
                 RuntimeOrigin::signed(1),
                 bv,
                 rvbn_sigs(),
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::EmptyVoucherBatch,
         );
     });
@@ -4224,7 +4277,7 @@ fn request_batch_vouchers_rejects_non_committee_caller() {
                 RuntimeOrigin::signed(ALICE), // not committee
                 bv,
                 rvbn_sigs(),
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::NotCommitteeMember,
         );
     });
@@ -4243,7 +4296,7 @@ fn request_batch_vouchers_below_threshold_rejected() {
                 RuntimeOrigin::signed(1),
                 bv,
                 vec![mock_sig_for(1)], // only 1 sig, threshold is 2
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures,
         );
     });
@@ -4298,7 +4351,7 @@ fn request_batch_vouchers_backward_compat_legacy_single_call() {
             voucher,
             bfpr,
             mock_voucher_sigs(),
-        ));
+        ).map_err(|error| error.error));
         let intent =
             pallet_intent_settlement::pallet::Intents::<Test>::get(iid).unwrap();
         assert_eq!(intent.status, IntentStatus::Vouchered);
@@ -4904,7 +4957,7 @@ fn vouchered_claim_with_voucher(
         voucher.clone(),
         bfpr,
         mock_voucher_sigs(),
-    ));
+    ).map_err(|error| error.error));
     let stored_voucher = Vouchers::<Test>::get(claim_id).expect("voucher just minted");
     (claim_id, iid, stored_voucher)
 }
@@ -4922,6 +4975,7 @@ fn task266_request_settle_happy_path_pins_evidence() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1
         ));
 
         let pending = pallet_intent_settlement::pallet::ClaimSettlementRequests::<
@@ -4964,6 +5018,7 @@ fn task266_request_settle_rejects_below_finality_depth() {
                 evidence.cardano_tx_hash,
                 false,
                 evidence,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::FinalityDepthBelowMinimum,
         );
@@ -4991,6 +5046,7 @@ fn task266_request_settle_rejects_wrong_mainchain_genesis() {
                 evidence.cardano_tx_hash,
                 false,
                 evidence,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::WrongMainchainGenesis,
         );
@@ -5015,6 +5071,7 @@ fn task266_request_settle_rejects_amount_mismatch() {
                 evidence.cardano_tx_hash,
                 false,
                 evidence,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::SettlementEvidenceMismatch,
         );
@@ -5038,6 +5095,7 @@ fn task266_request_settle_rejects_beneficiary_mismatch() {
                 evidence.cardano_tx_hash,
                 false,
                 evidence,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::SettlementEvidenceMismatch,
         );
@@ -5061,6 +5119,7 @@ fn task266_request_settle_rejects_tx_hash_drift_between_arg_and_evidence() {
                 [0xDEu8; 32], // arg doesn't match evidence.cardano_tx_hash
                 false,
                 evidence,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::SettlementEvidenceMismatch,
         );
@@ -5084,6 +5143,7 @@ fn task266_request_settle_rejects_unknown_claim() {
                 evidence.cardano_tx_hash,
                 false,
                 evidence,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::ClaimNotFound,
         );
@@ -5103,12 +5163,13 @@ fn task266_request_settle_rejects_already_settled_claim() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1
         ));
         assert_ok!(IntentSettlement::attest_settle(
             RuntimeOrigin::signed(1),
             claim_id,
             mock_settle_sigs(),
-        ));
+        ).map_err(|error| error.error));
         // Retry — claim is already settled, must reject.
         let evidence2 = settled_evidence_for(&voucher, 15, 2);
         assert_noop!(
@@ -5118,6 +5179,7 @@ fn task266_request_settle_rejects_already_settled_claim() {
                 evidence2.cardano_tx_hash,
                 false,
                 evidence2,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::AlreadySettled,
         );
@@ -5139,6 +5201,7 @@ fn task266_request_settle_rejects_duplicate_pending() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1
         ));
         assert_noop!(
             IntentSettlement::request_settle(
@@ -5147,6 +5210,7 @@ fn task266_request_settle_rejects_duplicate_pending() {
                 evidence.cardano_tx_hash,
                 false,
                 evidence,
+                1
             ),
             pallet_intent_settlement::pallet::Error::<Test>::SettlementRequestAlreadyExists,
         );
@@ -5169,12 +5233,13 @@ fn task266_attest_settle_happy_path() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1
         ));
         assert_ok!(IntentSettlement::attest_settle(
             RuntimeOrigin::signed(1),
             claim_id,
             mock_settle_sigs(),
-        ));
+        ).map_err(|error| error.error));
 
         let claim =
             pallet_intent_settlement::pallet::Claims::<Test>::get(claim_id).unwrap();
@@ -5209,7 +5274,7 @@ fn task266_attest_settle_rejects_missing_request() {
                 RuntimeOrigin::signed(1),
                 claim_id,
                 mock_settle_sigs(),
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::SettlementRequestMissing,
         );
     });
@@ -5229,6 +5294,7 @@ fn task266_attest_settle_rejects_expired_request() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1
         ));
         // Advance past TTL.
         let ttl = TestSettlementRequestTtl::get();
@@ -5238,7 +5304,7 @@ fn task266_attest_settle_rejects_expired_request() {
                 RuntimeOrigin::signed(1),
                 claim_id,
                 mock_settle_sigs(),
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::SettlementRequestExpired,
         );
     });
@@ -5256,13 +5322,14 @@ fn task266_attest_settle_rejects_non_committee_caller() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1
         ));
         assert_noop!(
             IntentSettlement::attest_settle(
                 RuntimeOrigin::signed(ALICE),
                 claim_id,
                 mock_settle_sigs(),
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::NotCommitteeMember,
         );
     });
@@ -5280,13 +5347,14 @@ fn task266_attest_settle_rejects_below_threshold() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1
         ));
         assert_noop!(
             IntentSettlement::attest_settle(
                 RuntimeOrigin::signed(1),
                 claim_id,
                 vec![mock_sig_for(1)], // 1 sig, threshold = 2
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures,
         );
         // Pending entry NOT consumed — keeper can retry with full bundle.
@@ -5402,7 +5470,7 @@ fn task266_legacy_settle_claim_works_before_cutover() {
             [0xFFu8; 32],
             false,
             mock_settle_sigs(),
-        ));
+        ).map_err(|error| error.error));
     });
 }
 
@@ -5424,7 +5492,7 @@ fn task266_legacy_settle_claim_rejects_after_cutover() {
                 [0xFFu8; 32],
                 false,
                 mock_settle_sigs(),
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::DeprecatedExtrinsic,
         );
     });
@@ -5449,7 +5517,7 @@ fn task266_legacy_settle_batch_atomic_rejects_after_cutover() {
                 RuntimeOrigin::signed(1),
                 bv,
                 mock_settle_sigs(),
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::DeprecatedExtrinsic,
         );
     });
@@ -5486,7 +5554,7 @@ fn task266_migration_flags_existing_settled_claims() {
             [0xFFu8; 32],
             false,
             mock_settle_sigs(),
-        ));
+        ).map_err(|error| error.error));
         // LOW #2 property: legacy settle flags PreAuditSettlement
         // immediately at settle time, not only via the migration sweep.
         // This closes the 50-block-grace-window gap where a colluding M
@@ -5498,20 +5566,24 @@ fn task266_migration_flags_existing_settled_claims() {
         // Run the migration via the on_runtime_upgrade hook.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         // Post-migration: settled claim is flagged (idempotent — already
-        // set by legacy settle), version bumped to 3 (chained v0→v1→v2→v3,
-        // adding the #84 bond_amount field migration), both cutovers
-        // scheduled.
+        // set by legacy settle), the version reaches the current one
+        // through every chained step, and both cutovers are scheduled.
         assert!(PreAuditSettlement::<Test>::get(claim_id));
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 3u32);
-        let stca_cutover =
-            pallet_intent_settlement::pallet::StcaCutoverBlock::<Test>::get();
+        assert_eq!(
+            SettlementStorageVersion::<Test>::get(),
+            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION
+        );
+        let stca_cutover = pallet_intent_settlement::pallet::StcaCutoverBlock::<Test>::get();
         assert!(stca_cutover > 0u64);
         let expp_cutover =
             pallet_intent_settlement::pallet::PolicyExpireCutoverBlock::<Test>::get();
         assert!(expp_cutover > 0u64);
         // Idempotency: a second invocation must not double-flag.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 3u32);
+        assert_eq!(
+            SettlementStorageVersion::<Test>::get(),
+            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION
+        );
     });
 }
 
@@ -5544,7 +5616,7 @@ fn task266_migration_truncation_recovers_to_full_progress() {
                 [0xFFu8; 32],
                 false,
                 mock_settle_sigs(),
-            ));
+            ).map_err(|error| error.error));
         }
         // The LOW #2 grace-window flag means legacy settle ALREADY
         // flagged all three. Clear the flags to simulate the
@@ -5574,18 +5646,23 @@ fn task266_migration_truncation_recovers_to_full_progress() {
             .filter(|cid| PreAuditSettlement::<Test>::get(*cid))
             .count();
         assert_eq!(flagged_after_2, 3, "second run drains tail to full flag set");
-        // Task #84 update: after v0→v1 completes, the same invocation
-        // chains v1→v2→v3 (the bond_amount field migration), so the
-        // terminal version is 3 not 2.
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 3u32,
-                   "version bumps to 3 after chained v0→v1→v2→v3 completes");
+        // After v0→v1 completes, the same invocation chains every later
+        // step, so the terminal version is the current one.
+        assert_eq!(
+            SettlementStorageVersion::<Test>::get(),
+            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION,
+            "version reaches the current one after the chained steps complete"
+        );
         let cutover_after_2 = StcaCutoverBlock::<Test>::get();
         assert_eq!(cutover_after_1, cutover_after_2,
                    "STCA cutover MUST NOT slide between runs");
-        // Third run: idempotent — version already 3, early-return.
+        // Third run: idempotent — version already current, early-return.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         assert_eq!(StcaCutoverBlock::<Test>::get(), cutover_after_2);
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 3u32);
+        assert_eq!(
+            SettlementStorageVersion::<Test>::get(),
+            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION
+        );
     });
 }
 
@@ -5611,6 +5688,7 @@ fn task266_request_batch_settle_happy_path() {
         assert_ok!(IntentSettlement::request_batch_settle(
             RuntimeOrigin::signed(1),
             bv,
+            1
         ));
         // Both pending entries pinned.
         assert!(pallet_intent_settlement::pallet::ClaimSettlementRequests::<Test>::get(
@@ -5646,7 +5724,7 @@ fn task266_request_batch_settle_atomic_revert_on_bad_entry() {
         let bv: BoundedVec<SettleAttestedBatchEntry, MaxSettleBatch> =
             BoundedVec::try_from(entries).unwrap();
         assert_noop!(
-            IntentSettlement::request_batch_settle(RuntimeOrigin::signed(1), bv),
+            IntentSettlement::request_batch_settle(RuntimeOrigin::signed(1), bv, 1),
             pallet_intent_settlement::pallet::Error::<Test>::SettlementEvidenceMismatch,
         );
         // Atomicity: neither pending entry pinned despite c1 being valid.
@@ -5679,6 +5757,7 @@ fn task266_attest_batch_settle_happy_path() {
         assert_ok!(IntentSettlement::request_batch_settle(
             RuntimeOrigin::signed(1),
             bv,
+            1
         ));
         let claim_ids: BoundedVec<ClaimId, MaxSettleBatch> =
             BoundedVec::try_from(vec![c1, c2]).unwrap();
@@ -5686,7 +5765,7 @@ fn task266_attest_batch_settle_happy_path() {
             RuntimeOrigin::signed(1),
             claim_ids,
             mock_settle_sigs(),
-        ));
+        ).map_err(|error| error.error));
         for c in [c1, c2].iter() {
             let claim =
                 pallet_intent_settlement::pallet::Claims::<Test>::get(*c).unwrap();
@@ -5730,6 +5809,7 @@ fn task266_attest_batch_settle_rejects_missing_request_for_any_entry() {
         assert_ok!(IntentSettlement::request_batch_settle(
             RuntimeOrigin::signed(1),
             bv,
+            1
         ));
         // c2 has NO pending request. Batch attest must reject.
         let claim_ids: BoundedVec<ClaimId, MaxSettleBatch> =
@@ -5739,7 +5819,7 @@ fn task266_attest_batch_settle_rejects_missing_request_for_any_entry() {
                 RuntimeOrigin::signed(1),
                 claim_ids,
                 mock_settle_sigs(),
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::SettlementRequestMissing,
         );
         // c1 NOT settled (atomic).
@@ -5762,6 +5842,7 @@ fn task266_attest_batch_settle_rejects_duplicates() {
         assert_ok!(IntentSettlement::request_batch_settle(
             RuntimeOrigin::signed(1),
             bv,
+            1
         ));
         let claim_ids: BoundedVec<ClaimId, MaxSettleBatch> =
             BoundedVec::try_from(vec![c1, c1]).unwrap();
@@ -5770,7 +5851,7 @@ fn task266_attest_batch_settle_rejects_duplicates() {
                 RuntimeOrigin::signed(1),
                 claim_ids,
                 mock_settle_sigs(),
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::DuplicateClaimInBatch,
         );
     });
@@ -5992,7 +6073,7 @@ fn task267_attest_expire_policy_happy_path_flips_to_expired() {
             RuntimeOrigin::signed(1),
             intent_id,
             mock_settle_sigs(),
-        ));
+        ).map_err(|error| error.error));
 
         let intent =
             pallet_intent_settlement::pallet::Intents::<Test>::get(intent_id).unwrap();
@@ -6171,7 +6252,7 @@ fn task267_request_expire_policy_idempotent_on_already_expired() {
             RuntimeOrigin::signed(1),
             intent_id,
             mock_settle_sigs(),
-        ));
+        ).map_err(|error| error.error));
         // Second request_expire_policy on already-Expired intent must
         // return Ok (idempotent, matches legacy contract).
         let evidence2 = good_expiry_evidence_for_buy(product_id, 15, 2);
@@ -6206,7 +6287,7 @@ fn task267_request_expire_policy_rejects_already_settled_intent() {
             [0xFFu8; 32],
             false,
             mock_settle_sigs(),
-        ));
+        ).map_err(|error| error.error));
         let intent =
             pallet_intent_settlement::pallet::Intents::<Test>::get(intent_id).unwrap();
         assert_eq!(intent.status, IntentStatus::Settled);
@@ -6264,7 +6345,7 @@ fn task267_attest_expire_policy_rejects_missing_request() {
                 RuntimeOrigin::signed(1),
                 intent_id,
                 mock_settle_sigs(),
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::ExpiryRequestMissing,
         );
     });
@@ -6289,7 +6370,7 @@ fn task267_attest_expire_policy_rejects_expired_request() {
                 RuntimeOrigin::signed(1),
                 intent_id,
                 mock_settle_sigs(),
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::ExpiryRequestExpired,
         );
     });
@@ -6311,7 +6392,7 @@ fn task267_attest_expire_policy_rejects_non_committee_caller() {
                 RuntimeOrigin::signed(ALICE),
                 intent_id,
                 mock_settle_sigs(),
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::NotCommitteeMember,
         );
     });
@@ -6334,7 +6415,7 @@ fn task267_attest_expire_policy_rejects_below_threshold() {
                 RuntimeOrigin::signed(1),
                 intent_id,
                 vec![mock_sig_for(1)],
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures,
         );
         // Pending entry NOT consumed — keeper can retry.
@@ -6525,13 +6606,11 @@ fn task267_migration_flags_existing_expired_intents() {
             !PreAuditExpiry::<Test>::get(iid),
             "TTL sweep does NOT flag (only legacy expire_policy_mirror does); the migration is what catches these"
         );
-        // Run the migration. Version starts at 0; this chains all the
-        // way through v0→v1→v2→v3 in one call (the #84 bond_amount
-        // field migration adds the v3 step). Post: PreAuditExpiry
-        // flagged, version = 3.
+        // Run the migration. Version starts at 0; this chains every step
+        // in one call. Post: PreAuditExpiry flagged, version current.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         assert!(PreAuditExpiry::<Test>::get(iid));
-        assert_eq!(SettlementStorageVersion::<Test>::get(), 3u32);
+        assert_eq!(SettlementStorageVersion::<Test>::get(), pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION);
         let cutover =
             pallet_intent_settlement::pallet::PolicyExpireCutoverBlock::<Test>::get();
         assert!(cutover > 0u64);
@@ -6609,13 +6688,13 @@ fn fund_account(who: u64, amount: u128) {
     let _ = pallet_balances::Pallet::<Test>::deposit_creating(&who, amount);
 }
 
-/// Helper: set up a fresh bonded request. ALICE is the requester; she
-/// posts `request_settle` and then bonds via `post_settlement_bond` for
-/// `bond_amount` MATRA. Returns the claim_id + voucher (so caller can
-/// build evidence / fraud proofs).
+/// Helper: set up a fresh bonded request. ALICE is the requester; her
+/// `request_settle` reserves `bond_amount` MATRA. Returns the claim_id +
+/// voucher (so caller can build evidence / fraud proofs).
 fn alice_request_and_bond(seed: u8, claim_amount: u64, bond_amount: u128) -> (ClaimId, Voucher) {
     let (claim_id, _iid, voucher) = vouchered_claim_with_voucher(seed, claim_amount);
     let evidence = settled_evidence_for(&voucher, 15, 12_345);
+    fund_account(ALICE, bond_amount.saturating_mul(10));
     // ALICE submits the request_settle (she's not a committee member, but
     // request_settle is permissionless).
     assert_ok!(IntentSettlement::request_settle(
@@ -6624,12 +6703,7 @@ fn alice_request_and_bond(seed: u8, claim_amount: u64, bond_amount: u128) -> (Cl
         evidence.cardano_tx_hash,
         false,
         evidence,
-    ));
-    fund_account(ALICE, bond_amount.saturating_mul(10));
-    assert_ok!(IntentSettlement::post_settlement_bond(
-        RuntimeOrigin::signed(ALICE),
-        claim_id,
-        bond_amount,
+        bond_amount
     ));
     (claim_id, voucher)
 }
@@ -6676,8 +6750,8 @@ fn bond_v2_to_v3_migration_fills_zero() {
         assert_eq!(row2.bond_amount, 0u128, "row 2 bond defaults to zero");
         assert_eq!(
             SettlementStorageVersion::<Test>::get(),
-            3u32,
-            "version bumps to 3 after v2→v3 walk completes"
+            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION,
+            "the v2→v3 walk completes and chains into the later steps"
         );
     });
 }
@@ -6715,12 +6789,12 @@ fn bond_v2_to_v3_truncation_recovery() {
             2u32,
             "version stays at 2 on truncation"
         );
-        // Second run: drains the tail, bumps to 3.
+        // Second run: drains the tail and chains into the later steps.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         assert_eq!(
             SettlementStorageVersion::<Test>::get(),
-            3u32,
-            "version bumps to 3 after second run drains the tail"
+            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION,
+            "the second run drains the tail"
         );
     });
 }
@@ -6732,13 +6806,16 @@ fn post_settlement_bond_happy_path() {
         let (claim_id, _iid, voucher) =
             vouchered_claim_with_voucher(0xB6, 100_000);
         let evidence = settled_evidence_for(&voucher, 15, 1);
-        assert_ok!(IntentSettlement::request_settle(
-            RuntimeOrigin::signed(ALICE),
+        pallet_intent_settlement::pallet::ClaimSettlementRequests::<Test>::insert(
             claim_id,
-            evidence.cardano_tx_hash,
-            false,
-            evidence,
-        ));
+            SettlementRequestRecord {
+                requester: ALICE,
+                evidence,
+                settled_direct: false,
+                submitted_block: 1,
+                bond_amount: 0,
+            },
+        );
         fund_account(ALICE, 10_000_000_000u128);
         let reserved_before =
             pallet_balances::Pallet::<Test>::reserved_balance(&ALICE);
@@ -6781,6 +6858,7 @@ fn post_settlement_bond_rejects_non_requester() {
             evidence.cardano_tx_hash,
             false,
             evidence,
+            1,
         ));
         fund_account(BOB, 10_000_000_000u128);
         // BOB (not ALICE) tries to bond ALICE's request.
@@ -6821,13 +6899,16 @@ fn post_settlement_bond_rejects_below_min() {
         let (claim_id, _iid, voucher) =
             vouchered_claim_with_voucher(0xBC, 100_000);
         let evidence = settled_evidence_for(&voucher, 15, 1);
-        assert_ok!(IntentSettlement::request_settle(
-            RuntimeOrigin::signed(ALICE),
+        pallet_intent_settlement::pallet::ClaimSettlementRequests::<Test>::insert(
             claim_id,
-            evidence.cardano_tx_hash,
-            false,
-            evidence,
-        ));
+            SettlementRequestRecord {
+                requester: ALICE,
+                evidence,
+                settled_direct: false,
+                submitted_block: 1,
+                bond_amount: 0,
+            },
+        );
         fund_account(ALICE, 10_000u128);
         // amount = 100 < floor 1_000 → BondBelowMinimum.
         assert_noop!(
@@ -6848,7 +6929,7 @@ fn post_settlement_bond_rejects_below_min() {
 fn slash_bad_settlement_evidence_happy_path() {
     new_test_ext().execute_with(|| {
         use pallet_intent_settlement::pallet::{
-            BondSlashedRequests, ClaimSettlementRequests,
+            ClaimSettlementRequests, SlashedSettlementRequests,
         };
         let bond: u128 = 100_000_000u128;
         let (claim_id, voucher) = alice_request_and_bond(0xB9, 100_000, bond);
@@ -6887,7 +6968,7 @@ fn slash_bad_settlement_evidence_happy_path() {
             claim_id,
             proof,
             sigs,
-        ));
+        ).map_err(|error| error.error));
         // Bond split: 50% to watcher, 50% to treasury (per
         // TestSlashWatcherShareBps = 5000).
         let watcher_free_after =
@@ -6912,8 +6993,10 @@ fn slash_bad_settlement_evidence_happy_path() {
         );
         // Tombstone set.
         assert!(
-            BondSlashedRequests::<Test>::contains_key(claim_id),
-            "BondSlashedRequests must hold the tombstone"
+            SlashedSettlementRequests::<Test>::iter_prefix(claim_id)
+                .next()
+                .is_some(),
+            "SlashedSettlementRequests must hold the request tombstone"
         );
         // SettlementBondSlashed event emitted.
         let found = System::events().into_iter().any(|er| matches!(
@@ -6945,7 +7028,7 @@ fn slash_bad_settlement_evidence_rejects_insufficient_sigs() {
                 claim_id,
                 proof,
                 vec![mock_sig_for(1)],
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::FraudThresholdNotMet,
         );
     });
@@ -6970,7 +7053,7 @@ fn slash_bad_settlement_evidence_rejects_inconsistent_proof() {
                 claim_id,
                 proof,
                 vec![mock_sig_for(1), mock_sig_for(2)],
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::FraudProofInvalid,
         );
     });
@@ -6997,7 +7080,7 @@ fn slash_bad_settlement_evidence_rejects_wrong_chain_id() {
                 claim_id,
                 proof,
                 vec![mock_sig_for(2), mock_sig_for(3)],
-            ),
+            ).map_err(|error| error.error),
             pallet_intent_settlement::pallet::Error::<Test>::InsufficientSignatures,
         );
     });
@@ -7014,7 +7097,7 @@ fn release_settlement_bond_happy_path() {
             RuntimeOrigin::signed(1),
             claim_id,
             mock_settle_sigs(),
-        ));
+        ).map_err(|error| error.error));
         let reserved_before =
             pallet_balances::Pallet::<Test>::reserved_balance(&ALICE);
         // Advance past BondReleaseDelayBlocks.
@@ -7054,7 +7137,7 @@ fn release_settlement_bond_rejects_too_early() {
             RuntimeOrigin::signed(1),
             claim_id,
             mock_settle_sigs(),
-        ));
+        ).map_err(|error| error.error));
         // Don't advance the block — release_settlement_bond fires
         // before the delay elapses.
         assert_noop!(
@@ -7087,16 +7170,13 @@ fn release_settlement_bond_rejects_on_slashed() {
             claim_id,
             proof,
             vec![mock_sig_for(1), mock_sig_for(2)],
-        ));
+        ).map_err(|error| error.error));
         // Even past the delay (which we trivially advance), release
         // must reject because the bond was slashed.
         System::set_block_number(System::block_number() + 1_000);
         assert_noop!(
-            IntentSettlement::release_settlement_bond(
-                RuntimeOrigin::signed(ALICE),
-                claim_id,
-            ),
-            pallet_intent_settlement::pallet::Error::<Test>::BondSlashedNoRelease,
+            IntentSettlement::release_settlement_bond(RuntimeOrigin::signed(ALICE), claim_id),
+            pallet_intent_settlement::pallet::Error::<Test>::BondNotReserved,
         );
     });
 }
@@ -7150,6 +7230,7 @@ mod max_submit_batch_boundary {
         type AccountStore = System;
         type Balance = u128;
         type ExistentialDeposit = ExistentialDeposit;
+        type ReserveIdentifier = [u8; 8];
     }
 
     parameter_types! {

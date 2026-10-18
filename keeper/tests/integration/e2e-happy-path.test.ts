@@ -26,14 +26,17 @@ import {
   encodeType0AddressCbor,
   splitType0AddressBytes,
   signPayload,
+  settleClaimAttestedPayload,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
 import type {
   BatchPayload,
+  ClaimId,
   Voucher,
   HexString,
   IntentKind,
   CommitteePubkey,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
+import { FakeSettlementChain } from "../support/fake-settlement-chain.js";
 import { Keeper } from "../../src/keeper.js";
 import { KeeperStateStore } from "../../src/state.js";
 import { CommitteeDaemon } from "../../src/daemon/index.js";
@@ -161,13 +164,43 @@ describe("E2E happy path — intent → attest → batch → submit → settle",
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "e2e-"));
     const { batch, voucher, committeePubkey } = makeIntentAndBatch();
 
-    // Mock Materios RPC: returns the batch + voucher the committee produced,
-    // records the new request_settle + attest_settle calls (Task #266).
-    // Separate tracking for keeper vs daemon polls.
-    let requestSettleArgs: any = null;
-    let attestSettleArgs: any = null;
+    // Mock Materios RPC: returns the batch + voucher the committee produced.
+    // The keeper's settlement calls run against an in-memory settlement
+    // pallet that verifies its STCA signatures and moves bond reserves.
+    const voucherDigest = voucherDigestWithAddress({
+      claimId: voucher.claimId,
+      policyId: voucher.policyId,
+      beneficiaryAddressCbor: encodeType0AddressCbor(
+        splitType0AddressBytes(voucher.beneficiaryCardanoAddr as Uint8Array),
+      ),
+      amountAda: voucher.amountAda,
+      batchFairnessProofDigest: voucher.batchFairnessProofDigest,
+      issuedBlock: voucher.issuedBlock,
+      expirySlotCardano: voucher.expirySlotCardano,
+      materiosChainId: TEST_CHAIN_ID,
+      networkMagic: TEST_NETWORK_MAGIC,
+      aegisPolicyV1ScriptHash: TEST_AEGIS_SCRIPT_HASH,
+      settlementVersion: TEST_SETTLEMENT_VERSION,
+    });
+    const chain = new FakeSettlementChain(committeePubkey as unknown as HexString, (claimId, evidence, settledDirect) =>
+      settleClaimAttestedPayload({
+        materiosChainId: TEST_CHAIN_ID,
+        claimId,
+        voucherDigest,
+        cardanoTxHash: evidence.cardano_tx_hash,
+        settledDirect,
+        beneficiaryAddrHash: evidence.beneficiary_addr_hash,
+        amountLovelace: evidence.amount_lovelace,
+        observedAtDepth: evidence.observed_at_depth,
+        observedSlot: evidence.observed_slot,
+        mainchainGenesisHash: evidence.mainchain_genesis_hash,
+      }),
+    );
+    // fakeCardano confirms 200 slots (about 10 blocks) after the payout.
+    chain.constants.minFinalityDepth = 3;
     let keeperPolls = 0;
     const makeRpc = (label: "daemon" | "keeper") => ({
+      ...chain.rpc(),
       getPendingBatches: async () => {
         if (label === "keeper") {
           return keeperPolls++ === 0 ? [batch] : [];
@@ -175,22 +208,10 @@ describe("E2E happy path — intent → attest → batch → submit → settle",
         return [batch]; // daemon attests
       },
       getVoucher: async () => voucher,
-      getLatestBlockNumber: async () => 200,
-      submitExtrinsic: async (section: string, method: string, args: unknown[]) => {
-        if (section === "intentSettlement" && method === "requestSettle") {
-          requestSettleArgs = args;
-        }
-        if (section === "intentSettlement" && method === "attestSettle") {
-          attestSettleArgs = args;
-        }
-        return { txHash: ("0x" + "ff".repeat(32)) as HexString, blockHash: null };
-      },
-      getApi: () => ({}) as any,
-      getSigner: () => ({}) as any,
+      getSigner: () => ({ publicKey: hexToU8a(committeePubkey) }) as any,
     });
     const daemonRpc = makeRpc("daemon");
     const keeperRpc = makeRpc("keeper");
-
     // Spin up committee daemon and run ONE iteration to attest.
     const daemon = new CommitteeDaemon(
       {
@@ -269,35 +290,37 @@ describe("E2E happy path — intent → attest → batch → submit → settle",
       },
     );
 
-    // Iteration 1: observe + submit.
-    await keeper.runOnce();
-    // Iteration 2: confirm + settle_claim.
-    await keeper.runOnce();
+    const claimId = batch.intentId as unknown as ClaimId;
+    const keeperAccount = committeePubkey as unknown as HexString;
+    const freeBefore = chain.freeBalance(keeperAccount);
 
+    // Iteration 1: observe, pay out on Cardano, request and attest on Materios.
+    await keeper.runOnce();
     expect(keeper.metrics.batchesObserved).toBe(1);
     expect(keeper.metrics.batchesSubmitted).toBe(1);
     expect(keeper.metrics.batchesConfirmed).toBe(1);
     expect(keeper.metrics.batchesSettled).toBe(1);
-
-    // Task #266 (mis-sec P0): the attested-settle pair both landed.
-    expect(requestSettleArgs).not.toBeNull();
-    expect(requestSettleArgs[0]).toBeTruthy(); // claim_id
-    expect(typeof requestSettleArgs[1]).toBe("string"); // cardano_tx_hash
-    expect(requestSettleArgs[2]).toBe(false); // settled_direct
-    // requestSettleArgs[3] = SettlementEvidence struct.
-    expect(requestSettleArgs[3]).toHaveProperty("cardano_tx_hash");
-    expect(requestSettleArgs[3]).toHaveProperty("amount_lovelace");
-    expect(requestSettleArgs[3]).toHaveProperty("beneficiary_addr_hash");
-    expect(requestSettleArgs[3]).toHaveProperty("mainchain_genesis_hash");
-
-    expect(attestSettleArgs).not.toBeNull();
-    expect(attestSettleArgs[0]).toBeTruthy(); // claim_id
-    expect(Array.isArray(attestSettleArgs[1])).toBe(true);
-    expect((attestSettleArgs[1] as unknown[]).length).toBe(1); // M=1 interim
-
-    // State machine: submission is marked confirmed/settled.
-    const final = state.snapshot.submissions[batch.intentId as unknown as HexString];
+    expect(chain.calls.map((call) => call.method)).toEqual(["requestSettle", "attestSettle"]);
+    const requestArgs = chain.calls[0]!.args;
+    expect(requestArgs[0]).toBe(claimId);
+    expect(requestArgs[2]).toBe(false); // settled_direct
+    expect(requestArgs[3]).toMatchObject({ cardano_tx_hash: ("0x" + "e2".repeat(32)) });
+    expect(requestArgs[4]).toBe(500n);
+    expect(chain.settled.has(claimId)).toBe(true);
+    expect(chain.reservedBalance(keeperAccount)).toBe(500n);
+    const final = state.snapshot.submissions[claimId];
     expect(final?.state).toBe("confirmed");
-    expect(state.isAlreadySettled(batch.intentId as unknown as HexString)).not.toBeNull();
+    expect(state.isAlreadySettled(claimId)).not.toBeNull();
+
+    // After the liquidity hold the keeper returns its bond.
+    chain.block += chain.constants.bondReleaseDelayBlocks;
+    await keeper.runOnce();
+    expect(chain.calls.map((call) => call.method)).toEqual([
+      "requestSettle",
+      "attestSettle",
+      "releaseSettlementBond",
+    ]);
+    expect(chain.reservedBalance(keeperAccount)).toBe(0n);
+    expect(chain.freeBalance(keeperAccount)).toBe(freeBefore);
   }, 30_000);
 });

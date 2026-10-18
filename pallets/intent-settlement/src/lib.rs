@@ -19,6 +19,7 @@
 extern crate alloc;
 
 pub use pallet::*;
+mod signature_weights;
 pub mod types;
 pub mod voucher_canonicalize;
 pub mod weights;
@@ -113,6 +114,19 @@ pub const STCA_CUTOVER_GRACE: u32 = 50;
 /// keeper redeploy onto the new request_expire_policy + attest_expire_policy
 /// path before the old route closes).
 pub const EXPP_CUTOVER_GRACE: u32 = 50;
+
+/// `SettlementStorageVersion` written at genesis and by the final migration step.
+pub const SETTLEMENT_STORAGE_VERSION: u32 = 4;
+
+/// Balances named-reserve identifier holding every settlement bond. Refunds
+/// and slashes move at most this reserve's amount, never another pallet's.
+pub const SETTLEMENT_BOND_RESERVE_ID: [u8; 8] = *b"settbond";
+
+/// Largest `observed_at_depth` that settlement evidence may claim: Cardano's
+/// security parameter k (2160 blocks on mainnet and preprod). A transaction
+/// k blocks deep is immutable, so deeper claims add no finality, and a
+/// requester whose transaction is deeper claims k.
+pub const MAX_OBSERVED_DEPTH: u32 = 2160;
 
 /// Task #266 (mis-sec P0): domain tag for the **attested** `settle_claim`
 /// payload (split into `request_settle` + `attest_settle`). Replaces the
@@ -604,32 +618,38 @@ pub fn attest_intent_payload(
 ///
 /// Pre-image:
 ///
-/// `blake2_256(b"FRAU" || materios_chain_id (32B)
-///             || claim_id (32B) || scale(fraud_proof))`
-///
-/// The SCALE encoding of `FraudProof` carries the discriminant + variant
-/// fields (e.g., `actual_lovelace` for `WrongAmount`), so each committee
-/// signature commits to the *specific* alleged fraud rather than a vacuous
-/// "evidence is wrong" claim. Same domain-separation property as the rest
-/// of the pallet's M-of-N tags: a FRAU sig cannot replay onto an STCL /
-/// STCA / EXPP / etc. payload because the prefix bytes differ in the
-/// blake2 pre-image.
-///
-/// Per `feedback_mofn_hash_determinism.md`: chain_id is chain-derived,
-/// claim_id is the public extrinsic argument, fraud_proof is the public
-/// extrinsic argument. No operator-local state appears in the pre-image,
-/// so honest committee members independently recompute the same digest.
-pub fn slash_bad_settlement_evidence_payload(
+/// `blake2_256(b"FRV2" || chain_id || claim_id || request_id || SCALE(proof))`.
+/// Request identity binds the requester, normalized u64 submission block,
+/// evidence and settlement mode. A replacement cannot inherit old allegations.
+pub fn slash_bad_settlement_evidence_payload<A: Encode, B: Copy + Into<u64>>(
     materios_chain_id: &[u8; 32],
     claim_id: &ClaimId,
+    request: &SettlementRequestRecord<A, B>,
     fraud_proof: &FraudProof,
 ) -> [u8; 32] {
+    let request_id = settlement_request_id(request);
     let encoded = fraud_proof.encode();
-    let mut body = alloc::vec::Vec::with_capacity(32 + 32 + encoded.len());
+    let mut body = alloc::vec::Vec::with_capacity(96 + encoded.len());
     body.extend_from_slice(materios_chain_id);
     body.extend_from_slice(claim_id.as_bytes());
+    body.extend_from_slice(&request_id);
     body.extend_from_slice(&encoded);
-    crate::types::domain_hash(*TAG_FRAU, &body)
+    crate::types::domain_hash(*TAG_FRV2, &body)
+}
+
+pub fn settlement_request_id<A: Encode, B: Copy + Into<u64>>(
+    request: &SettlementRequestRecord<A, B>,
+) -> [u8; 32] {
+    let submitted: u64 = request.submitted_block.into();
+    sp_io::hashing::blake2_256(
+        &(
+            account_to_bytes(&request.requester),
+            submitted,
+            request.evidence,
+            request.settled_direct,
+        )
+            .encode(),
+    )
 }
 
 #[frame_support::pallet]
@@ -637,12 +657,13 @@ pub mod pallet {
     use super::*;
     use alloc::vec::Vec;
     use frame_support::{
+        dispatch::DispatchResultWithPostInfo,
         pallet_prelude::*,
-        traits::{tokens::BalanceStatus, Currency, ReservableCurrency},
+        traits::{tokens::BalanceStatus, Currency, NamedReservableCurrency, ReservableCurrency},
         BoundedVec, PalletId,
     };
     use frame_system::pallet_prelude::*;
-    use sp_runtime::traits::{AccountIdConversion, Saturating, Zero};
+    use sp_runtime::traits::{AccountIdConversion, SaturatedConversion, Saturating, Zero};
 
     /// Task #84 (mis-sec P1): currency-balance alias for the bond surface.
     /// Aliased here so the pallet body can stay in terms of `BalanceOf<T>`
@@ -805,12 +826,11 @@ pub mod pallet {
         #[pallet::constant]
         type MainchainGenesisHash: Get<[u8; 32]>;
 
-        /// Task #84 (mis-sec P1): reservable-currency surface used by
-        /// `post_settlement_bond` / `release_settlement_bond` /
-        /// `slash_bad_settlement_evidence`. In prod this wires to the
-        /// runtime's native balances (`pallet_balances`); in tests we wire
-        /// the same `pallet_balances` against the mock runtime.
-        type Currency: ReservableCurrency<Self::AccountId>;
+        /// Currency holding settlement bonds under the
+        /// `SETTLEMENT_BOND_RESERVE_ID` named reserve. `pallet_balances`
+        /// qualifies when its `ReserveIdentifier` is `[u8; 8]` and
+        /// `MaxReserves` is at least one.
+        type Currency: NamedReservableCurrency<Self::AccountId, ReserveIdentifier = [u8; 8]>;
 
         /// Task #84 (mis-sec P1): basis-point share of a slashed bond paid
         /// out to the watcher who proved the fraud. `5000` (= 50%) is the
@@ -821,23 +841,17 @@ pub mod pallet {
         #[pallet::constant]
         type SlashWatcherShareBps: Get<u32>;
 
-        /// Task #84 (mis-sec P1): minimum number of Materios blocks that
-        /// must elapse between `attest_settle` landing and
-        /// `release_settlement_bond` succeeding. Production runtimes plumb
-        /// `2 * MinFinalityDepth` (so Cardano has had two finality windows
-        /// to surface any reorg before the bond is returned). Tests use
-        /// `30` (= 2 × the mock's 15-block min finality scaled up so
-        /// `release_settlement_bond_rejects_too_early` can be exercised
-        /// inside a single block-stepped harness).
+        /// Minimum number of Materios blocks between `attest_settle` and
+        /// `release_settlement_bond` for an attested request. This is a
+        /// liquidity hold, not a challenge period: attestation consumes the
+        /// pending request and no slash path exists afterwards. Tests use
+        /// `30` so `release_settlement_bond_rejects_too_early` can be
+        /// exercised inside a single block-stepped harness.
         #[pallet::constant]
         type BondReleaseDelayBlocks: Get<u32>;
 
-        /// Task #84 (mis-sec P1): minimum bond a requester must reserve
-        /// via `post_settlement_bond` for the call to succeed. Defaulting
-        /// to zero keeps the bond opt-in (matches the design memo §5.2
-        /// "opt-in by default" property); production runtimes can bump
-        /// this via governance once a credible MATRA-denominated value
-        /// surface lands.
+        /// Minimum reserve per settlement request. Requests also require a
+        /// positive bond when the host configures a zero minimum.
         #[pallet::constant]
         type MinSettlementBond: Get<u128>;
 
@@ -1014,15 +1028,10 @@ pub mod pallet {
     #[pallet::storage]
     pub type MinSignerThreshold<T: Config> = StorageValue<_, u32, ValueQuery>;
 
-    /// Task #266 (mis-sec P0): pending `request_settle` records, keyed by
-    /// claim_id. Populated by `request_settle`; consumed by `attest_settle`
-    /// (removed on successful attestation OR on `SettlementRequestExpired`).
-    ///
-    /// Bounded indirectly: each entry pins one storage slot until consumed
-    /// or expired. The TTL gate at `Config::SettlementRequestTtl` blocks
-    /// keeps the worst-case live set size bounded by `expected claim rate ×
-    /// TTL_blocks`, which is single-digit on preprod and ~hundreds on
-    /// mainnet.
+    /// Pending settlement evidence. Successful attestation or slash removes
+    /// the row. Past the inclusive TTL it may be replaced, refunding any bond,
+    /// or removed by permissionless expired-bond release. Failed attestation
+    /// does not remove it; there is no automatic historical-storage sweep.
     #[pallet::storage]
     pub type ClaimSettlementRequests<T: Config> = StorageMap<
         _,
@@ -1046,9 +1055,8 @@ pub mod pallet {
     /// Task #266 (mis-sec P0): Materios block at which the legacy
     /// `settle_claim` / `settle_batch_atomic` extrinsics flip to
     /// `Error::DeprecatedExtrinsic`. Set to `upgrade_block + 50` by the
-    /// spec-N OnRuntimeUpgrade hook. A zero value means "not yet bumped" —
-    /// the legacy extrinsics keep working until governance / migration
-    /// stamps the cutover.
+    /// upgrade hook. Zero means immediately closed at storage version >= 1,
+    /// or not yet scheduled on an older chain.
     #[pallet::storage]
     pub type StcaCutoverBlock<T: Config> =
         StorageValue<_, BlockNumberFor<T>, ValueQuery>;
@@ -1058,20 +1066,15 @@ pub mod pallet {
     /// flags + legacy settle_claim path live); v1 = post-fix (legacy
     /// settlements grandfathered, STCA path live + cutover scheduled);
     /// v2 = post-#267 (legacy expire_policy_mirror grandfathered + EXPP
-    /// path live + expire-cutover scheduled).
+    /// path live + expire-cutover scheduled); v3 includes settlement bonds;
+    /// v4 holds them under `SETTLEMENT_BOND_RESERVE_ID`. Fresh genesis
+    /// starts at `SETTLEMENT_STORAGE_VERSION` with both legacy paths closed.
     #[pallet::storage]
     pub type SettlementStorageVersion<T: Config> = StorageValue<_, u32, ValueQuery>;
 
-    /// Task #267 (mis-sec P0): pending `request_expire_policy` records,
-    /// keyed by intent_id. Populated by `request_expire_policy`; consumed
-    /// by `attest_expire_policy` (removed on successful attestation OR on
-    /// `ExpiryRequestExpired`).
-    ///
-    /// Bounded indirectly: each entry pins one storage slot until consumed
-    /// or expired. The TTL gate at `Config::SettlementRequestTtl` blocks
-    /// keeps the worst-case live set size bounded by `expected expire rate
-    /// × TTL_blocks`, single-digit on preprod and ~hundreds on mainnet —
-    /// well inside the per-block-budget envelope.
+    /// Pending policy-expiry evidence, consumed on successful attestation.
+    /// Requests may be replaced after the inclusive TTL; a failed attestation
+    /// leaves the old row intact. There is no automatic expiry sweep.
     #[pallet::storage]
     pub type PolicyExpireRequests<T: Config> = StorageMap<
         _,
@@ -1084,9 +1087,8 @@ pub mod pallet {
     /// Task #267 (mis-sec P0): Materios block at which the legacy
     /// `expire_policy_mirror` extrinsic flips to
     /// `Error::DeprecatedExtrinsic`. Set to `upgrade_block + 50` by the
-    /// spec-N+1 OnRuntimeUpgrade hook. A zero value means "not yet bumped"
-    /// — the legacy extrinsic keeps working until governance / migration
-    /// stamps the cutover. Mirrors `StcaCutoverBlock` exactly.
+    /// upgrade hook. Zero means immediately closed at storage version >= 2,
+    /// or not yet scheduled on an older chain.
     #[pallet::storage]
     pub type PolicyExpireCutoverBlock<T: Config> =
         StorageValue<_, BlockNumberFor<T>, ValueQuery>;
@@ -1110,22 +1112,22 @@ pub mod pallet {
     pub type PreAuditExpiry<T: Config> =
         StorageMap<_, Blake2_128Concat, IntentId, bool, ValueQuery>;
 
-    /// Task #84 (mis-sec P1): tombstone set for claims whose bond was
-    /// slashed via `slash_bad_settlement_evidence`. The presence of an
-    /// entry blocks a re-attest, re-bond, or release attempt on the same
-    /// claim — once a watcher has prosecuted a fraudulent settlement
-    /// request, the requester cannot re-post the same claim_id under a
-    /// fresh evidence record nor recover the bond. Acts as the
-    /// "slashed-no-release" gate referenced by `BondSlashedNoRelease`.
-    ///
-    /// Bounded indirectly: only `slash_bad_settlement_evidence` inserts,
-    /// and the call requires a successful M-of-N round + an internally-
-    /// consistent fraud proof, so the live set tracks actual prosecuted
-    /// fraud events — single-digit on preprod, ~tens worst case on
-    /// mainnet.
+    /// Claim-wide slash tombstones written before slashes became
+    /// request-scoped. Dispatches no longer read or write it, so existing
+    /// entries do not block new requests; the declaration keeps them
+    /// decodable.
     #[pallet::storage]
     pub type BondSlashedRequests<T: Config> =
         StorageMap<_, Blake2_128Concat, ClaimId, (), OptionQuery>;
+
+    /// `(claim_id, settlement_request_id)` of every slashed request. An
+    /// FRV2 bundle commits to one request id, and only an identical repost
+    /// in the slashing block can recreate it, so refusing those reposts
+    /// lets each signed allegation slash once. Other requests for the
+    /// claim are unaffected.
+    #[pallet::storage]
+    pub type SlashedSettlementRequests<T: Config> =
+        StorageDoubleMap<_, Blake2_128Concat, ClaimId, Blake2_128Concat, [u8; 32], (), OptionQuery>;
 
     /// Task #84 (mis-sec P1): per-claim Materios block at which the
     /// matching `ClaimSettlementRequests` entry was attested via
@@ -1152,7 +1154,7 @@ pub mod pallet {
     /// consumed by `attest_settle`, so we need a separate slot to keep
     /// the unreserve target + amount visible to
     /// `release_settlement_bond` (which can be called by anyone). Pruned
-    /// on successful release or successful slash.
+    /// on release.
     #[pallet::storage]
     pub type BondedClaimRequester<T: Config> = StorageMap<
         _,
@@ -1325,26 +1327,18 @@ pub mod pallet {
             cardano_tx_hash: [u8; 32],
             policy_id_witness: PolicyId,
         },
-        /// Task #84 (mis-sec P1): the requester reserved `amount` of
-        /// `Config::Currency` against an existing
-        /// `ClaimSettlementRequests` entry via `post_settlement_bond`. The
-        /// matching record's `bond_amount` field is rewritten to the
-        /// supplied amount; release happens via
-        /// `release_settlement_bond` (after the delay) or
-        /// `slash_bad_settlement_evidence` (on prosecuted fraud).
+        /// Currency reserved atomically with a request, or posted to a legacy request.
         SettlementBondPosted {
             claim_id: ClaimId,
             requester: T::AccountId,
             amount: u128,
         },
-        /// Task #84 (mis-sec P1): a `slash_bad_settlement_evidence` call
-        /// succeeded. The reserved bond is split: `watcher_share` units
-        /// go to the caller (the watcher who posted the fraud proof);
-        /// `treasury_share` units go to the
-        /// `SettlementTreasuryPalletId`-derived treasury account. The
-        /// `fraud_proof` discriminant is surfaced so explorers can
-        /// distinguish WrongAmount vs TxNotFound vs WrongBeneficiary
-        /// without re-decoding the pre-image.
+        /// A `slash_bad_settlement_evidence` call succeeded. `watcher_share`
+        /// units moved to the caller and `treasury_share` units to the
+        /// `SettlementTreasuryPalletId`-derived treasury account, as far as
+        /// the settlement reserve held them. The `fraud_proof` discriminant
+        /// is surfaced so explorers can distinguish WrongAmount vs
+        /// TxNotFound vs WrongBeneficiary without re-decoding the pre-image.
         SettlementBondSlashed {
             claim_id: ClaimId,
             requester: T::AccountId,
@@ -1353,16 +1347,26 @@ pub mod pallet {
             treasury_share: u128,
             fraud_proof: FraudProof,
         },
-        /// Task #84 (mis-sec P1): a `release_settlement_bond` call
-        /// succeeded — the requester's reserved units are unreserved and
-        /// returned to their free balance. Emits in both the
-        /// requester-initiated and the keeper-initiated release path
-        /// (anyone can call once the delay has elapsed and the request
-        /// wasn't slashed).
+        /// A bond returned to its requester's free balance by release,
+        /// replacement or supersede; `amount` is what the settlement reserve
+        /// returned.
         SettlementBondReleased {
             claim_id: ClaimId,
             requester: T::AccountId,
             amount: u128,
+        },
+        /// The settlement reserve held less than a bond being returned or
+        /// slashed; `missing_amount` was not moved.
+        SettlementBondReserveDeficit {
+            claim_id: ClaimId,
+            requester: T::AccountId,
+            missing_amount: u128,
+        },
+        /// The committee settled the claim on its own evidence and displaced
+        /// this requester's pending request, refunding its bond.
+        SettlementRequestSuperseded {
+            claim_id: ClaimId,
+            requester: T::AccountId,
         },
     }
 
@@ -1600,43 +1604,15 @@ pub mod pallet {
         /// a watcher) or stacking reserves (NAV double-counting), so we
         /// hard-reject.
         BondAlreadyReserved,
-        /// Task #84 (mis-sec P1): `release_settlement_bond` was called
-        /// before `BondReleaseDelayBlocks` had elapsed since the matching
-        /// `attest_settle`. The delay gives the Cardano side a
-        /// reorg-survival window to surface late-arriving fraud; releasing
-        /// inside the window would let a colluding requester un-collateralise
-        /// before a watcher can prosecute.
+        /// The pending request has not expired, or its attested liquidity hold has not ended.
         BondReleaseTooEarly,
-        /// Task #84 (mis-sec P1): the watcher's `FraudProof` variant is
-        /// internally inconsistent with the stored evidence. Examples:
-        /// `WrongAmount { actual_lovelace = X }` where `X` already
-        /// matches `stored.amount_lovelace` (no actual fraud being
-        /// alleged); `WrongBeneficiary { actual_payment_hash = H }`
-        /// where `H` already matches `stored.beneficiary_addr_hash`.
-        /// `TxNotFound` is never internally inconsistent — it's always
-        /// a valid negative claim subject to the committee's M-of-N
-        /// confirmation.
+        /// The alleged fraud contradicts the stored evidence's own fields.
         FraudProofInvalid,
-        /// Task #84 (mis-sec P1): `slash_bad_settlement_evidence` was
-        /// posted with fewer distinct, valid M-of-N committee
-        /// signatures than the configured threshold. Surfaced
-        /// explicitly so a watcher can tell "the chain is healthy, my
-        /// bundle just lacked sigs" from "the chain rejected this
-        /// outright." Reuses the same threshold (`ensure_threshold_signatures`)
-        /// as `attest_settle` — same trust assumption.
+        /// The fraud bundle contains fewer signatures than the configured threshold.
         FraudThresholdNotMet,
-        /// Task #84 (mis-sec P1): `post_settlement_bond` was called on
-        /// a claim whose pending request has already been attested via
-        /// `attest_settle` (claim flipped to settled, pending entry
-        /// removed). Bonds MUST be posted *before* the attest lands so
-        /// they're enforceable against the falsifiable evidence the
-        /// committee just signed.
+        /// An attested request can no longer receive a bond.
         RequestAlreadyAttested,
-        /// Task #84 (mis-sec P1): `release_settlement_bond` was called
-        /// on a claim whose bond was already slashed (it's in
-        /// `BondSlashedRequests`). Slashed bonds are permanently
-        /// repatriated to watcher + treasury; the requester has no
-        /// further claim on them.
+        /// This request instance was already prosecuted and cannot be reposted.
         BondSlashedNoRelease,
         /// Task #84 (mis-sec P1): `post_settlement_bond` was called by
         /// an origin that does not match the `requester` field on the
@@ -1657,6 +1633,11 @@ pub mod pallet {
         /// can tell their `u128` input simply doesn't fit the chain's
         /// configured balance width.
         BondAmountConversionOverflow,
+        /// Settlement evidence claims a depth above `MAX_OBSERVED_DEPTH`.
+        FinalityDepthAboveMaximum,
+        /// The pending request already carries this evidence and mode;
+        /// attest it with `attest_settle` instead.
+        SupersedeMatchesRequest,
     }
 
     // ---------------------------------------------------------------------
@@ -1698,6 +1679,9 @@ pub mod pallet {
                 self.min_signer_threshold
             };
             MinSignerThreshold::<T>::put(mst);
+            SettlementStorageVersion::<T>::put(SETTLEMENT_STORAGE_VERSION);
+            StcaCutoverBlock::<T>::put(BlockNumberFor::<T>::from(0u32));
+            PolicyExpireCutoverBlock::<T>::put(BlockNumberFor::<T>::from(0u32));
         }
     }
 
@@ -1705,19 +1689,133 @@ pub mod pallet {
     // Hooks — bounded TTL sweep
     // ---------------------------------------------------------------------
 
+    /// Domain tags exposed in metadata so off-chain signers can detect the
+    /// digest protocol a runtime verifies. Each getter returns the constant
+    /// its digest function hashes.
+    #[pallet::extra_constants]
+    impl<T: Config> Pallet<T> {
+        /// See [`MAX_OBSERVED_DEPTH`].
+        #[pallet::constant_name(MaxObservedDepth)]
+        fn max_observed_depth() -> u32 {
+            MAX_OBSERVED_DEPTH
+        }
+
+        /// Committee-signed digest for `credit_deposit`.
+        #[pallet::constant_name(CreditDepositTag)]
+        fn credit_deposit_tag() -> [u8; 4] {
+            *TAG_CRDP
+        }
+
+        /// Committee-signed digest for the legacy `settle_claim`.
+        #[pallet::constant_name(SettleClaimTag)]
+        fn settle_claim_tag() -> [u8; 4] {
+            *TAG_STCL
+        }
+
+        /// Committee-signed digest for `request_voucher`.
+        #[pallet::constant_name(RequestVoucherTag)]
+        fn request_voucher_tag() -> [u8; 4] {
+            *TAG_RVCH
+        }
+
+        /// Committee-signed digest for the legacy `settle_batch_atomic`.
+        #[pallet::constant_name(SettleBatchAtomicTag)]
+        fn settle_batch_atomic_tag() -> [u8; 4] {
+            *TAG_STBA
+        }
+
+        /// Committee-signed digest for `attest_batch_intents`.
+        #[pallet::constant_name(AttestBatchIntentsTag)]
+        fn attest_batch_intents_tag() -> [u8; 4] {
+            *TAG_ABIN
+        }
+
+        /// Committee-signed digest for `request_batch_vouchers`.
+        #[pallet::constant_name(RequestBatchVouchersTag)]
+        fn request_batch_vouchers_tag() -> [u8; 4] {
+            *TAG_RVBN
+        }
+
+        /// Committee-signed STCA digest for `attest_settle` and `supersede_settlement_request`.
+        #[pallet::constant_name(AttestSettleTag)]
+        fn attest_settle_tag() -> [u8; 4] {
+            *TAG_STCA
+        }
+
+        /// Committee-signed digest for `attest_batch_settle`.
+        #[pallet::constant_name(AttestBatchSettleTag)]
+        fn attest_batch_settle_tag() -> [u8; 4] {
+            *TAG_BSTA
+        }
+
+        /// Committee-signed digest for `attest_expire_policy`.
+        #[pallet::constant_name(AttestExpirePolicyTag)]
+        fn attest_expire_policy_tag() -> [u8; 4] {
+            *TAG_EXPP
+        }
+
+        /// Committee-signed digest for `attest_intent`.
+        #[pallet::constant_name(AttestIntentTag)]
+        fn attest_intent_tag() -> [u8; 4] {
+            *TAG_INTA
+        }
+
+        /// Committee-signed digest for `slash_bad_settlement_evidence`; `FRV2` binds the request id.
+        #[pallet::constant_name(SlashSettlementTag)]
+        fn slash_settlement_tag() -> [u8; 4] {
+            *TAG_FRV2
+        }
+
+        /// Unsigned batch digest emitted by `submit_batch_intents`.
+        #[pallet::constant_name(SubmitBatchIntentsTag)]
+        fn submit_batch_intents_tag() -> [u8; 4] {
+            *TAG_SBIN
+        }
+
+        /// Intent id derivation.
+        #[pallet::constant_name(IntentIdTag)]
+        fn intent_id_tag() -> [u8; 4] {
+            *TAG_INTT
+        }
+
+        /// Batch fairness proof digest, bound into voucher digests.
+        #[pallet::constant_name(FairnessProofTag)]
+        fn fairness_proof_tag() -> [u8; 4] {
+            *TAG_BFPR
+        }
+
+        /// Committee set digest for the Cardano mirror.
+        #[pallet::constant_name(CommitteeSetTag)]
+        fn committee_set_tag() -> [u8; 4] {
+            *TAG_CMTT
+        }
+
+        /// Voucher digest, bound into the voucher, STCA and BSTA digests.
+        #[pallet::constant_name(VoucherTag)]
+        fn voucher_tag() -> [u8; 4] {
+            *TAG_VCHR
+        }
+    }
+
     #[pallet::hooks]
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T>
     where
         BlockNumberFor<T>: Into<u64> + Copy,
     {
+        fn integrity_test() {
+            assert!(
+                T::MinFinalityDepth::get() <= MAX_OBSERVED_DEPTH,
+                "MinFinalityDepth exceeds MAX_OBSERVED_DEPTH, so no evidence is acceptable"
+            );
+        }
+
         fn on_initialize(n: BlockNumberFor<T>) -> Weight {
             // Convert to u32 block for the expiry key. Saturating-cast avoids
             // panics on tests that burn through block numbers.
             let n_u32: u32 = n.into().try_into().unwrap_or(u32::MAX);
-            let mut total = Weight::from_parts(10_000, 0);
             let to_expire = ExpiryQueue::<T>::take(n_u32);
+            let total = T::WeightInfo::expire_intents(to_expire.len() as u32);
             for intent_id in to_expire {
-                total = total.saturating_add(Weight::from_parts(10_000, 0));
                 if let Some(mut intent) = Intents::<T>::get(intent_id) {
                     if matches!(
                         intent.status,
@@ -1742,6 +1840,131 @@ pub mod pallet {
                 }
             }
             total
+        }
+
+        #[cfg(feature = "try-runtime")]
+        fn pre_upgrade() -> Result<Vec<u8>, sp_runtime::TryRuntimeError> {
+            Self::try_state(frame_system::Pallet::<T>::block_number())?;
+            let settled: Vec<ClaimId> = Claims::<T>::iter()
+                .filter_map(|(id, claim)| claim.settled.then_some(id))
+                .collect();
+            let expired: Vec<IntentId> = Intents::<T>::iter()
+                .filter_map(|(id, intent)| (intent.status == IntentStatus::Expired).then_some(id))
+                .collect();
+            Ok((
+                SettlementStorageVersion::<T>::get(),
+                StcaCutoverBlock::<T>::get(),
+                PolicyExpireCutoverBlock::<T>::get(),
+                Self::settlement_storage_digest(),
+                settled,
+                expired,
+            )
+                .encode())
+        }
+
+        #[cfg(feature = "try-runtime")]
+        fn post_upgrade(state: Vec<u8>) -> Result<(), sp_runtime::TryRuntimeError> {
+            let mut input = &state[..];
+            let (before, stca, expp, digest, settled, expired) = <(
+                u32,
+                BlockNumberFor<T>,
+                BlockNumberFor<T>,
+                [u8; 32],
+                Vec<ClaimId>,
+                Vec<IntentId>,
+            )>::decode(&mut input)
+            .map_err(|_| "invalid settlement pre-upgrade state")?;
+            ensure!(
+                input.is_empty() && before <= SETTLEMENT_STORAGE_VERSION,
+                "invalid settlement pre-upgrade state"
+            );
+            let now = frame_system::Pallet::<T>::block_number();
+            Self::try_state(now)?;
+            let after = SettlementStorageVersion::<T>::get();
+            ensure!(after >= before, "settlement storage version regressed");
+            if before == SETTLEMENT_STORAGE_VERSION {
+                ensure!(
+                    Self::settlement_storage_digest() == digest,
+                    "current-version settlement upgrade mutated settlement storage"
+                );
+            }
+            let expected_stca = if before == 0 && stca.is_zero() {
+                now.saturating_add(STCA_CUTOVER_GRACE.into())
+            } else {
+                stca
+            };
+            let expected_expp = if before < 2 && after > 0 && expp.is_zero() {
+                now.saturating_add(EXPP_CUTOVER_GRACE.into())
+            } else {
+                expp
+            };
+            ensure!(
+                StcaCutoverBlock::<T>::get() == expected_stca,
+                "STCA cutover changed unexpectedly"
+            );
+            ensure!(
+                PolicyExpireCutoverBlock::<T>::get() == expected_expp,
+                "EXPP cutover changed unexpectedly"
+            );
+            if before == 0 && after > 0 {
+                ensure!(
+                    settled.iter().all(PreAuditSettlement::<T>::get),
+                    "legacy settlement audit flags missing"
+                );
+            }
+            if before < 2 && after > 1 {
+                ensure!(
+                    expired.iter().all(PreAuditExpiry::<T>::get),
+                    "legacy expiry audit flags missing"
+                );
+            }
+            Ok(())
+        }
+
+        #[cfg(feature = "try-runtime")]
+        fn try_state(_now: BlockNumberFor<T>) -> Result<(), sp_runtime::TryRuntimeError> {
+            let version = SettlementStorageVersion::<T>::get();
+            ensure!(
+                version <= SETTLEMENT_STORAGE_VERSION,
+                "unknown settlement storage version"
+            );
+            ensure!(
+                version == 2 || BondMigrationProgress::<T>::get().is_empty(),
+                "bond migration progress outside version 2"
+            );
+            let stca = StcaCutoverBlock::<T>::get();
+            let expp = PolicyExpireCutoverBlock::<T>::get();
+            ensure!(
+                match version {
+                    0 => expp.is_zero(),
+                    1 => !stca.is_zero(),
+                    2 => !stca.is_zero() && !expp.is_zero(),
+                    3 | SETTLEMENT_STORAGE_VERSION => stca.is_zero() == expp.is_zero(),
+                    _ => false,
+                },
+                "settlement cutovers inconsistent with storage version"
+            );
+            if version == SETTLEMENT_STORAGE_VERSION {
+                let mut owed = alloc::collections::BTreeMap::<T::AccountId, u128>::new();
+                let pending = ClaimSettlementRequests::<T>::iter_values()
+                    .map(|request| (request.requester, request.bond_amount));
+                for (requester, bond) in pending.chain(BondedClaimRequester::<T>::iter_values()) {
+                    let total = owed.entry(requester).or_default();
+                    *total = total.saturating_add(bond);
+                }
+                for (requester, bond) in owed {
+                    let reserved: u128 = T::Currency::reserved_balance_named(
+                        &SETTLEMENT_BOND_RESERVE_ID,
+                        &requester,
+                    )
+                    .saturated_into();
+                    ensure!(
+                        reserved >= bond,
+                        "settlement bonds exceed the settlement reserve"
+                    );
+                }
+            }
+            Ok(())
         }
 
         /// Spec-N / Spec-N+1 chained storage migration.
@@ -1969,6 +2192,52 @@ pub mod pallet {
                 }
             }
 
+            // ----- v3 → v4: bonds move to the settlement named reserve ---
+            //
+            // Every outstanding bond, pending or attested, is unreserved
+            // from the anonymous pool and reserved again under
+            // `SETTLEMENT_BOND_RESERVE_ID` in one pass. The pass must not
+            // truncate: a refund through the named reserve cannot return
+            // an anonymous bond. Its length is the number of outstanding
+            // bonds, zero at a fresh genesis.
+            let current = SettlementStorageVersion::<T>::get();
+            if current == 3 {
+                let pending = ClaimSettlementRequests::<T>::iter()
+                    .filter(|(_, request)| request.bond_amount > 0)
+                    .map(|(claim_id, request)| (claim_id, request.requester, request.bond_amount));
+                let attested = BondedClaimRequester::<T>::iter()
+                    .map(|(claim_id, (requester, bond))| (claim_id, requester, bond));
+                let bonds: Vec<_> = pending.chain(attested).collect();
+                total = total.saturating_add(T::DbWeight::get().reads(bonds.len() as u64 + 2));
+                for (claim_id, requester, bond) in bonds {
+                    total = total.saturating_add(T::DbWeight::get().reads_writes(2, 3));
+                    let named = bond
+                        .try_into()
+                        .ok()
+                        .map(|balance: BalanceOf<T>| {
+                            let moved =
+                                balance.saturating_sub(T::Currency::unreserve(&requester, balance));
+                            match T::Currency::reserve_named(
+                                &SETTLEMENT_BOND_RESERVE_ID,
+                                &requester,
+                                moved,
+                            ) {
+                                Ok(()) => moved.saturated_into::<u128>(),
+                                Err(_) => 0,
+                            }
+                        })
+                        .unwrap_or(0);
+                    if named < bond {
+                        Self::deposit_event(Event::SettlementBondReserveDeficit {
+                            claim_id,
+                            requester,
+                            missing_amount: bond - named,
+                        });
+                    }
+                }
+                SettlementStorageVersion::<T>::put(SETTLEMENT_STORAGE_VERSION);
+            }
+
             total
         }
     }
@@ -1987,7 +2256,7 @@ pub mod pallet {
         /// expiry, and (for `BuyPolicy`/`RefundCredit`) atomically debits
         /// `Credits[who]` by the premium/refund amount.
         #[pallet::call_index(0)]
-        #[pallet::weight(Weight::from_parts(500_000_000, 0))]
+        #[pallet::weight(T::WeightInfo::submit_intent())]
         pub fn submit_intent(origin: OriginFor<T>, kind: IntentKind) -> DispatchResult {
             let who = ensure_signed(origin)?;
             Self::do_submit_intent(who, kind).map(|_| ())
@@ -2013,7 +2282,8 @@ pub mod pallet {
         ///   block can't race past threshold mid-mutation: the second call
         ///   either sees the first's committed state or rolls back atomically.
         #[pallet::call_index(1)]
-        #[pallet::weight((Weight::from_parts(50_000_000, 0), DispatchClass::Operational, Pays::No))]
+        #[pallet::weight((T::WeightInfo::attest_intent()
+            .saturating_add(T::WeightInfo::threshold_signatures(1)), DispatchClass::Operational, Pays::No))]
         pub fn attest_intent(
             origin: OriginFor<T>,
             intent_id: IntentId,
@@ -2046,14 +2316,12 @@ pub mod pallet {
                 return Ok(());
             }
 
-            // Task #74: runtime sr25519 verification on the canonical INTA
-            // pre-image. Without this the chain advances state on garbage
-            // signatures because "Cardano verifies later" — but Cardano only
-            // sees the bundle at settle/voucher time, after Materios already
-            // transitioned the intent. Verify NOW so unverifiable bundles
-            // never count. INTA pre-image is chain-identity-bound (#73)
-            // alongside the other six M-of-N tags so a bundle signed on
-            // preprod can't replay on a different Materios chain.
+            let mut bundle = PendingAttestations::<T>::get(intent_id);
+            ensure!(
+                !bundle.iter().any(|(p, _)| p == &pubkey),
+                Error::<T>::DuplicatePubkey
+            );
+
             let chain_id = Self::materios_chain_id_bytes();
             let payload = attest_intent_payload(&chain_id, &intent_id);
             ensure!(
@@ -2067,19 +2335,7 @@ pub mod pallet {
             // state from a stale read of PendingAttestations. The closure
             // either commits both the bundle insert AND any threshold-
             // crossing intent flip, or rolls back atomically.
-            frame_support::storage::with_storage_layer::<
-                (),
-                sp_runtime::DispatchError,
-                _,
-            >(|| {
-                let mut bundle = PendingAttestations::<T>::get(intent_id);
-                // Task #74: duplicate pubkey is now a hard error
-                // (Error::DuplicatePubkey) instead of a silent Ok(()).
-                // Replay attempts must surface in failed-extrinsic counts.
-                ensure!(
-                    !bundle.iter().any(|(p, _)| p == &pubkey),
-                    Error::<T>::DuplicatePubkey
-                );
+            frame_support::storage::with_storage_layer::<(), sp_runtime::DispatchError, _>(|| {
                 bundle
                     .try_push((pubkey, sig))
                     .map_err(|_| Error::<T>::TooManySigs)?;
@@ -2128,7 +2384,9 @@ pub mod pallet {
         /// signature is gone; keepers must upgrade in lockstep with the
         /// runtime spec bump.
         #[pallet::call_index(2)]
-        #[pallet::weight((Weight::from_parts(100_000_000, 0), DispatchClass::Operational, Pays::No))]
+        #[pallet::weight((T::WeightInfo::request_voucher()
+            .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
+            DispatchClass::Operational, Pays::No))]
         pub fn request_voucher(
             origin: OriginFor<T>,
             claim_id: ClaimId,
@@ -2136,137 +2394,144 @@ pub mod pallet {
             voucher: Voucher,
             fairness_proof: BatchFairnessProof,
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
-        ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            ensure!(
-                T::CommitteeMembership::is_member(&who),
-                Error::<T>::NotCommitteeMember
-            );
-            // Task #75 (sec-review): cap unbounded `signatures` len at
-            // MaxCommittee BEFORE any sig-verify cycle. Pre-fix an attacker
-            // could submit a 1024-entry Vec and burn 1024 sr25519 verifies
-            // in `ensure_threshold_signatures` before the BoundedVec
-            // truncate ever fired — a trivial DoS once the chain is public.
-            ensure!(
-                signatures.len() <= T::MaxCommittee::get() as usize,
-                Error::<T>::TooManySignatures
-            );
+        ) -> DispatchResultWithPostInfo {
+            Self::with_signature_weight(T::WeightInfo::request_voucher(), |checked| {
+                let who = ensure_signed(origin)?;
+                ensure!(
+                    T::CommitteeMembership::is_member(&who),
+                    Error::<T>::NotCommitteeMember
+                );
+                // Task #75 (sec-review): cap unbounded `signatures` len at
+                // MaxCommittee BEFORE any sig-verify cycle. Pre-fix an attacker
+                // could submit a 1024-entry Vec and burn 1024 sr25519 verifies
+                // in `ensure_threshold_signatures` before the BoundedVec
+                // truncate ever fired — a trivial DoS once the chain is public.
+                ensure!(
+                    signatures.len() <= T::MaxCommittee::get() as usize,
+                    Error::<T>::TooManySignatures
+                );
 
-            // Check duplicate-voucher first so callers get an unambiguous error
-            // when they retry with the same claim_id.
-            ensure!(
-                !Vouchers::<T>::contains_key(claim_id),
-                Error::<T>::DuplicateVoucher
-            );
-            let mut intent =
-                Intents::<T>::get(intent_id).ok_or(Error::<T>::IntentNotFound)?;
-            ensure!(
-                intent.status == IntentStatus::Attested,
-                Error::<T>::IntentStatusMismatch
-            );
+                // Check duplicate-voucher first so callers get an unambiguous error
+                // when they retry with the same claim_id.
+                ensure!(
+                    !Vouchers::<T>::contains_key(claim_id),
+                    Error::<T>::DuplicateVoucher
+                );
+                let mut intent = Intents::<T>::get(intent_id).ok_or(Error::<T>::IntentNotFound)?;
+                ensure!(
+                    intent.status == IntentStatus::Attested,
+                    Error::<T>::IntentStatusMismatch
+                );
 
-            Self::validate_fairness_proof(&fairness_proof)?;
-            let bfpr_digest = compute_fairness_proof_digest(&fairness_proof);
-            ensure!(
-                voucher.batch_fairness_proof_digest == bfpr_digest,
-                Error::<T>::FairnessDigestMismatch
-            );
+                Self::validate_fairness_proof(&fairness_proof)?;
+                let bfpr_digest = compute_fairness_proof_digest(&fairness_proof);
+                ensure!(
+                    voucher.batch_fairness_proof_digest == bfpr_digest,
+                    Error::<T>::FairnessDigestMismatch
+                );
 
-            // Task #174: M-of-N gate on voucher mint. We compute the canonical
-            // pre-image *after* the fairness-proof and digest-binding checks
-            // pass, so honest operators all see the same `(voucher_digest,
-            // bfpr_digest)` pair the pallet just validated — no operator-local
-            // state slips in. The same `ensure_threshold_signatures` routine
-            // used by settle_claim/credit_deposit gives us caller-binding,
-            // distinct-signer, member-only, and per-sig sr25519 verification.
-            //
-            // #79: voucher_digest is the chain-identity-bound CBOR form (the
-            // legacy SCALE form is gone). The pallet computes from voucher
-            // fields + chain-config so the keeper's mirror digest cannot
-            // diverge.
-            let chain_id = Self::materios_chain_id_bytes();
-            let aegis_script_hash = T::AegisPolicyV1ScriptHash::get();
-            let beneficiary_cbor =
-                Self::beneficiary_cbor_for(&voucher.beneficiary_cardano_addr)?;
-            let voucher_digest_pre = crate::voucher_canonicalize::compute_voucher_digest_with_address(
-                crate::voucher_canonicalize::ChainIdentity {
-                    materios_chain_id: &chain_id,
-                    network_magic: T::NetworkMagic::get(),
-                    aegis_policy_script_hash: &aegis_script_hash,
-                    settlement_version: T::SettlementVersion::get(),
-                },
-                &voucher.claim_id,
-                &voucher.policy_id,
-                &beneficiary_cbor,
-                voucher.amount_ada,
-                &voucher.batch_fairness_proof_digest,
-                voucher.issued_block,
-                voucher.expiry_slot_cardano,
-            );
-            let voucher_payload = request_voucher_payload(
-                &chain_id,
-                &claim_id,
-                &intent_id,
-                &voucher_digest_pre,
-                &bfpr_digest,
-            );
-            Self::ensure_threshold_signatures(&voucher_payload, &who, &signatures)?;
+                // Task #174: M-of-N gate on voucher mint. We compute the canonical
+                // pre-image *after* the fairness-proof and digest-binding checks
+                // pass, so honest operators all see the same `(voucher_digest,
+                // bfpr_digest)` pair the pallet just validated — no operator-local
+                // state slips in. The same `ensure_threshold_signatures` routine
+                // used by settle_claim/credit_deposit gives us caller-binding,
+                // distinct-signer, member-only, and per-sig sr25519 verification.
+                //
+                // #79: voucher_digest is the chain-identity-bound CBOR form (the
+                // legacy SCALE form is gone). The pallet computes from voucher
+                // fields + chain-config so the keeper's mirror digest cannot
+                // diverge.
+                let chain_id = Self::materios_chain_id_bytes();
+                let aegis_script_hash = T::AegisPolicyV1ScriptHash::get();
+                let beneficiary_cbor =
+                    Self::beneficiary_cbor_for(&voucher.beneficiary_cardano_addr)?;
+                let voucher_digest_pre =
+                    crate::voucher_canonicalize::compute_voucher_digest_with_address(
+                        crate::voucher_canonicalize::ChainIdentity {
+                            materios_chain_id: &chain_id,
+                            network_magic: T::NetworkMagic::get(),
+                            aegis_policy_script_hash: &aegis_script_hash,
+                            settlement_version: T::SettlementVersion::get(),
+                        },
+                        &voucher.claim_id,
+                        &voucher.policy_id,
+                        &beneficiary_cbor,
+                        voucher.amount_ada,
+                        &voucher.batch_fairness_proof_digest,
+                        voucher.issued_block,
+                        voucher.expiry_slot_cardano,
+                    );
+                let voucher_payload = request_voucher_payload(
+                    &chain_id,
+                    &claim_id,
+                    &intent_id,
+                    &voucher_digest_pre,
+                    &bfpr_digest,
+                );
+                Self::verify_threshold_signatures::<T::SigVerifier>(
+                    &voucher_payload,
+                    &who,
+                    &signatures,
+                    checked,
+                )?;
 
-            // Issue #5: pre-check the `outstanding_coverage_ada` increment
-            // BEFORE mutating storage (checked_add -> CoverageOverflow) so
-            // that a craft-a-batch overflow attempt cannot leave state in a
-            // half-updated shape. We only account for this single claim's
-            // `voucher.amount_ada`, matching the symmetric `settle_claim`
-            // decrement in the same unit — the prior batch-sum semantics
-            // drifted the counter for every partial batch (+10*, -1*).
-            let pool = PoolUtilization::<T>::get();
-            let new_outstanding = pool
-                .outstanding_coverage_ada
-                .checked_add(voucher.amount_ada)
-                .ok_or(Error::<T>::CoverageOverflow)?;
+                // Issue #5: pre-check the `outstanding_coverage_ada` increment
+                // BEFORE mutating storage (checked_add -> CoverageOverflow) so
+                // that a craft-a-batch overflow attempt cannot leave state in a
+                // half-updated shape. We only account for this single claim's
+                // `voucher.amount_ada`, matching the symmetric `settle_claim`
+                // decrement in the same unit — the prior batch-sum semantics
+                // drifted the counter for every partial batch (+10*, -1*).
+                let pool = PoolUtilization::<T>::get();
+                let new_outstanding = pool
+                    .outstanding_coverage_ada
+                    .checked_add(voucher.amount_ada)
+                    .ok_or(Error::<T>::CoverageOverflow)?;
 
-            // Reuse the digest we already computed for the M-of-N pre-image.
-            let voucher_digest = voucher_digest_pre;
-            let voucher_amount = voucher.amount_ada;
+                // Reuse the digest we already computed for the M-of-N pre-image.
+                let voucher_digest = voucher_digest_pre;
+                let voucher_amount = voucher.amount_ada;
 
-            // Store claim + voucher, flip intent state.
-            let claim = Claim {
-                intent_id,
-                policy_id: voucher.policy_id,
-                amount_ada: voucher_amount,
-                issued_block: voucher.issued_block,
-                expiry_slot_cardano: voucher.expiry_slot_cardano,
-                settled: false,
-                settled_direct: false,
-                cardano_tx_hash: [0u8; 32],
-            };
-            Claims::<T>::insert(claim_id, claim);
-            Vouchers::<T>::insert(claim_id, voucher);
-            intent.status = IntentStatus::Vouchered;
-            Intents::<T>::insert(intent_id, intent);
-            // Issue #6: once Vouchered the intent is out of the keeper's
-            // attested-batch window. Drop from the index so get_pending_batches
-            // doesn't re-surface it, and the index doesn't grow unboundedly.
-            Self::remove_from_pending_batches(intent_id);
+                // Store claim + voucher, flip intent state.
+                let claim = Claim {
+                    intent_id,
+                    policy_id: voucher.policy_id,
+                    amount_ada: voucher_amount,
+                    issued_block: voucher.issued_block,
+                    expiry_slot_cardano: voucher.expiry_slot_cardano,
+                    settled: false,
+                    settled_direct: false,
+                    cardano_tx_hash: [0u8; 32],
+                };
+                Claims::<T>::insert(claim_id, claim);
+                Vouchers::<T>::insert(claim_id, voucher);
+                intent.status = IntentStatus::Vouchered;
+                Intents::<T>::insert(intent_id, intent);
+                // Issue #6: once Vouchered the intent is out of the keeper's
+                // attested-batch window. Drop from the index so get_pending_batches
+                // doesn't re-surface it, and the index doesn't grow unboundedly.
+                Self::remove_from_pending_batches(intent_id);
 
-            // Issue #5: write the pre-checked value; `outstanding_coverage_ada`
-            // is now maintained symmetrically against `settle_claim`.
-            PoolUtilization::<T>::mutate(|u| {
-                u.outstanding_coverage_ada = new_outstanding;
-            });
+                // Issue #5: write the pre-checked value; `outstanding_coverage_ada`
+                // is now maintained symmetrically against `settle_claim`.
+                PoolUtilization::<T>::mutate(|u| {
+                    u.outstanding_coverage_ada = new_outstanding;
+                });
 
-            Self::deposit_event(Event::VoucherIssued {
-                claim_id,
-                voucher_digest,
-                fairness_proof_digest: bfpr_digest,
-            });
-            Ok(())
+                Self::deposit_event(Event::VoucherIssued {
+                    claim_id,
+                    voucher_digest,
+                    fairness_proof_digest: bfpr_digest,
+                });
+                Ok(())
+            })
         }
 
         /// Sugar wrapper around `submit_intent(IntentKind::RefundCredit { .. })`.
         /// Enforces `Credits[who] >= amount`.
         #[pallet::call_index(3)]
-        #[pallet::weight(Weight::from_parts(500_000_000, 0))]
+        #[pallet::weight(T::WeightInfo::request_credit_refund())]
         pub fn request_credit_refund(
             origin: OriginFor<T>,
             amount_ada: AdaLovelace,
@@ -2288,103 +2553,107 @@ pub mod pallet {
         /// to `settled` and flips the bound intent to `Settled`. `settled_direct`
         /// distinguishes keeper-batch vs direct-path 10-minute fallback.
         #[pallet::call_index(4)]
-        #[pallet::weight((Weight::from_parts(50_000_000, 0), DispatchClass::Operational, Pays::No))]
+        #[pallet::weight((Weight::from_parts(50_000_000, 0)
+            .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
+            DispatchClass::Operational, Pays::No))]
         pub fn settle_claim(
             origin: OriginFor<T>,
             claim_id: ClaimId,
             cardano_tx_hash: [u8; 32],
             settled_direct: bool,
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
-        ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            // Task #266 (mis-sec P0): cutover gate. Once the spec-N migration
-            // schedules `StcaCutoverBlock`, any subsequent call to the legacy
-            // path is hard-rejected. The 50-block grace gives keepers time to
-            // redeploy to the new request_settle + attest_settle path.
-            Self::ensure_legacy_settle_path_open()?;
-            ensure!(
-                T::CommitteeMembership::is_member(&who),
-                Error::<T>::NotCommitteeMember
-            );
-            // Task #75 (sec-review): cap unbounded `signatures` len at
-            // MaxCommittee BEFORE any sig-verify cycle.
-            ensure!(
-                signatures.len() <= T::MaxCommittee::get() as usize,
-                Error::<T>::TooManySignatures
-            );
+        ) -> DispatchResultWithPostInfo {
+            Self::with_signature_weight(Weight::from_parts(50_000_000, 0), |checked| {
+                let who = ensure_signed(origin)?;
+                // Task #266 (mis-sec P0): cutover gate. Once the spec-N migration
+                // schedules `StcaCutoverBlock`, any subsequent call to the legacy
+                // path is hard-rejected. The 50-block grace gives keepers time to
+                // redeploy to the new request_settle + attest_settle path.
+                Self::ensure_legacy_settle_path_open()?;
+                ensure!(
+                    T::CommitteeMembership::is_member(&who),
+                    Error::<T>::NotCommitteeMember
+                );
+                // Task #75 (sec-review): cap unbounded `signatures` len at
+                // MaxCommittee BEFORE any sig-verify cycle.
+                ensure!(
+                    signatures.len() <= T::MaxCommittee::get() as usize,
+                    Error::<T>::TooManySignatures
+                );
 
-            // Issue #7: require M-of-N distinct committee signatures over the
-            // canonical payload. The origin itself MUST sign (otherwise any
-            // member could replay stale signature bundles), so we build the
-            // digest including who and verify inclusion.
-            //
-            // #73: pre-image is now bound to the Materios chain-id so a bundle
-            // signed on preprod cannot land on mainnet.
-            let chain_id = Self::materios_chain_id_bytes();
-            let payload = settle_claim_payload(
-                &chain_id,
-                &claim_id,
-                &cardano_tx_hash,
-                settled_direct,
-            );
-            Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
+                let mut claim = Claims::<T>::get(claim_id).ok_or(Error::<T>::ClaimNotFound)?;
+                if claim.settled {
+                    return Ok(()); // idempotent
+                }
 
-            let mut claim =
-                Claims::<T>::get(claim_id).ok_or(Error::<T>::ClaimNotFound)?;
-            if claim.settled {
-                return Ok(()); // idempotent
-            }
-            claim.settled = true;
-            claim.settled_direct = settled_direct;
-            claim.cardano_tx_hash = cardano_tx_hash;
-            let intent_id = claim.intent_id;
-            let amount = claim.amount_ada;
-            Claims::<T>::insert(claim_id, claim);
-            // Sec-review LOW #2: legacy settle uses the trust-vacuous STCL
-            // payload. Tag the resulting claim so audit/explorer tooling
-            // can distinguish "trust-vacuous" from STCA-attested settles
-            // even when the settle landed in the 50-block grace window
-            // (i.e., post-upgrade but pre-cutover). Migration only flags
-            // claims that were ALREADY settled at upgrade time; this line
-            // covers the grace window.
-            PreAuditSettlement::<T>::insert(claim_id, true);
+                // Issue #7: require M-of-N distinct committee signatures over the
+                // canonical payload. The origin itself MUST sign (otherwise any
+                // member could replay stale signature bundles), so we build the
+                // digest including who and verify inclusion.
+                //
+                // #73: pre-image is now bound to the Materios chain-id so a bundle
+                // signed on preprod cannot land on mainnet.
+                let chain_id = Self::materios_chain_id_bytes();
+                let payload =
+                    settle_claim_payload(&chain_id, &claim_id, &cardano_tx_hash, settled_direct);
+                Self::verify_threshold_signatures::<T::SigVerifier>(
+                    &payload,
+                    &who,
+                    &signatures,
+                    checked,
+                )?;
 
-            if let Some(mut intent) = Intents::<T>::get(intent_id) {
-                intent.status = IntentStatus::Settled;
-                Intents::<T>::insert(intent_id, intent);
-            }
-            // Issue #6: intent is now terminal; drop from index.
-            Self::remove_from_pending_batches(intent_id);
+                claim.settled = true;
+                claim.settled_direct = settled_direct;
+                claim.cardano_tx_hash = cardano_tx_hash;
+                let intent_id = claim.intent_id;
+                let amount = claim.amount_ada;
+                Claims::<T>::insert(claim_id, claim);
+                // Sec-review LOW #2: legacy settle uses the trust-vacuous STCL
+                // payload. Tag the resulting claim so audit/explorer tooling
+                // can distinguish "trust-vacuous" from STCA-attested settles
+                // even when the settle landed in the 50-block grace window
+                // (i.e., post-upgrade but pre-cutover). Migration only flags
+                // claims that were ALREADY settled at upgrade time; this line
+                // covers the grace window.
+                PreAuditSettlement::<T>::insert(claim_id, true);
 
-            // Decrement outstanding coverage AND total NAV.
-            //
-            // Task #82 (sec-review): pre-fix `credit_deposit` grew
-            // `total_nav_ada` 1:1 on every deposit but no path EVER
-            // decremented it on payout. NAV monotonically grew, pool
-            // utilization (= outstanding / nav) drifted toward zero forever,
-            // and the 75% cap effectively disabled itself after enough
-            // payouts. Now: settling a claim drains the actual `amount`
-            // from NAV (capital really is gone — it was paid out on
-            // Cardano). `expire_policy_mirror` does NOT touch NAV — the
-            // unclaimed premium still belongs to the pool.
-            //
-            // Saturating_sub keeps the runtime panic-free. If we ever hit
-            // the saturating floor, the post-state is honest (zero) and
-            // the `BatchSettled` / `ClaimSettled` event records the real
-            // payout amount, so off-chain monitors can flag the divergence
-            // for forensic follow-up.
-            PoolUtilization::<T>::mutate(|u| {
-                u.outstanding_coverage_ada =
-                    u.outstanding_coverage_ada.saturating_sub(amount);
-                u.total_nav_ada = u.total_nav_ada.saturating_sub(amount);
-            });
+                if let Some(mut intent) = Intents::<T>::get(intent_id) {
+                    intent.status = IntentStatus::Settled;
+                    Intents::<T>::insert(intent_id, intent);
+                }
+                // Issue #6: intent is now terminal; drop from index.
+                Self::remove_from_pending_batches(intent_id);
 
-            Self::deposit_event(Event::ClaimSettled {
-                claim_id,
-                cardano_tx_hash,
-                settled_direct,
-            });
-            Ok(())
+                // Decrement outstanding coverage AND total NAV.
+                //
+                // Task #82 (sec-review): pre-fix `credit_deposit` grew
+                // `total_nav_ada` 1:1 on every deposit but no path EVER
+                // decremented it on payout. NAV monotonically grew, pool
+                // utilization (= outstanding / nav) drifted toward zero forever,
+                // and the 75% cap effectively disabled itself after enough
+                // payouts. Now: settling a claim drains the actual `amount`
+                // from NAV (capital really is gone — it was paid out on
+                // Cardano). `expire_policy_mirror` does NOT touch NAV — the
+                // unclaimed premium still belongs to the pool.
+                //
+                // Saturating_sub keeps the runtime panic-free. If we ever hit
+                // the saturating floor, the post-state is honest (zero) and
+                // the `BatchSettled` / `ClaimSettled` event records the real
+                // payout amount, so off-chain monitors can flag the divergence
+                // for forensic follow-up.
+                PoolUtilization::<T>::mutate(|u| {
+                    u.outstanding_coverage_ada = u.outstanding_coverage_ada.saturating_sub(amount);
+                    u.total_nav_ada = u.total_nav_ada.saturating_sub(amount);
+                });
+
+                Self::deposit_event(Event::ClaimSettled {
+                    claim_id,
+                    cardano_tx_hash,
+                    settled_direct,
+                });
+                Ok(())
+            })
         }
 
         /// Committee reports that a policy expired on Cardano (Expire redeemer
@@ -2449,63 +2718,69 @@ pub mod pallet {
         /// Committee registers a confirmed Cardano deposit to the premium
         /// collector script. Idempotent on `(who, cardano_tx_hash)`.
         #[pallet::call_index(6)]
-        #[pallet::weight((Weight::from_parts(30_000_000, 0), DispatchClass::Operational, Pays::No))]
+        #[pallet::weight((Weight::from_parts(30_000_000, 0)
+            .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
+            DispatchClass::Operational, Pays::No))]
         pub fn credit_deposit(
             origin: OriginFor<T>,
             target: T::AccountId,
             amount_ada: AdaLovelace,
             cardano_tx_hash: [u8; 32],
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
-        ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            ensure!(
-                T::CommitteeMembership::is_member(&who),
-                Error::<T>::NotCommitteeMember
-            );
-            // Task #75 (sec-review): cap unbounded `signatures` len at
-            // MaxCommittee BEFORE any sig-verify cycle.
-            ensure!(
-                signatures.len() <= T::MaxCommittee::get() as usize,
-                Error::<T>::TooManySignatures
-            );
+        ) -> DispatchResultWithPostInfo {
+            Self::with_signature_weight(Weight::from_parts(30_000_000, 0), |checked| {
+                let who = ensure_signed(origin)?;
+                ensure!(
+                    T::CommitteeMembership::is_member(&who),
+                    Error::<T>::NotCommitteeMember
+                );
+                // Task #75 (sec-review): cap unbounded `signatures` len at
+                // MaxCommittee BEFORE any sig-verify cycle.
+                ensure!(
+                    signatures.len() <= T::MaxCommittee::get() as usize,
+                    Error::<T>::TooManySignatures
+                );
 
-            // Issue #7: M-of-N gate. Previously any single committee member
-            // could unilaterally credit any ADA amount onto any account —
-            // trivial pool drain. We now require `MinSignerThreshold`
-            // distinct committee signatures over the canonical payload
-            // (target, amount, tx_hash) and verify each at runtime.
-            //
-            // #73: pre-image is now bound to the Materios chain-id so a bundle
-            // signed on preprod cannot land on mainnet.
-            let chain_id = Self::materios_chain_id_bytes();
-            let target_bytes = crate::account_to_bytes(&target);
-            let payload = credit_deposit_payload(
-                &chain_id,
-                &target_bytes,
-                amount_ada,
-                &cardano_tx_hash,
-            );
-            Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
+                let key = (target.clone(), cardano_tx_hash);
+                ensure!(
+                    !ProcessedDeposits::<T>::contains_key(&key),
+                    Error::<T>::DepositAlreadyProcessed
+                );
 
-            let key = (target.clone(), cardano_tx_hash);
-            ensure!(
-                !ProcessedDeposits::<T>::contains_key(&key),
-                Error::<T>::DepositAlreadyProcessed
-            );
-            ProcessedDeposits::<T>::insert(&key, ());
-            Credits::<T>::mutate(&target, |c| *c = c.saturating_add(amount_ada));
+                // Issue #7: M-of-N gate. Previously any single committee member
+                // could unilaterally credit any ADA amount onto any account —
+                // trivial pool drain. We now require `MinSignerThreshold`
+                // distinct committee signatures over the canonical payload
+                // (target, amount, tx_hash) and verify each at runtime.
+                //
+                // #73: pre-image is now bound to the Materios chain-id so a bundle
+                // signed on preprod cannot land on mainnet.
+                let chain_id = Self::materios_chain_id_bytes();
+                let target_bytes = crate::account_to_bytes(&target);
+                let payload =
+                    credit_deposit_payload(&chain_id, &target_bytes, amount_ada, &cardano_tx_hash);
+                Self::verify_threshold_signatures::<T::SigVerifier>(
+                    &payload,
+                    &who,
+                    &signatures,
+                    checked,
+                )?;
 
-            // Track NAV for pool utilization.
-            PoolUtilization::<T>::mutate(|u| {
-                u.total_nav_ada = u.total_nav_ada.saturating_add(amount_ada);
-            });
+                ProcessedDeposits::<T>::insert(&key, ());
+                Credits::<T>::mutate(&target, |c| *c = c.saturating_add(amount_ada));
 
-            Self::deposit_event(Event::CreditsCredited {
-                account: target,
-                delta_ada: amount_ada,
-                source_cardano_tx: cardano_tx_hash,
-            });
-            Ok(())
+                // Track NAV for pool utilization.
+                PoolUtilization::<T>::mutate(|u| {
+                    u.total_nav_ada = u.total_nav_ada.saturating_add(amount_ada);
+                });
+
+                Self::deposit_event(Event::CreditsCredited {
+                    account: target,
+                    delta_ada: amount_ada,
+                    source_cardano_tx: cardano_tx_hash,
+                });
+                Ok(())
+            })
         }
 
         /// Governance knob — update pool NAV/utilization parameters. Root-only.
@@ -2597,139 +2872,140 @@ pub mod pallet {
         /// deterministic — split the batch and resubmit only the
         /// not-yet-settled subset.
         #[pallet::call_index(9)]
-        #[pallet::weight((
-            // Auto-generated via frame-benchmarking (task #43). The
-            // generated curve excludes sig-verify cost (the bench uses
-            // `BenchAllowAnyVerifier`); we add a fixed 50M ref_time
-            // budget to cover the single sr25519 verification the
-            // production `Sr25519Verifier` performs.
-            <T as Config>::WeightInfo::settle_batch_atomic(entries.len() as u32)
-                .saturating_add(Weight::from_parts(50_000_000, 0)),
-            DispatchClass::Operational,
-            Pays::No,
-        ))]
+        #[pallet::weight((T::WeightInfo::settle_batch_atomic(entries.len() as u32)
+            .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
+            DispatchClass::Operational, Pays::No))]
         pub fn settle_batch_atomic(
             origin: OriginFor<T>,
             entries: BoundedVec<SettleBatchEntry, <T as Config>::MaxSettleBatch>,
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
-        ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            // Task #266 (mis-sec P0): cutover gate — same shape as the
-            // single-call `settle_claim` legacy path. Post-`StcaCutoverBlock`
-            // the keeper MUST switch to `request_batch_settle` +
-            // `attest_batch_settle` (call_index 15 / 16) which carry the
-            // falsifiable Cardano evidence.
-            Self::ensure_legacy_settle_path_open()?;
-            ensure!(
-                T::CommitteeMembership::is_member(&who),
-                Error::<T>::NotCommitteeMember
-            );
-            // Task #75 (sec-review): cap unbounded `signatures` len at
-            // MaxCommittee BEFORE any sig-verify cycle.
-            ensure!(
-                signatures.len() <= T::MaxCommittee::get() as usize,
-                Error::<T>::TooManySignatures
-            );
-            ensure!(!entries.is_empty(), Error::<T>::EmptyBatch);
-
-            // Compute batch digest ONCE over all entries. Single sig-verify
-            // pass below — this is where the ~100x throughput unlock lives.
-            //
-            // #73: pre-image is now bound to the Materios chain-id.
-            let chain_id = Self::materios_chain_id_bytes();
-            let payload = settle_batch_atomic_payload(&chain_id, entries.as_slice());
-            Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
-
-            // Pass 1: detect duplicate claim_ids INSIDE the batch up-front
-            // (cheaper than discovering it mid-loop after we've already
-            // mutated state). O(N^2) with N <= 256 — ~32k comparisons worst
-            // case, well below sig-verify cost.
-            let n = entries.len();
-            for i in 0..n {
-                for j in (i + 1)..n {
+        ) -> DispatchResultWithPostInfo {
+            Self::with_signature_weight(
+                T::WeightInfo::settle_batch_atomic(entries.len() as u32),
+                |checked| {
+                    let who = ensure_signed(origin)?;
+                    // Task #266 (mis-sec P0): cutover gate — same shape as the
+                    // single-call `settle_claim` legacy path. Post-`StcaCutoverBlock`
+                    // the keeper MUST switch to `request_batch_settle` +
+                    // `attest_batch_settle` (call_index 15 / 16) which carry the
+                    // falsifiable Cardano evidence.
+                    Self::ensure_legacy_settle_path_open()?;
                     ensure!(
-                        entries[i].claim_id != entries[j].claim_id,
-                        Error::<T>::DuplicateClaimInBatch,
+                        T::CommitteeMembership::is_member(&who),
+                        Error::<T>::NotCommitteeMember
                     );
-                }
-            }
+                    // Task #75 (sec-review): cap unbounded `signatures` len at
+                    // MaxCommittee BEFORE any sig-verify cycle.
+                    ensure!(
+                        signatures.len() <= T::MaxCommittee::get() as usize,
+                        Error::<T>::TooManySignatures
+                    );
+                    ensure!(!entries.is_empty(), Error::<T>::EmptyBatch);
 
-            // Atomic mutation phase — apply all settlements in a transactional
-            // storage layer so any per-entry failure rolls the whole call back.
-            // Any error returned from this closure is bubbled up as the
-            // extrinsic's DispatchError; on Ok the changes commit.
-            let (count, settled_direct_count) =
-                frame_support::storage::with_storage_layer::<
-                    (u32, u32),
-                    sp_runtime::DispatchError,
-                    _,
-                >(|| {
-                    let mut total_amount_unsettled: u64 = 0;
-                    let mut direct_count: u32 = 0;
+                    // Compute batch digest ONCE over all entries. Single sig-verify
+                    // pass below — this is where the ~100x throughput unlock lives.
+                    //
+                    // #73: pre-image is now bound to the Materios chain-id.
+                    let chain_id = Self::materios_chain_id_bytes();
+                    let payload = settle_batch_atomic_payload(&chain_id, entries.as_slice());
 
-                    for entry in entries.iter() {
-                        let mut claim = Claims::<T>::get(entry.claim_id)
-                            .ok_or(Error::<T>::ClaimNotFound)?;
-                        // Strict reject on already-settled — atomic semantics.
-                        ensure!(
-                            !claim.settled,
-                            Error::<T>::BatchClaimAlreadySettled
-                        );
-                        claim.settled = true;
-                        claim.settled_direct = entry.settled_direct;
-                        claim.cardano_tx_hash = entry.cardano_tx_hash;
-                        let intent_id = claim.intent_id;
-                        let amount = claim.amount_ada;
-                        Claims::<T>::insert(entry.claim_id, claim);
-                        // Sec-review LOW #2: legacy batch path uses STBA
-                        // (trust-vacuous batch digest). Flag each settled
-                        // claim so audit tooling can distinguish from
-                        // STCA-attested settles even in the 50-block grace
-                        // window. See `settle_claim` for the rationale.
-                        PreAuditSettlement::<T>::insert(entry.claim_id, true);
-
-                        if let Some(mut intent) = Intents::<T>::get(intent_id) {
-                            intent.status = IntentStatus::Settled;
-                            Intents::<T>::insert(intent_id, intent);
+                    // Pass 1: detect duplicate claim_ids INSIDE the batch up-front
+                    // (cheaper than discovering it mid-loop after we've already
+                    // mutated state). O(N^2) with N <= 256 — ~32k comparisons worst
+                    // case, well below sig-verify cost.
+                    let n = entries.len();
+                    for i in 0..n {
+                        for j in (i + 1)..n {
+                            ensure!(
+                                entries[i].claim_id != entries[j].claim_id,
+                                Error::<T>::DuplicateClaimInBatch,
+                            );
                         }
-                        Self::remove_from_pending_batches(intent_id);
-
-                        if entry.settled_direct {
-                            direct_count = direct_count.saturating_add(1);
-                        }
-                        total_amount_unsettled =
-                            total_amount_unsettled.saturating_add(amount);
                     }
 
-                    // Decrement outstanding coverage AND total NAV in ONE
-                    // mutate call (vs N separate mutates) — same storage-
-                    // write economics as `settle_claim` summed across N
-                    // calls, but cheaper.
-                    //
-                    // Task #82 (sec-review): NAV decrement matches
-                    // `settle_claim`'s post-fix behaviour. Capital really
-                    // is gone (paid out on Cardano), so it must leave the
-                    // NAV bucket too. Pre-fix this site only updated
-                    // `outstanding_coverage_ada`, leaving NAV monotonically
-                    // growing across settlements.
-                    PoolUtilization::<T>::mutate(|u| {
-                        u.outstanding_coverage_ada = u
-                            .outstanding_coverage_ada
-                            .saturating_sub(total_amount_unsettled);
-                        u.total_nav_ada = u
-                            .total_nav_ada
-                            .saturating_sub(total_amount_unsettled);
+                    let mut hydrated_claims = Vec::with_capacity(n);
+                    for entry in entries.iter() {
+                        let claim =
+                            Claims::<T>::get(entry.claim_id).ok_or(Error::<T>::ClaimNotFound)?;
+                        ensure!(!claim.settled, Error::<T>::BatchClaimAlreadySettled);
+                        hydrated_claims.push(claim);
+                    }
+
+                    Self::verify_threshold_signatures::<T::SigVerifier>(
+                        &payload,
+                        &who,
+                        &signatures,
+                        checked,
+                    )?;
+
+                    // Atomic mutation phase — apply all settlements in a transactional
+                    // storage layer so any per-entry failure rolls the whole call back.
+                    // Any error returned from this closure is bubbled up as the
+                    // extrinsic's DispatchError; on Ok the changes commit.
+                    let (count, settled_direct_count) = frame_support::storage::with_storage_layer::<
+                        (u32, u32),
+                        sp_runtime::DispatchError,
+                        _,
+                    >(|| {
+                        let mut total_amount_unsettled: u64 = 0;
+                        let mut direct_count: u32 = 0;
+
+                        for (entry, mut claim) in entries.iter().zip(hydrated_claims) {
+                            claim.settled = true;
+                            claim.settled_direct = entry.settled_direct;
+                            claim.cardano_tx_hash = entry.cardano_tx_hash;
+                            let intent_id = claim.intent_id;
+                            let amount = claim.amount_ada;
+                            Claims::<T>::insert(entry.claim_id, claim);
+                            // Sec-review LOW #2: legacy batch path uses STBA
+                            // (trust-vacuous batch digest). Flag each settled
+                            // claim so audit tooling can distinguish from
+                            // STCA-attested settles even in the 50-block grace
+                            // window. See `settle_claim` for the rationale.
+                            PreAuditSettlement::<T>::insert(entry.claim_id, true);
+
+                            if let Some(mut intent) = Intents::<T>::get(intent_id) {
+                                intent.status = IntentStatus::Settled;
+                                Intents::<T>::insert(intent_id, intent);
+                            }
+                            Self::remove_from_pending_batches(intent_id);
+
+                            if entry.settled_direct {
+                                direct_count = direct_count.saturating_add(1);
+                            }
+                            total_amount_unsettled = total_amount_unsettled.saturating_add(amount);
+                        }
+
+                        // Decrement outstanding coverage AND total NAV in ONE
+                        // mutate call (vs N separate mutates) — same storage-
+                        // write economics as `settle_claim` summed across N
+                        // calls, but cheaper.
+                        //
+                        // Task #82 (sec-review): NAV decrement matches
+                        // `settle_claim`'s post-fix behaviour. Capital really
+                        // is gone (paid out on Cardano), so it must leave the
+                        // NAV bucket too. Pre-fix this site only updated
+                        // `outstanding_coverage_ada`, leaving NAV monotonically
+                        // growing across settlements.
+                        PoolUtilization::<T>::mutate(|u| {
+                            u.outstanding_coverage_ada = u
+                                .outstanding_coverage_ada
+                                .saturating_sub(total_amount_unsettled);
+                            u.total_nav_ada =
+                                u.total_nav_ada.saturating_sub(total_amount_unsettled);
+                        });
+
+                        Ok((n as u32, direct_count))
+                    })?;
+
+                    Self::deposit_event(Event::BatchSettled {
+                        count,
+                        batch_digest: payload,
+                        settled_direct_count,
                     });
-
-                    Ok((n as u32, direct_count))
-                })?;
-
-            Self::deposit_event(Event::BatchSettled {
-                count,
-                batch_digest: payload,
-                settled_direct_count,
-            });
-            Ok(())
+                    Ok(())
+                },
+            )
         }
 
         /// Task #211: attest N intents in ONE extrinsic under ONE M-of-N
@@ -2773,134 +3049,149 @@ pub mod pallet {
         /// Atomic semantics: any per-intent failure (intent not found,
         /// terminal status mismatch, duplicate intent_id within the batch)
         /// reverts every storage mutation in this call.
-        ///
-        /// Cost model:
-        /// - Base ~50M ref_time (M-of-N sig-verify pass)
-        /// - Plus N * ~3M ref_time (per-intent storage read for `Intents`,
-        ///   one storage write each for `Intents` + `AttestationSigs`).
-        /// - At N=256 the per-intent cost ~768M dwarfs the sig-verify
-        ///   pass — but it's still ~3x cheaper than the legacy 768
-        ///   `attest_intent` calls each at ~50M = 38B total.
         #[pallet::call_index(11)]
-        #[pallet::weight((
-            Weight::from_parts(
-                50_000_000u64.saturating_add((intent_ids.len() as u64).saturating_mul(3_000_000)),
-                0,
-            ),
-            DispatchClass::Operational,
-            Pays::No,
-        ))]
+        #[pallet::weight((T::WeightInfo::attest_batch_intents(intent_ids.len() as u32)
+            .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
+            DispatchClass::Operational, Pays::No))]
         pub fn attest_batch_intents(
             origin: OriginFor<T>,
             intent_ids: BoundedVec<IntentId, <T as Config>::MaxAttestBatch>,
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
-        ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            ensure!(
-                T::CommitteeMembership::is_member(&who),
-                Error::<T>::NotCommitteeMember
-            );
-            // Task #75 (sec-review): cap unbounded `signatures` len at
-            // MaxCommittee BEFORE the per-sig verify pass below. Pre-fix the
-            // BoundedVec::try_from truncate ran AFTER ensure_threshold_signatures
-            // (so a 1024-entry attacker bundle burned 1024 sr25519 verifies
-            // before bailing). Capping here makes the DoS surface a constant
-            // MaxCommittee worth of work.
-            ensure!(
-                signatures.len() <= T::MaxCommittee::get() as usize,
-                Error::<T>::TooManySignatures
-            );
-            ensure!(!intent_ids.is_empty(), Error::<T>::EmptyAttestBatch);
-
-            // Compute the canonical ABIN digest ONCE over all intent_ids,
-            // then verify the M-of-N sig bundle against it ONCE — the
-            // throughput unlock.
-            //
-            // #73: pre-image is now bound to the Materios chain-id.
-            let chain_id = Self::materios_chain_id_bytes();
-            let payload =
-                attest_batch_intents_payload(&chain_id, intent_ids.as_slice());
-            Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
-
-            // Pass 1: detect duplicate intent_ids inside the batch up-front
-            // (cheaper than discovering it mid-loop after we've mutated
-            // state). O(N^2) with N <= 256 ~32k comparisons worst case,
-            // well below sig-verify cost.
-            let n = intent_ids.len();
-            for i in 0..n {
-                for j in (i + 1)..n {
+        ) -> DispatchResultWithPostInfo {
+            Self::with_signature_weight(
+                T::WeightInfo::attest_batch_intents(intent_ids.len() as u32),
+                |checked| {
+                    let who = ensure_signed(origin)?;
                     ensure!(
-                        intent_ids[i] != intent_ids[j],
-                        Error::<T>::DuplicateIntentInBatch,
+                        T::CommitteeMembership::is_member(&who),
+                        Error::<T>::NotCommitteeMember
                     );
-                }
-            }
+                    // Task #75 (sec-review): cap unbounded `signatures` len at
+                    // MaxCommittee BEFORE the per-sig verify pass below. Pre-fix the
+                    // BoundedVec::try_from truncate ran AFTER ensure_threshold_signatures
+                    // (so a 1024-entry attacker bundle burned 1024 sr25519 verifies
+                    // before bailing). Capping here makes the DoS surface a constant
+                    // MaxCommittee worth of work.
+                    ensure!(
+                        signatures.len() <= T::MaxCommittee::get() as usize,
+                        Error::<T>::TooManySignatures
+                    );
+                    ensure!(!intent_ids.is_empty(), Error::<T>::EmptyAttestBatch);
 
-            // Truncate the call-level sigs vec into the storage-bound
-            // BoundedVec for AttestationSigs. The storage type uses
-            // `MaxCommittee` (=32 in prod), and `ensure_threshold_signatures`
-            // already proved `signatures.len() >= threshold` — so any
-            // overflow here would mean the caller submitted MORE than
-            // MaxCommittee sigs, which we treat as an error rather than
-            // silently truncate.
-            let sigs_bv: BoundedVec<
-                (CommitteePubkey, CommitteeSig),
-                <T as Config>::MaxCommittee,
-            > = BoundedVec::try_from(signatures.clone())
-                .map_err(|_| Error::<T>::TooManySigs)?;
+                    // Compute the canonical ABIN digest ONCE over all intent_ids,
+                    // then verify the M-of-N sig bundle against it ONCE — the
+                    // throughput unlock.
+                    //
+                    // #73: pre-image is now bound to the Materios chain-id.
+                    let chain_id = Self::materios_chain_id_bytes();
+                    let payload = attest_batch_intents_payload(&chain_id, intent_ids.as_slice());
 
-            let signer_count = signatures.len() as u32;
-
-            // Atomic mutation phase. Any per-intent failure reverts the
-            // whole call — same all-or-nothing semantics as PR #27.
-            let attested_count = frame_support::storage::with_storage_layer::<
-                u32,
-                sp_runtime::DispatchError,
-                _,
-            >(|| {
-                let mut freshly_attested: u32 = 0;
-                for iid in intent_ids.iter() {
-                    let mut intent =
-                        Intents::<T>::get(iid).ok_or(Error::<T>::IntentNotFound)?;
-                    match intent.status {
-                        IntentStatus::Attested => {
-                            // Idempotent — already past the threshold from a
-                            // prior batch / single-call. Silently skip.
-                            continue;
-                        }
-                        IntentStatus::Pending => {
-                            intent.status = IntentStatus::Attested;
-                            Intents::<T>::insert(iid, intent);
-                            AttestationSigs::<T>::insert(iid, sigs_bv.clone());
-                            // Drop any partial single-call accumulation —
-                            // the batch's M-of-N envelope is the canonical
-                            // bundle now.
-                            PendingAttestations::<T>::remove(iid);
-                            Self::deposit_event(Event::IntentAttested {
-                                intent_id: *iid,
-                                attestor_count: signer_count,
-                            });
-                            freshly_attested = freshly_attested.saturating_add(1);
-                        }
-                        _ => {
-                            // Vouchered / Settled / Expired / Refunded —
-                            // can't be re-attested. Reject the batch
-                            // atomically; keeper must split the next batch
-                            // and exclude this intent.
-                            return Err(Error::<T>::IntentStatusMismatch.into());
+                    // Pass 1: detect duplicate intent_ids inside the batch up-front
+                    // (cheaper than discovering it mid-loop after we've mutated
+                    // state). O(N^2) with N <= 256 ~32k comparisons worst case,
+                    // well below sig-verify cost.
+                    let n = intent_ids.len();
+                    for i in 0..n {
+                        for j in (i + 1)..n {
+                            ensure!(
+                                intent_ids[i] != intent_ids[j],
+                                Error::<T>::DuplicateIntentInBatch,
+                            );
                         }
                     }
-                }
-                Ok(freshly_attested)
-            })?;
 
-            Self::deposit_event(Event::BatchIntentsAttested {
-                submitted_count: n as u32,
-                attested_count,
-                batch_digest: payload,
-                signer_count,
-            });
-            Ok(())
+                    let mut hydrated_intents = Vec::with_capacity(n);
+                    for iid in intent_ids.iter() {
+                        let intent = Intents::<T>::get(iid).ok_or(Error::<T>::IntentNotFound)?;
+                        ensure!(
+                            matches!(
+                                intent.status,
+                                IntentStatus::Pending | IntentStatus::Attested
+                            ),
+                            Error::<T>::IntentStatusMismatch
+                        );
+                        hydrated_intents.push(intent);
+                    }
+
+                    if hydrated_intents
+                        .iter()
+                        .all(|intent| intent.status == IntentStatus::Attested)
+                    {
+                        return Ok(());
+                    }
+
+                    Self::verify_threshold_signatures::<T::SigVerifier>(
+                        &payload,
+                        &who,
+                        &signatures,
+                        checked,
+                    )?;
+
+                    // Truncate the call-level sigs vec into the storage-bound
+                    // BoundedVec for AttestationSigs. The storage type uses
+                    // `MaxCommittee` (=32 in prod), and `ensure_threshold_signatures`
+                    // already proved `signatures.len() >= threshold` — so any
+                    // overflow here would mean the caller submitted MORE than
+                    // MaxCommittee sigs, which we treat as an error rather than
+                    // silently truncate.
+                    let sigs_bv: BoundedVec<
+                        (CommitteePubkey, CommitteeSig),
+                        <T as Config>::MaxCommittee,
+                    > = BoundedVec::try_from(signatures.clone())
+                        .map_err(|_| Error::<T>::TooManySigs)?;
+
+                    let signer_count = signatures.len() as u32;
+
+                    // Atomic mutation phase. Any per-intent failure reverts the
+                    // whole call — same all-or-nothing semantics as PR #27.
+                    let attested_count = frame_support::storage::with_storage_layer::<
+                        u32,
+                        sp_runtime::DispatchError,
+                        _,
+                    >(|| {
+                        let mut freshly_attested: u32 = 0;
+                        for (iid, mut intent) in intent_ids.iter().zip(hydrated_intents) {
+                            match intent.status {
+                                IntentStatus::Attested => {
+                                    // Idempotent — already past the threshold from a
+                                    // prior batch / single-call. Silently skip.
+                                    continue;
+                                }
+                                IntentStatus::Pending => {
+                                    intent.status = IntentStatus::Attested;
+                                    Intents::<T>::insert(iid, intent);
+                                    AttestationSigs::<T>::insert(iid, sigs_bv.clone());
+                                    // Drop any partial single-call accumulation —
+                                    // the batch's M-of-N envelope is the canonical
+                                    // bundle now.
+                                    PendingAttestations::<T>::remove(iid);
+                                    Self::deposit_event(Event::IntentAttested {
+                                        intent_id: *iid,
+                                        attestor_count: signer_count,
+                                    });
+                                    freshly_attested = freshly_attested.saturating_add(1);
+                                }
+                                _ => {
+                                    // Vouchered / Settled / Expired / Refunded —
+                                    // can't be re-attested. Reject the batch
+                                    // atomically; keeper must split the next batch
+                                    // and exclude this intent.
+                                    return Err(Error::<T>::IntentStatusMismatch.into());
+                                }
+                            }
+                        }
+                        Ok(freshly_attested)
+                    })?;
+
+                    Self::deposit_event(Event::BatchIntentsAttested {
+                        submitted_count: n as u32,
+                        attested_count,
+                        batch_digest: payload,
+                        signer_count,
+                    });
+                    Ok(())
+                },
+            )
         }
 
         /// Task #212: mint N vouchers in ONE extrinsic under ONE M-of-N
@@ -2937,186 +3228,175 @@ pub mod pallet {
         /// status, claim already vouchered, invalid fairness proof, digest
         /// mismatch, duplicate claim_id within batch, coverage overflow)
         /// reverts every storage mutation in this call.
-        ///
-        /// Cost model:
-        /// - Base ~50M ref_time (M-of-N sig-verify + duplicate-claim scan)
-        /// - Plus N * ~10M ref_time (per-entry voucher_digest +
-        ///   bfpr_digest computation + storage writes for `Claims`,
-        ///   `Vouchers`, `Intents`, `PendingBatches` removal,
-        ///   `outstanding_coverage_ada` increment).
-        /// - At N=256 ~2.6B ref_time. Versus 256 single `request_voucher`
-        ///   calls at ~100M each = 25.6B ref_time, the batch path is
-        ///   ~10x cheaper.
         #[pallet::call_index(12)]
-        #[pallet::weight((
-            Weight::from_parts(
-                50_000_000u64.saturating_add((entries.len() as u64).saturating_mul(10_000_000)),
-                0,
-            ),
-            DispatchClass::Operational,
-            Pays::No,
-        ))]
+        #[pallet::weight((T::WeightInfo::request_batch_vouchers(entries.len() as u32)
+            .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
+            DispatchClass::Operational, Pays::No))]
         pub fn request_batch_vouchers(
             origin: OriginFor<T>,
             entries: BoundedVec<RequestVoucherEntry, <T as Config>::MaxVoucherBatch>,
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
-        ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            ensure!(
-                T::CommitteeMembership::is_member(&who),
-                Error::<T>::NotCommitteeMember
-            );
-            // Task #75 (sec-review): cap unbounded `signatures` len at
-            // MaxCommittee BEFORE any sig-verify cycle.
-            ensure!(
-                signatures.len() <= T::MaxCommittee::get() as usize,
-                Error::<T>::TooManySignatures
-            );
-            ensure!(!entries.is_empty(), Error::<T>::EmptyVoucherBatch);
-
-            // Pass 0: detect duplicate claim_ids inside the batch up-front.
-            // O(N^2) at N <= 256 ~32k comparisons, well below sig-verify cost.
-            let n = entries.len();
-            for i in 0..n {
-                for j in (i + 1)..n {
+        ) -> DispatchResultWithPostInfo {
+            Self::with_signature_weight(
+                T::WeightInfo::request_batch_vouchers(entries.len() as u32),
+                |checked| {
+                    let who = ensure_signed(origin)?;
                     ensure!(
-                        entries[i].claim_id != entries[j].claim_id,
-                        Error::<T>::DuplicateClaimInVoucherBatch,
+                        T::CommitteeMembership::is_member(&who),
+                        Error::<T>::NotCommitteeMember
                     );
-                }
-            }
-
-            // Pass 1: per-entry digest computation + per-entry digest
-            // binding check. We do this BEFORE the M-of-N sig-verify so
-            // honest operators all see the same `(voucher_digest,
-            // bfpr_digest)` pair the pallet just validated — no operator-
-            // local state slips into the canonical pre-image (per
-            // `feedback_mofn_hash_determinism.md`).
-            //
-            // #79: voucher_digest uses the chain-identity-bound CBOR form
-            // (legacy SCALE form is gone) so the keeper's mirror digest is
-            // guaranteed to match.
-            let chain_id = Self::materios_chain_id_bytes();
-            let aegis_script_hash = T::AegisPolicyV1ScriptHash::get();
-            let chain_identity = crate::voucher_canonicalize::ChainIdentity {
-                materios_chain_id: &chain_id,
-                network_magic: T::NetworkMagic::get(),
-                aegis_policy_script_hash: &aegis_script_hash,
-                settlement_version: T::SettlementVersion::get(),
-            };
-            let mut tuples: alloc::vec::Vec<(ClaimId, IntentId, [u8; 32], [u8; 32])> =
-                alloc::vec::Vec::with_capacity(n);
-            for entry in entries.iter() {
-                Self::validate_fairness_proof(&entry.fairness_proof)?;
-                let bfpr_digest =
-                    compute_fairness_proof_digest(&entry.fairness_proof);
-                ensure!(
-                    entry.voucher.batch_fairness_proof_digest == bfpr_digest,
-                    Error::<T>::FairnessDigestMismatch
-                );
-                let beneficiary_cbor =
-                    Self::beneficiary_cbor_for(&entry.voucher.beneficiary_cardano_addr)?;
-                let voucher_digest =
-                    crate::voucher_canonicalize::compute_voucher_digest_with_address(
-                        chain_identity,
-                        &entry.voucher.claim_id,
-                        &entry.voucher.policy_id,
-                        &beneficiary_cbor,
-                        entry.voucher.amount_ada,
-                        &entry.voucher.batch_fairness_proof_digest,
-                        entry.voucher.issued_block,
-                        entry.voucher.expiry_slot_cardano,
-                    );
-                tuples.push((
-                    entry.claim_id,
-                    entry.intent_id,
-                    voucher_digest,
-                    bfpr_digest,
-                ));
-            }
-
-            // ONE sig-verify pass over the whole batch — the throughput
-            // unlock. Domain-tagged with RVBN so a per-entry RVCH
-            // signature can never replay onto the batch path.
-            //
-            // #73: pre-image is bound to the Materios chain-id.
-            let payload = request_batch_vouchers_payload(&chain_id, &tuples);
-            Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
-
-            // Atomic mutation phase. Each per-entry mutation mirrors the
-            // single-call `request_voucher` body (issue #5 ordering
-            // preserved: pre-check coverage overflow on the WHOLE batch
-            // sum before mutating, mirror that per-entry as we walk).
-            let (count, total_amount_unsettled) = frame_support::storage::with_storage_layer::<
-                (u32, u64),
-                sp_runtime::DispatchError,
-                _,
-            >(|| {
-                let mut running_total: u64 = 0;
-                for (idx, entry) in entries.iter().enumerate() {
-                    // Duplicate-voucher check (per single-call semantics).
+                    // Task #75 (sec-review): cap unbounded `signatures` len at
+                    // MaxCommittee BEFORE any sig-verify cycle.
                     ensure!(
-                        !Vouchers::<T>::contains_key(entry.claim_id),
-                        Error::<T>::DuplicateVoucher
+                        signatures.len() <= T::MaxCommittee::get() as usize,
+                        Error::<T>::TooManySignatures
                     );
-                    let mut intent = Intents::<T>::get(entry.intent_id)
-                        .ok_or(Error::<T>::IntentNotFound)?;
-                    ensure!(
-                        intent.status == IntentStatus::Attested,
-                        Error::<T>::IntentStatusMismatch
-                    );
+                    ensure!(!entries.is_empty(), Error::<T>::EmptyVoucherBatch);
 
-                    // Coverage overflow check — same checked-add as
-                    // request_voucher (issue #5).
-                    let pool = PoolUtilization::<T>::get();
-                    let new_outstanding = pool
-                        .outstanding_coverage_ada
-                        .checked_add(entry.voucher.amount_ada)
-                        .ok_or(Error::<T>::CoverageOverflow)?;
+                    // Pass 0: detect duplicate claim_ids inside the batch up-front.
+                    // O(N^2) at N <= 256 ~32k comparisons, well below sig-verify cost.
+                    let n = entries.len();
+                    for i in 0..n {
+                        for j in (i + 1)..n {
+                            ensure!(
+                                entries[i].claim_id != entries[j].claim_id,
+                                Error::<T>::DuplicateClaimInVoucherBatch,
+                            );
+                        }
+                    }
 
-                    let voucher_amount = entry.voucher.amount_ada;
-                    let claim = Claim {
-                        intent_id: entry.intent_id,
-                        policy_id: entry.voucher.policy_id,
-                        amount_ada: voucher_amount,
-                        issued_block: entry.voucher.issued_block,
-                        expiry_slot_cardano: entry.voucher.expiry_slot_cardano,
-                        settled: false,
-                        settled_direct: false,
-                        cardano_tx_hash: [0u8; 32],
+                    // Pass 1: per-entry digest computation + per-entry digest
+                    // binding check. We do this BEFORE the M-of-N sig-verify so
+                    // honest operators all see the same `(voucher_digest,
+                    // bfpr_digest)` pair the pallet just validated — no operator-
+                    // local state slips into the canonical pre-image (per
+                    // `feedback_mofn_hash_determinism.md`).
+                    //
+                    // #79: voucher_digest uses the chain-identity-bound CBOR form
+                    // (legacy SCALE form is gone) so the keeper's mirror digest is
+                    // guaranteed to match.
+                    let chain_id = Self::materios_chain_id_bytes();
+                    let aegis_script_hash = T::AegisPolicyV1ScriptHash::get();
+                    let chain_identity = crate::voucher_canonicalize::ChainIdentity {
+                        materios_chain_id: &chain_id,
+                        network_magic: T::NetworkMagic::get(),
+                        aegis_policy_script_hash: &aegis_script_hash,
+                        settlement_version: T::SettlementVersion::get(),
                     };
-                    Claims::<T>::insert(entry.claim_id, claim);
-                    Vouchers::<T>::insert(entry.claim_id, entry.voucher.clone());
-                    intent.status = IntentStatus::Vouchered;
-                    Intents::<T>::insert(entry.intent_id, intent);
-                    Self::remove_from_pending_batches(entry.intent_id);
+                    let mut tuples: alloc::vec::Vec<(ClaimId, IntentId, [u8; 32], [u8; 32])> =
+                        alloc::vec::Vec::with_capacity(n);
+                    for entry in entries.iter() {
+                        ensure!(
+                            !Vouchers::<T>::contains_key(entry.claim_id),
+                            Error::<T>::DuplicateVoucher
+                        );
+                        Self::validate_fairness_proof(&entry.fairness_proof)?;
+                        let bfpr_digest = compute_fairness_proof_digest(&entry.fairness_proof);
+                        ensure!(
+                            entry.voucher.batch_fairness_proof_digest == bfpr_digest,
+                            Error::<T>::FairnessDigestMismatch
+                        );
+                        let beneficiary_cbor =
+                            Self::beneficiary_cbor_for(&entry.voucher.beneficiary_cardano_addr)?;
+                        let voucher_digest =
+                            crate::voucher_canonicalize::compute_voucher_digest_with_address(
+                                chain_identity,
+                                &entry.voucher.claim_id,
+                                &entry.voucher.policy_id,
+                                &beneficiary_cbor,
+                                entry.voucher.amount_ada,
+                                &entry.voucher.batch_fairness_proof_digest,
+                                entry.voucher.issued_block,
+                                entry.voucher.expiry_slot_cardano,
+                            );
+                        tuples.push((entry.claim_id, entry.intent_id, voucher_digest, bfpr_digest));
+                    }
 
-                    PoolUtilization::<T>::mutate(|u| {
-                        u.outstanding_coverage_ada = new_outstanding;
+                    // ONE sig-verify pass over the whole batch — the throughput
+                    // unlock. Domain-tagged with RVBN so a per-entry RVCH
+                    // signature can never replay onto the batch path.
+                    //
+                    // #73: pre-image is bound to the Materios chain-id.
+                    let payload = request_batch_vouchers_payload(&chain_id, &tuples);
+                    Self::verify_threshold_signatures::<T::SigVerifier>(
+                        &payload,
+                        &who,
+                        &signatures,
+                        checked,
+                    )?;
+
+                    // Atomic mutation phase. Each per-entry mutation mirrors the
+                    // single-call `request_voucher` body (issue #5 ordering
+                    // preserved: pre-check coverage overflow on the WHOLE batch
+                    // sum before mutating, mirror that per-entry as we walk).
+                    let (count, total_amount_unsettled) =
+                        frame_support::storage::with_storage_layer::<
+                            (u32, u64),
+                            sp_runtime::DispatchError,
+                            _,
+                        >(|| {
+                            let mut running_total: u64 = 0;
+                            for (idx, entry) in entries.iter().enumerate() {
+                                let mut intent = Intents::<T>::get(entry.intent_id)
+                                    .ok_or(Error::<T>::IntentNotFound)?;
+                                ensure!(
+                                    intent.status == IntentStatus::Attested,
+                                    Error::<T>::IntentStatusMismatch
+                                );
+
+                                // Coverage overflow check — same checked-add as
+                                // request_voucher (issue #5).
+                                let pool = PoolUtilization::<T>::get();
+                                let new_outstanding = pool
+                                    .outstanding_coverage_ada
+                                    .checked_add(entry.voucher.amount_ada)
+                                    .ok_or(Error::<T>::CoverageOverflow)?;
+
+                                let voucher_amount = entry.voucher.amount_ada;
+                                let claim = Claim {
+                                    intent_id: entry.intent_id,
+                                    policy_id: entry.voucher.policy_id,
+                                    amount_ada: voucher_amount,
+                                    issued_block: entry.voucher.issued_block,
+                                    expiry_slot_cardano: entry.voucher.expiry_slot_cardano,
+                                    settled: false,
+                                    settled_direct: false,
+                                    cardano_tx_hash: [0u8; 32],
+                                };
+                                Claims::<T>::insert(entry.claim_id, claim);
+                                Vouchers::<T>::insert(entry.claim_id, entry.voucher.clone());
+                                intent.status = IntentStatus::Vouchered;
+                                Intents::<T>::insert(entry.intent_id, intent);
+                                Self::remove_from_pending_batches(entry.intent_id);
+
+                                PoolUtilization::<T>::mutate(|u| {
+                                    u.outstanding_coverage_ada = new_outstanding;
+                                });
+
+                                // Per-voucher event still emitted for indexer
+                                // back-compat — same shape as single-call. The
+                                // `voucher_digest` + `fairness_proof_digest` were
+                                // computed in pass 1 and stashed in `tuples`.
+                                let (_cid, _iid, vd, bd) = tuples[idx];
+                                Self::deposit_event(Event::VoucherIssued {
+                                    claim_id: entry.claim_id,
+                                    voucher_digest: vd,
+                                    fairness_proof_digest: bd,
+                                });
+
+                                running_total = running_total.saturating_add(voucher_amount);
+                            }
+                            Ok((n as u32, running_total))
+                        })?;
+
+                    Self::deposit_event(Event::BatchVouchersIssued {
+                        count,
+                        batch_digest: payload,
+                        total_amount_ada: total_amount_unsettled,
                     });
-
-                    // Per-voucher event still emitted for indexer
-                    // back-compat — same shape as single-call. The
-                    // `voucher_digest` + `fairness_proof_digest` were
-                    // computed in pass 1 and stashed in `tuples`.
-                    let (_cid, _iid, vd, bd) = tuples[idx];
-                    Self::deposit_event(Event::VoucherIssued {
-                        claim_id: entry.claim_id,
-                        voucher_digest: vd,
-                        fairness_proof_digest: bd,
-                    });
-
-                    running_total = running_total.saturating_add(voucher_amount);
-                }
-                Ok((n as u32, running_total))
-            })?;
-
-            Self::deposit_event(Event::BatchVouchersIssued {
-                count,
-                batch_digest: payload,
-                total_amount_ada: total_amount_unsettled,
-            });
-            Ok(())
+                    Ok(())
+                },
+            )
         }
 
         /// Task #210: register N user intents in ONE extrinsic.
@@ -3149,43 +3429,8 @@ pub mod pallet {
         /// Backward compatibility: the existing 1-arg `submit_intent` is
         /// unchanged. Callers can mix single and batch in the same block.
         ///
-        /// Cost model:
-        /// - Base ~50M ref_time (signature verify + envelope decode)
-        /// - Plus N*~5M ref_time (per-entry pool-utilization check +
-        ///   IntentId derivation + storage writes for `Intents`, `Nonces`,
-        ///   `PendingBatches`, `ExpiryQueue`)
-        /// - Plus the standard `submit_intent` per-call weight (500M from
-        ///   the legacy single-call) but consumed ONCE per batch, not per
-        ///   entry — that's the throughput unlock.
         #[pallet::call_index(10)]
-        #[pallet::weight({
-            // Base weight ~50M (single-call submit_intent's amortised cost)
-            // plus per-entry storage cost ~5M. Tuned to match the sublinear
-            // pattern proven in PR #27 (settle_batch_atomic) — actual numbers
-            // are pinned by the runtime-benchmarks recipe in benchmarking.rs.
-            //
-            // Task #221 (PR #28 pre-merge security review): proof_size is no
-            // longer 0. Per-entry proof footprint ~5KB worst case (one
-            // `Intents::insert` value + one `Nonces::mutate` + one
-            // `PendingBatches::try_push` + one `ExpiryQueue::insert` + the
-            // SCALE-encoded `IntentKind` itself, dominated by BuyPolicy's
-            // 114-byte beneficiary_cardano_addr). Plus a 16KB base for the
-            // M-of-N free zone, header reads, and pool-utilization fetch.
-            // The bench-cli wiring (#190) is still pending so this remains
-            // a hand-tuned upper bound — the runtime-benchmarks pass will
-            // replace this whole expression with the generated WeightInfo
-            // entry when #190 lands. Until then, this estimate keeps the
-            // per-block normal-class budget honest at N=256
-            // (~16KB + 256*5KB ~1.3MB proof_size, well under the 5MB limit
-            // documented in types.rs::MAX_SUBMIT_BATCH).
-            const BASE_PROOF_SIZE: u64 = 16_384;
-            const PER_ENTRY_PROOF_SIZE: u64 = 5_120;
-            let n = entries.len() as u64;
-            Weight::from_parts(
-                50_000_000u64.saturating_add(n.saturating_mul(5_000_000)),
-                BASE_PROOF_SIZE.saturating_add(n.saturating_mul(PER_ENTRY_PROOF_SIZE)),
-            )
-        })]
+        #[pallet::weight(T::WeightInfo::submit_batch_intents(entries.len() as u32))]
         pub fn submit_batch_intents(
             origin: OriginFor<T>,
             entries: BoundedVec<SubmitIntentEntry, <T as Config>::MaxSubmitBatch>,
@@ -3281,18 +3526,19 @@ pub mod pallet {
         /// - Voucher must exist (`VoucherMissing`) — we cross-check the
         ///   amount + beneficiary now, not just at attest time, so a
         ///   provably-bad request never even pins storage.
-        /// - No pending request for this claim_id can exist
-        ///   (`SettlementRequestAlreadyExists`). The requester waits out
-        ///   `SettlementRequestTtl` before re-posting; this preempts a
-        ///   request-flapper attack.
+        /// - An existing request must be past `SettlementRequestTtl`.
+        ///   Replacement refunds its bond to the original requester.
+        /// - `bond_amount` is positive and at least `MinSettlementBond`,
+        ///   reserved atomically before the request becomes visible.
         #[pallet::call_index(13)]
-        #[pallet::weight((Weight::from_parts(40_000_000, 0), DispatchClass::Operational, Pays::Yes))]
+        #[pallet::weight((T::WeightInfo::request_settle(), DispatchClass::Operational, Pays::Yes))]
         pub fn request_settle(
             origin: OriginFor<T>,
             claim_id: ClaimId,
             cardano_tx_hash: [u8; 32],
             settled_direct: bool,
             attestation_evidence: SettlementEvidence,
+            bond_amount: u128,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             // The requester's cardano_tx_hash is recorded in two places:
@@ -3305,82 +3551,17 @@ pub mod pallet {
                 Error::<T>::SettlementEvidenceMismatch
             );
 
-            // Mainchain genesis pin — preprod attestor's evidence cannot
-            // settle a mainnet claim and vice versa.
-            ensure!(
-                attestation_evidence.mainchain_genesis_hash
-                    == T::MainchainGenesisHash::get(),
-                Error::<T>::WrongMainchainGenesis
-            );
-
-            // Finality depth gate — the attestor's k value must clear the
-            // pallet's freshness floor.
-            ensure!(
-                attestation_evidence.observed_at_depth >= T::MinFinalityDepth::get(),
-                Error::<T>::FinalityDepthBelowMinimum
-            );
-
-            // Claim presence + state checks. We do these BEFORE pinning the
-            // pending-request entry so a request against a wrong/settled
-            // claim never wastes a storage slot.
-            let claim =
-                Claims::<T>::get(claim_id).ok_or(Error::<T>::ClaimNotFound)?;
-            ensure!(!claim.settled, Error::<T>::AlreadySettled);
-
-            // Voucher must exist — the attest-side payload pulls
-            // voucher_digest from `Vouchers[claim_id]`, so an attest_settle
-            // against a missing voucher would fail later. Fail loud here so
-            // the requester gets a clean error.
-            let voucher =
-                Vouchers::<T>::get(claim_id).ok_or(Error::<T>::VoucherMissing)?;
-
-            // Cross-check evidence against the on-chain voucher. We pull the
-            // beneficiary payment-key hash from the CIP-0019 type-0 address
-            // bytes (`addr[1..29]`) — the canonical voucher digest already
-            // depends on this layout via `voucher_canonicalize::
-            // split_type0_address_bytes`, so a misformed address fails the
-            // voucher mint long before we get here.
-            ensure!(
-                attestation_evidence.amount_lovelace == voucher.amount_ada,
-                Error::<T>::SettlementEvidenceMismatch
-            );
-            let (payment_hash, _stake_hash) =
-                crate::voucher_canonicalize::split_type0_address_bytes(
-                    voucher.beneficiary_cardano_addr.as_slice(),
-                )
-                .map_err(|_| Error::<T>::InvalidBeneficiaryAddress)?;
-            ensure!(
-                attestation_evidence.beneficiary_addr_hash == payment_hash,
-                Error::<T>::SettlementEvidenceMismatch
-            );
-
-            // Strict idempotency — a pending request for this claim_id must
-            // not exist. Keepers retry with `SettlementRequestExpired` not
-            // `SettlementRequestAlreadyExists`.
-            ensure!(
-                !ClaimSettlementRequests::<T>::contains_key(claim_id),
-                Error::<T>::SettlementRequestAlreadyExists
-            );
-
-            // Task #84 (mis-sec P1): bond starts at zero — opt-in via the
-            // separate `post_settlement_bond` extrinsic so we don't bump
-            // request_settle's transaction_version. A request landing on a
-            // tombstoned (`BondSlashedRequests`) claim is hard-rejected so
-            // a slashed requester can't re-pin the same claim_id.
-            ensure!(
-                !BondSlashedRequests::<T>::contains_key(claim_id),
-                Error::<T>::BondSlashedNoRelease
-            );
-
-            let now = <frame_system::Pallet<T>>::block_number();
-            let record = SettlementRequestRecord::<T::AccountId, BlockNumberFor<T>> {
-                requester: who.clone(),
-                evidence: attestation_evidence,
-                settled_direct,
-                submitted_block: now,
-                bond_amount: 0u128,
-            };
-            ClaimSettlementRequests::<T>::insert(claim_id, record);
+            Self::checked_settlement_target(claim_id, &attestation_evidence)?;
+            Self::store_settlement_request(
+                claim_id,
+                SettlementRequestRecord {
+                    requester: who.clone(),
+                    evidence: attestation_evidence,
+                    settled_direct,
+                    submitted_block: <frame_system::Pallet<T>>::block_number(),
+                    bond_amount,
+                },
+            )?;
 
             Self::deposit_event(Event::SettlementRequested {
                 claim_id,
@@ -3418,137 +3599,196 @@ pub mod pallet {
         /// to `Settled`, NAV + outstanding coverage decrement, and the
         /// pending request is removed. The `cardano_tx_hash` recorded on
         /// `Claim` is the requester-asserted one — but it's now bound to a
-        /// FAT, falsifiable attestation that a future watcher dispatch
-        /// (#84 slash route) can prosecute.
+        /// committee attestation. Fraud slashing only applies while the
+        /// request is pending; attestation consumes that request.
         #[pallet::call_index(14)]
-        #[pallet::weight((Weight::from_parts(60_000_000, 0), DispatchClass::Operational, Pays::No))]
+        #[pallet::weight((T::WeightInfo::attest_settle()
+            .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
+            DispatchClass::Operational, Pays::No))]
         pub fn attest_settle(
             origin: OriginFor<T>,
             claim_id: ClaimId,
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
-        ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            ensure!(
-                T::CommitteeMembership::is_member(&who),
-                Error::<T>::NotCommitteeMember
-            );
-            ensure!(
-                signatures.len() <= T::MaxCommittee::get() as usize,
-                Error::<T>::TooManySignatures
-            );
-
-            // Hydrate the pending request — every attestor signs over a
-            // payload derived from these stored bytes plus chain state.
-            let request = ClaimSettlementRequests::<T>::get(claim_id)
-                .ok_or(Error::<T>::SettlementRequestMissing)?;
-
-            // TTL gate. Expired requests can't be attested; the keeper must
-            // post fresh evidence (a stale observation could be stale because
-            // the Cardano tx got reorged or the attestor pool was offline,
-            // either way we don't want to settle on it).
-            let now = <frame_system::Pallet<T>>::block_number();
-            // `BlockNumberFor<T>` is `Into<u64> + Copy` per the impl's where
-            // clause, so we coerce both sides to u64 for the saturating sub.
-            let now_u64: u64 = now.into();
-            let submitted_u64: u64 = request.submitted_block.into();
-            let age = now_u64.saturating_sub(submitted_u64);
-            let ttl_u64: u64 = T::SettlementRequestTtl::get().into();
-            ensure!(age <= ttl_u64, Error::<T>::SettlementRequestExpired);
-
-            // Claim + voucher hydration. Both still needed even though
-            // request_settle already cross-checked — a settle that races
-            // an `expire_policy_mirror` could land here with the claim
-            // already terminalized, so re-check.
-            let mut claim =
-                Claims::<T>::get(claim_id).ok_or(Error::<T>::ClaimNotFound)?;
-            ensure!(!claim.settled, Error::<T>::AlreadySettled);
-            let voucher =
-                Vouchers::<T>::get(claim_id).ok_or(Error::<T>::VoucherMissing)?;
-
-            // Re-derive voucher_digest from the on-chain voucher. Same
-            // canonical pre-image as `request_voucher` / RVCH, so all
-            // committee members see the same bytes.
-            let voucher_digest =
-                Self::compute_canonical_voucher_digest(&voucher)?;
-
-            // Re-derive payment-key hash from the on-chain voucher address.
-            // We already cross-checked this against the requester's
-            // evidence in request_settle, but the digest must commit to
-            // chain state, so we compute it here too.
-            let (payment_hash, _stake_hash) =
-                crate::voucher_canonicalize::split_type0_address_bytes(
-                    voucher.beneficiary_cardano_addr.as_slice(),
-                )
-                .map_err(|_| Error::<T>::InvalidBeneficiaryAddress)?;
-
-            // Build the canonical STCA payload + run the M-of-N gate.
-            let chain_id = Self::materios_chain_id_bytes();
-            let mc_genesis = T::MainchainGenesisHash::get();
-            let payload = settle_claim_attested_payload(
-                &chain_id,
-                &claim_id,
-                &voucher_digest,
-                &request.evidence.cardano_tx_hash,
-                request.settled_direct,
-                &payment_hash,
-                claim.amount_ada,
-                request.evidence.observed_at_depth,
-                request.evidence.observed_slot,
-                &mc_genesis,
-            );
-            Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
-
-            // All checks pass — settle the claim. Same NAV / coverage math
-            // as the legacy path; only the trust gate changed.
-            let cardano_tx_hash = request.evidence.cardano_tx_hash;
-            let settled_direct = request.settled_direct;
-            claim.settled = true;
-            claim.settled_direct = settled_direct;
-            claim.cardano_tx_hash = cardano_tx_hash;
-            let intent_id = claim.intent_id;
-            let amount = claim.amount_ada;
-            Claims::<T>::insert(claim_id, claim);
-
-            if let Some(mut intent) = Intents::<T>::get(intent_id) {
-                intent.status = IntentStatus::Settled;
-                Intents::<T>::insert(intent_id, intent);
-            }
-            Self::remove_from_pending_batches(intent_id);
-
-            PoolUtilization::<T>::mutate(|u| {
-                u.outstanding_coverage_ada =
-                    u.outstanding_coverage_ada.saturating_sub(amount);
-                u.total_nav_ada = u.total_nav_ada.saturating_sub(amount);
-            });
-
-            // Task #84 (mis-sec P1): if a bond was posted on this
-            // request, pin the attested-at block + a (requester, amount)
-            // side record so the release-delay gate + unreserve target
-            // are visible to `release_settlement_bond` after the
-            // pending `ClaimSettlementRequests` row is removed below.
-            // Storage writes are conditional on `bond_amount > 0` so the
-            // un-bonded (legacy / opt-out) path costs zero extra slots.
-            if request.bond_amount > 0 {
-                BondedClaimAttestedAt::<T>::insert(
-                    claim_id,
-                    <frame_system::Pallet<T>>::block_number(),
+        ) -> DispatchResultWithPostInfo {
+            Self::with_signature_weight(T::WeightInfo::attest_settle(), |checked| {
+                let who = ensure_signed(origin)?;
+                ensure!(
+                    T::CommitteeMembership::is_member(&who),
+                    Error::<T>::NotCommitteeMember
                 );
-                BondedClaimRequester::<T>::insert(
-                    claim_id,
-                    (request.requester.clone(), request.bond_amount),
+                ensure!(
+                    signatures.len() <= T::MaxCommittee::get() as usize,
+                    Error::<T>::TooManySignatures
                 );
-            }
 
-            // Consume the pending request — the canonical post-state is
-            // "claim settled, no pending entry."
-            ClaimSettlementRequests::<T>::remove(claim_id);
+                // Hydrate the pending request — every attestor signs over a
+                // payload derived from these stored bytes plus chain state.
+                let request = ClaimSettlementRequests::<T>::get(claim_id)
+                    .ok_or(Error::<T>::SettlementRequestMissing)?;
 
-            Self::deposit_event(Event::ClaimSettled {
-                claim_id,
-                cardano_tx_hash,
-                settled_direct,
-            });
-            Ok(())
+                // TTL gate. Expired requests can't be attested; the keeper must
+                // post fresh evidence (a stale observation could be stale because
+                // the Cardano tx got reorged or the attestor pool was offline,
+                // either way we don't want to settle on it).
+                let now = <frame_system::Pallet<T>>::block_number();
+                // `BlockNumberFor<T>` is `Into<u64> + Copy` per the impl's where
+                // clause, so we coerce both sides to u64 for the saturating sub.
+                let now_u64: u64 = now.into();
+                let submitted_u64: u64 = request.submitted_block.into();
+                let age = now_u64.saturating_sub(submitted_u64);
+                let ttl_u64: u64 = T::SettlementRequestTtl::get().into();
+                ensure!(age <= ttl_u64, Error::<T>::SettlementRequestExpired);
+
+                // Claim + voucher hydration. Both still needed even though
+                // request_settle already cross-checked — a settle that races
+                // an `expire_policy_mirror` could land here with the claim
+                // already terminalized, so re-check.
+                let claim = Claims::<T>::get(claim_id).ok_or(Error::<T>::ClaimNotFound)?;
+                ensure!(!claim.settled, Error::<T>::AlreadySettled);
+                let voucher = Vouchers::<T>::get(claim_id).ok_or(Error::<T>::VoucherMissing)?;
+
+                // Re-derive voucher_digest from the on-chain voucher. Same
+                // canonical pre-image as `request_voucher` / RVCH, so all
+                // committee members see the same bytes.
+                let voucher_digest = Self::compute_canonical_voucher_digest(&voucher)?;
+
+                // Re-derive payment-key hash from the on-chain voucher address.
+                // We already cross-checked this against the requester's
+                // evidence in request_settle, but the digest must commit to
+                // chain state, so we compute it here too.
+                let (payment_hash, _stake_hash) =
+                    crate::voucher_canonicalize::split_type0_address_bytes(
+                        voucher.beneficiary_cardano_addr.as_slice(),
+                    )
+                    .map_err(|_| Error::<T>::InvalidBeneficiaryAddress)?;
+
+                // Build the canonical STCA payload + run the M-of-N gate.
+                let chain_id = Self::materios_chain_id_bytes();
+                let mc_genesis = T::MainchainGenesisHash::get();
+                let payload = settle_claim_attested_payload(
+                    &chain_id,
+                    &claim_id,
+                    &voucher_digest,
+                    &request.evidence.cardano_tx_hash,
+                    request.settled_direct,
+                    &payment_hash,
+                    claim.amount_ada,
+                    request.evidence.observed_at_depth,
+                    request.evidence.observed_slot,
+                    &mc_genesis,
+                );
+                Self::verify_threshold_signatures::<T::SigVerifier>(
+                    &payload,
+                    &who,
+                    &signatures,
+                    checked,
+                )?;
+
+                Self::settle_attested_claim(
+                    claim_id,
+                    claim,
+                    request.evidence.cardano_tx_hash,
+                    request.settled_direct,
+                );
+
+                // Task #84 (mis-sec P1): if a bond was posted on this
+                // request, pin the attested-at block + a (requester, amount)
+                // side record so the release-delay gate + unreserve target
+                // are visible to `release_settlement_bond` after the
+                // pending `ClaimSettlementRequests` row is removed below.
+                // Storage writes are conditional on `bond_amount > 0` so the
+                // unbonded legacy path costs zero extra slots.
+                if request.bond_amount > 0 {
+                    BondedClaimAttestedAt::<T>::insert(
+                        claim_id,
+                        <frame_system::Pallet<T>>::block_number(),
+                    );
+                    BondedClaimRequester::<T>::insert(
+                        claim_id,
+                        (request.requester.clone(), request.bond_amount),
+                    );
+                }
+
+                // Consume the pending request — the canonical post-state is
+                // "claim settled, no pending entry."
+                ClaimSettlementRequests::<T>::remove(claim_id);
+                Ok(())
+            })
+        }
+
+        /// Settles `claim_id` on M-of-N STCA signatures over evidence the
+        /// committee supplies, displacing a pending request whose evidence
+        /// or settlement mode differs. The displaced bond is refunded, not
+        /// slashed: an unattestable request may be honest but wrong, and no
+        /// fraud is alleged. This clears requests that no `FraudProof` can
+        /// slash, such as a wrong slot or an unreachable depth.
+        ///
+        /// The STCA digest is the one `attest_settle` verifies for a
+        /// request carrying the same evidence. The evidence passes the
+        /// checks `request_settle` applies; a request whose evidence and
+        /// mode already match must be attested instead
+        /// (`SupersedeMatchesRequest`).
+        #[pallet::call_index(22)]
+        #[pallet::weight((T::WeightInfo::supersede_settlement_request()
+            .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
+            DispatchClass::Operational, Pays::No))]
+        pub fn supersede_settlement_request(
+            origin: OriginFor<T>,
+            claim_id: ClaimId,
+            settled_direct: bool,
+            evidence: SettlementEvidence,
+            signatures: Vec<(CommitteePubkey, CommitteeSig)>,
+        ) -> DispatchResultWithPostInfo {
+            Self::with_signature_weight(T::WeightInfo::supersede_settlement_request(), |checked| {
+                let who = ensure_signed(origin)?;
+                ensure!(
+                    T::CommitteeMembership::is_member(&who),
+                    Error::<T>::NotCommitteeMember
+                );
+                ensure!(
+                    signatures.len() <= T::MaxCommittee::get() as usize,
+                    Error::<T>::TooManySignatures
+                );
+                let (claim, voucher) = Self::checked_settlement_target(claim_id, &evidence)?;
+                let request = ClaimSettlementRequests::<T>::get(claim_id)
+                    .ok_or(Error::<T>::SettlementRequestMissing)?;
+                ensure!(
+                    request.evidence != evidence || request.settled_direct != settled_direct,
+                    Error::<T>::SupersedeMatchesRequest
+                );
+
+                let payload = settle_claim_attested_payload(
+                    &Self::materios_chain_id_bytes(),
+                    &claim_id,
+                    &Self::compute_canonical_voucher_digest(&voucher)?,
+                    &evidence.cardano_tx_hash,
+                    settled_direct,
+                    &evidence.beneficiary_addr_hash,
+                    claim.amount_ada,
+                    evidence.observed_at_depth,
+                    evidence.observed_slot,
+                    &T::MainchainGenesisHash::get(),
+                );
+                Self::verify_threshold_signatures::<T::SigVerifier>(
+                    &payload,
+                    &who,
+                    &signatures,
+                    checked,
+                )?;
+
+                Self::discard_settlement_request(claim_id, request.clone())?;
+                Self::deposit_event(Event::SettlementRequestSuperseded {
+                    claim_id,
+                    requester: request.requester,
+                });
+                Self::settle_attested_claim(
+                    claim_id,
+                    claim,
+                    evidence.cardano_tx_hash,
+                    settled_direct,
+                );
+                Ok(())
+            })
         }
 
         /// Task #266 (mis-sec P0): batch parallel of `request_settle`. The
@@ -3566,18 +3806,14 @@ pub mod pallet {
         /// resubmitting.
         #[pallet::call_index(15)]
         #[pallet::weight((
-            Weight::from_parts(
-                40_000_000u64.saturating_add(
-                    (entries.len() as u64).saturating_mul(8_000_000),
-                ),
-                0,
-            ),
+            T::WeightInfo::request_batch_settle(entries.len() as u32),
             DispatchClass::Operational,
             Pays::Yes,
         ))]
         pub fn request_batch_settle(
             origin: OriginFor<T>,
             entries: BoundedVec<SettleAttestedBatchEntry, <T as Config>::MaxSettleBatch>,
+            bond_amount: u128,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(!entries.is_empty(), Error::<T>::EmptyBatch);
@@ -3594,8 +3830,6 @@ pub mod pallet {
                 }
             }
 
-            let mc_genesis = T::MainchainGenesisHash::get();
-            let min_depth = T::MinFinalityDepth::get();
             let now = <frame_system::Pallet<T>>::block_number();
             let count = n as u32;
 
@@ -3605,60 +3839,17 @@ pub mod pallet {
                 _,
             >(|| {
                 for entry in entries.iter() {
-                    // Per-entry mirror of the single-call request_settle
-                    // invariants. Atomic rollback if any fail.
-                    ensure!(
-                        entry.evidence.mainchain_genesis_hash == mc_genesis,
-                        Error::<T>::WrongMainchainGenesis
-                    );
-                    ensure!(
-                        entry.evidence.observed_at_depth >= min_depth,
-                        Error::<T>::FinalityDepthBelowMinimum
-                    );
-                    let claim = Claims::<T>::get(entry.claim_id)
-                        .ok_or(Error::<T>::ClaimNotFound)?;
-                    ensure!(!claim.settled, Error::<T>::AlreadySettled);
-                    let voucher = Vouchers::<T>::get(entry.claim_id)
-                        .ok_or(Error::<T>::VoucherMissing)?;
-                    ensure!(
-                        entry.evidence.amount_lovelace == voucher.amount_ada,
-                        Error::<T>::SettlementEvidenceMismatch
-                    );
-                    let (payment_hash, _stake_hash) =
-                        crate::voucher_canonicalize::split_type0_address_bytes(
-                            voucher.beneficiary_cardano_addr.as_slice(),
-                        )
-                        .map_err(|_| Error::<T>::InvalidBeneficiaryAddress)?;
-                    ensure!(
-                        entry.evidence.beneficiary_addr_hash == payment_hash,
-                        Error::<T>::SettlementEvidenceMismatch
-                    );
-                    ensure!(
-                        !ClaimSettlementRequests::<T>::contains_key(entry.claim_id),
-                        Error::<T>::SettlementRequestAlreadyExists
-                    );
-
-                    // Task #84 (mis-sec P1): batch entries land
-                    // un-bonded. The watcher slash path requires a
-                    // separate `post_settlement_bond` per claim, which
-                    // is the contract for the legacy single-call shape
-                    // too. Slashed-tombstone gate: refuse if this
-                    // claim_id was previously prosecuted.
-                    ensure!(
-                        !BondSlashedRequests::<T>::contains_key(entry.claim_id),
-                        Error::<T>::BondSlashedNoRelease
-                    );
-                    let record = SettlementRequestRecord::<
-                        T::AccountId,
-                        BlockNumberFor<T>,
-                    > {
-                        requester: who.clone(),
-                        evidence: entry.evidence,
-                        settled_direct: entry.settled_direct,
-                        submitted_block: now,
-                        bond_amount: 0u128,
-                    };
-                    ClaimSettlementRequests::<T>::insert(entry.claim_id, record);
+                    Self::checked_settlement_target(entry.claim_id, &entry.evidence)?;
+                    Self::store_settlement_request(
+                        entry.claim_id,
+                        SettlementRequestRecord {
+                            requester: who.clone(),
+                            evidence: entry.evidence,
+                            settled_direct: entry.settled_direct,
+                            submitted_block: now,
+                            bond_amount,
+                        },
+                    )?;
                 }
                 Ok(())
             })?;
@@ -3680,185 +3871,183 @@ pub mod pallet {
         /// `attest_settle`, applied per-entry. Atomic rollback on first
         /// failure.
         #[pallet::call_index(16)]
-        #[pallet::weight((
-            Weight::from_parts(
-                60_000_000u64.saturating_add(
-                    (claim_ids.len() as u64).saturating_mul(15_000_000),
-                ),
-                0,
-            ),
-            DispatchClass::Operational,
-            Pays::No,
-        ))]
+        #[pallet::weight((T::WeightInfo::attest_batch_settle(claim_ids.len() as u32)
+            .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
+            DispatchClass::Operational, Pays::No))]
         pub fn attest_batch_settle(
             origin: OriginFor<T>,
             claim_ids: BoundedVec<ClaimId, <T as Config>::MaxSettleBatch>,
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
-        ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            ensure!(
-                T::CommitteeMembership::is_member(&who),
-                Error::<T>::NotCommitteeMember
-            );
-            ensure!(
-                signatures.len() <= T::MaxCommittee::get() as usize,
-                Error::<T>::TooManySignatures
-            );
-            ensure!(!claim_ids.is_empty(), Error::<T>::EmptyBatch);
-
-            // Pass 0: duplicate claim_id detection.
-            let n = claim_ids.len();
-            for i in 0..n {
-                for j in (i + 1)..n {
+        ) -> DispatchResultWithPostInfo {
+            Self::with_signature_weight(
+                T::WeightInfo::attest_batch_settle(claim_ids.len() as u32),
+                |checked| {
+                    let who = ensure_signed(origin)?;
                     ensure!(
-                        claim_ids[i] != claim_ids[j],
-                        Error::<T>::DuplicateClaimInBatch,
+                        T::CommitteeMembership::is_member(&who),
+                        Error::<T>::NotCommitteeMember
                     );
-                }
-            }
+                    ensure!(
+                        signatures.len() <= T::MaxCommittee::get() as usize,
+                        Error::<T>::TooManySignatures
+                    );
+                    ensure!(!claim_ids.is_empty(), Error::<T>::EmptyBatch);
 
-            // Pass 1: hydrate per-entry bytes BEFORE the sig-verify pass so
-            // honest operators all see the same flat byte stream the pallet
-            // is about to hash. Any missing/expired request fails the batch
-            // before any sig verifications run.
-            let chain_id = Self::materios_chain_id_bytes();
-            let mc_genesis = T::MainchainGenesisHash::get();
-            let now = <frame_system::Pallet<T>>::block_number();
-            let now_u64: u64 = now.into();
-            let ttl_u64: u64 = T::SettlementRequestTtl::get().into();
-
-            let mut entry_bytes: alloc::vec::Vec<BatchAttestEntryBytes> =
-                alloc::vec::Vec::with_capacity(n);
-            let mut hydrated_amounts: alloc::vec::Vec<u64> =
-                alloc::vec::Vec::with_capacity(n);
-            let mut hydrated_direct: alloc::vec::Vec<bool> =
-                alloc::vec::Vec::with_capacity(n);
-            let mut hydrated_intent_ids: alloc::vec::Vec<IntentId> =
-                alloc::vec::Vec::with_capacity(n);
-            // Task #84 (mis-sec P1): per-entry bond amount so the batch
-            // can pin `BondedClaimAttestedAt` at attest time for entries
-            // that opted in via `post_settlement_bond`.
-            let mut hydrated_bonds: alloc::vec::Vec<u128> =
-                alloc::vec::Vec::with_capacity(n);
-            for cid in claim_ids.iter() {
-                let request = ClaimSettlementRequests::<T>::get(*cid)
-                    .ok_or(Error::<T>::SettlementRequestMissing)?;
-                let submitted_u64: u64 = request.submitted_block.into();
-                let age = now_u64.saturating_sub(submitted_u64);
-                ensure!(age <= ttl_u64, Error::<T>::SettlementRequestExpired);
-                let claim =
-                    Claims::<T>::get(*cid).ok_or(Error::<T>::ClaimNotFound)?;
-                ensure!(!claim.settled, Error::<T>::AlreadySettled);
-                let voucher =
-                    Vouchers::<T>::get(*cid).ok_or(Error::<T>::VoucherMissing)?;
-                let voucher_digest =
-                    Self::compute_canonical_voucher_digest(&voucher)?;
-                let (payment_hash, _stake_hash) =
-                    crate::voucher_canonicalize::split_type0_address_bytes(
-                        voucher.beneficiary_cardano_addr.as_slice(),
-                    )
-                    .map_err(|_| Error::<T>::InvalidBeneficiaryAddress)?;
-                // No need to re-check amount/beneficiary against evidence
-                // here — request_settle already enforced that at the time
-                // the entry was pinned, and the per-entry record is
-                // immutable for its lifetime.
-                entry_bytes.push(BatchAttestEntryBytes {
-                    claim_id: *cid,
-                    voucher_digest,
-                    cardano_tx_hash: request.evidence.cardano_tx_hash,
-                    settled_direct: request.settled_direct,
-                    beneficiary_hash: payment_hash,
-                    amount_ada: claim.amount_ada,
-                    depth: request.evidence.observed_at_depth,
-                    slot: request.evidence.observed_slot,
-                    mc_genesis,
-                });
-                hydrated_amounts.push(claim.amount_ada);
-                hydrated_direct.push(request.settled_direct);
-                hydrated_intent_ids.push(claim.intent_id);
-                hydrated_bonds.push(request.bond_amount);
-            }
-
-            // ONE sig-verify pass over the canonical BSTA digest — the
-            // throughput unlock.
-            let payload = attest_batch_settle_payload(&chain_id, &entry_bytes);
-            Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
-
-            // Atomic mutation phase. Settle every claim under the same
-            // transactional storage layer so a mid-loop runtime error
-            // rolls the whole batch back.
-            let (count, settled_direct_count, total_amount) =
-                frame_support::storage::with_storage_layer::<
-                    (u32, u32, u64),
-                    sp_runtime::DispatchError,
-                    _,
-                >(|| {
-                    let mut direct_count: u32 = 0;
-                    let mut total_amount_unsettled: u64 = 0;
-                    for (idx, cid) in claim_ids.iter().enumerate() {
-                        let mut claim = Claims::<T>::get(*cid)
-                            .ok_or(Error::<T>::ClaimNotFound)?;
-                        // Re-check inside the storage layer in case a sibling
-                        // extrinsic in the same block already settled it.
-                        ensure!(!claim.settled, Error::<T>::AlreadySettled);
-                        let tx_hash = entry_bytes[idx].cardano_tx_hash;
-                        let settled_direct = hydrated_direct[idx];
-                        let amount = hydrated_amounts[idx];
-                        let intent_id = hydrated_intent_ids[idx];
-                        claim.settled = true;
-                        claim.settled_direct = settled_direct;
-                        claim.cardano_tx_hash = tx_hash;
-                        Claims::<T>::insert(*cid, claim);
-                        if let Some(mut intent) = Intents::<T>::get(intent_id) {
-                            intent.status = IntentStatus::Settled;
-                            Intents::<T>::insert(intent_id, intent);
-                        }
-                        Self::remove_from_pending_batches(intent_id);
-                        // Task #84 (mis-sec P1): pin attested-at block +
-                        // (requester, amount) side-record for bonded
-                        // entries so the release-delay gate + unreserve
-                        // target resolve later. We re-read the pending
-                        // request to grab the requester field (cheaper
-                        // than threading it through hydrated_* vecs and
-                        // matches the single-call site's shape).
-                        if hydrated_bonds[idx] > 0 {
-                            BondedClaimAttestedAt::<T>::insert(
-                                *cid,
-                                <frame_system::Pallet<T>>::block_number(),
+                    // Pass 0: duplicate claim_id detection.
+                    let n = claim_ids.len();
+                    for i in 0..n {
+                        for j in (i + 1)..n {
+                            ensure!(
+                                claim_ids[i] != claim_ids[j],
+                                Error::<T>::DuplicateClaimInBatch,
                             );
-                            if let Some(pending) =
-                                ClaimSettlementRequests::<T>::get(*cid)
-                            {
-                                BondedClaimRequester::<T>::insert(
-                                    *cid,
-                                    (pending.requester, hydrated_bonds[idx]),
-                                );
-                            }
                         }
-                        ClaimSettlementRequests::<T>::remove(*cid);
-                        if settled_direct {
-                            direct_count = direct_count.saturating_add(1);
-                        }
-                        total_amount_unsettled =
-                            total_amount_unsettled.saturating_add(amount);
                     }
-                    PoolUtilization::<T>::mutate(|u| {
-                        u.outstanding_coverage_ada = u
-                            .outstanding_coverage_ada
-                            .saturating_sub(total_amount_unsettled);
-                        u.total_nav_ada =
-                            u.total_nav_ada.saturating_sub(total_amount_unsettled);
-                    });
-                    Ok((n as u32, direct_count, total_amount_unsettled))
-                })?;
 
-            let _ = total_amount; // surface to optional future event field
-            Self::deposit_event(Event::BatchSettled {
-                count,
-                batch_digest: payload,
-                settled_direct_count,
-            });
-            Ok(())
+                    // Pass 1: hydrate per-entry bytes BEFORE the sig-verify pass so
+                    // honest operators all see the same flat byte stream the pallet
+                    // is about to hash. Any missing/expired request fails the batch
+                    // before any sig verifications run.
+                    let chain_id = Self::materios_chain_id_bytes();
+                    let mc_genesis = T::MainchainGenesisHash::get();
+                    let now = <frame_system::Pallet<T>>::block_number();
+                    let now_u64: u64 = now.into();
+                    let ttl_u64: u64 = T::SettlementRequestTtl::get().into();
+
+                    let mut entry_bytes: alloc::vec::Vec<BatchAttestEntryBytes> =
+                        alloc::vec::Vec::with_capacity(n);
+                    let mut hydrated_amounts: alloc::vec::Vec<u64> =
+                        alloc::vec::Vec::with_capacity(n);
+                    let mut hydrated_direct: alloc::vec::Vec<bool> =
+                        alloc::vec::Vec::with_capacity(n);
+                    let mut hydrated_intent_ids: alloc::vec::Vec<IntentId> =
+                        alloc::vec::Vec::with_capacity(n);
+                    // Task #84 (mis-sec P1): per-entry bond amount so the batch
+                    // can pin `BondedClaimAttestedAt` at attest time for entries
+                    // that opted in via `post_settlement_bond`.
+                    let mut hydrated_bonds: alloc::vec::Vec<u128> =
+                        alloc::vec::Vec::with_capacity(n);
+                    for cid in claim_ids.iter() {
+                        let request = ClaimSettlementRequests::<T>::get(*cid)
+                            .ok_or(Error::<T>::SettlementRequestMissing)?;
+                        let submitted_u64: u64 = request.submitted_block.into();
+                        let age = now_u64.saturating_sub(submitted_u64);
+                        ensure!(age <= ttl_u64, Error::<T>::SettlementRequestExpired);
+                        let claim = Claims::<T>::get(*cid).ok_or(Error::<T>::ClaimNotFound)?;
+                        ensure!(!claim.settled, Error::<T>::AlreadySettled);
+                        let voucher = Vouchers::<T>::get(*cid).ok_or(Error::<T>::VoucherMissing)?;
+                        let voucher_digest = Self::compute_canonical_voucher_digest(&voucher)?;
+                        let (payment_hash, _stake_hash) =
+                            crate::voucher_canonicalize::split_type0_address_bytes(
+                                voucher.beneficiary_cardano_addr.as_slice(),
+                            )
+                            .map_err(|_| Error::<T>::InvalidBeneficiaryAddress)?;
+                        // No need to re-check amount/beneficiary against evidence
+                        // here — request_settle already enforced that at the time
+                        // the entry was pinned, and the per-entry record is
+                        // immutable for its lifetime.
+                        entry_bytes.push(BatchAttestEntryBytes {
+                            claim_id: *cid,
+                            voucher_digest,
+                            cardano_tx_hash: request.evidence.cardano_tx_hash,
+                            settled_direct: request.settled_direct,
+                            beneficiary_hash: payment_hash,
+                            amount_ada: claim.amount_ada,
+                            depth: request.evidence.observed_at_depth,
+                            slot: request.evidence.observed_slot,
+                            mc_genesis,
+                        });
+                        hydrated_amounts.push(claim.amount_ada);
+                        hydrated_direct.push(request.settled_direct);
+                        hydrated_intent_ids.push(claim.intent_id);
+                        hydrated_bonds.push(request.bond_amount);
+                    }
+
+                    // ONE sig-verify pass over the canonical BSTA digest — the
+                    // throughput unlock.
+                    let payload = attest_batch_settle_payload(&chain_id, &entry_bytes);
+                    Self::verify_threshold_signatures::<T::SigVerifier>(
+                        &payload,
+                        &who,
+                        &signatures,
+                        checked,
+                    )?;
+
+                    // Atomic mutation phase. Settle every claim under the same
+                    // transactional storage layer so a mid-loop runtime error
+                    // rolls the whole batch back.
+                    let (count, settled_direct_count, total_amount) =
+                        frame_support::storage::with_storage_layer::<
+                            (u32, u32, u64),
+                            sp_runtime::DispatchError,
+                            _,
+                        >(|| {
+                            let mut direct_count: u32 = 0;
+                            let mut total_amount_unsettled: u64 = 0;
+                            for (idx, cid) in claim_ids.iter().enumerate() {
+                                let mut claim =
+                                    Claims::<T>::get(*cid).ok_or(Error::<T>::ClaimNotFound)?;
+                                // Re-check inside the storage layer in case a sibling
+                                // extrinsic in the same block already settled it.
+                                ensure!(!claim.settled, Error::<T>::AlreadySettled);
+                                let tx_hash = entry_bytes[idx].cardano_tx_hash;
+                                let settled_direct = hydrated_direct[idx];
+                                let amount = hydrated_amounts[idx];
+                                let intent_id = hydrated_intent_ids[idx];
+                                claim.settled = true;
+                                claim.settled_direct = settled_direct;
+                                claim.cardano_tx_hash = tx_hash;
+                                Claims::<T>::insert(*cid, claim);
+                                if let Some(mut intent) = Intents::<T>::get(intent_id) {
+                                    intent.status = IntentStatus::Settled;
+                                    Intents::<T>::insert(intent_id, intent);
+                                }
+                                Self::remove_from_pending_batches(intent_id);
+                                // Task #84 (mis-sec P1): pin attested-at block +
+                                // (requester, amount) side-record for bonded
+                                // entries so the release-delay gate + unreserve
+                                // target resolve later. We re-read the pending
+                                // request to grab the requester field (cheaper
+                                // than threading it through hydrated_* vecs and
+                                // matches the single-call site's shape).
+                                if hydrated_bonds[idx] > 0 {
+                                    BondedClaimAttestedAt::<T>::insert(
+                                        *cid,
+                                        <frame_system::Pallet<T>>::block_number(),
+                                    );
+                                    if let Some(pending) = ClaimSettlementRequests::<T>::get(*cid) {
+                                        BondedClaimRequester::<T>::insert(
+                                            *cid,
+                                            (pending.requester, hydrated_bonds[idx]),
+                                        );
+                                    }
+                                }
+                                ClaimSettlementRequests::<T>::remove(*cid);
+                                if settled_direct {
+                                    direct_count = direct_count.saturating_add(1);
+                                }
+                                total_amount_unsettled =
+                                    total_amount_unsettled.saturating_add(amount);
+                            }
+                            PoolUtilization::<T>::mutate(|u| {
+                                u.outstanding_coverage_ada = u
+                                    .outstanding_coverage_ada
+                                    .saturating_sub(total_amount_unsettled);
+                                u.total_nav_ada =
+                                    u.total_nav_ada.saturating_sub(total_amount_unsettled);
+                            });
+                            Ok((n as u32, direct_count, total_amount_unsettled))
+                        })?;
+
+                    let _ = total_amount; // surface to optional future event field
+                    Self::deposit_event(Event::BatchSettled {
+                        count,
+                        batch_digest: payload,
+                        settled_direct_count,
+                    });
+                    Ok(())
+                },
+            )
         }
 
         // -------------------------------------------------------------
@@ -3973,13 +4162,12 @@ pub mod pallet {
                 Error::<T>::ExpiryEvidenceMismatch
             );
 
-            // Strict idempotency — a pending request for this intent_id
-            // must not exist. Keepers retry with `ExpiryRequestExpired`
-            // not `ExpiryRequestAlreadyExists`.
-            ensure!(
-                !PolicyExpireRequests::<T>::contains_key(intent_id),
-                Error::<T>::ExpiryRequestAlreadyExists
-            );
+            if let Some(previous) = PolicyExpireRequests::<T>::get(intent_id) {
+                ensure!(
+                    Self::request_expired(previous.submitted_block),
+                    Error::<T>::ExpiryRequestAlreadyExists
+                );
+            }
 
             let now = <frame_system::Pallet<T>>::block_number();
             let record = ExpiryRequestRecord::<T::AccountId, BlockNumberFor<T>> {
@@ -4032,134 +4220,134 @@ pub mod pallet {
         /// `IntentExpired{reason=PolicyExpiredOnCardano}` is the canonical
         /// event for indexers.
         #[pallet::call_index(18)]
-        #[pallet::weight((Weight::from_parts(55_000_000, 0), DispatchClass::Operational, Pays::No))]
+        #[pallet::weight((T::WeightInfo::attest_expire_policy()
+            .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
+            DispatchClass::Operational, Pays::No))]
         pub fn attest_expire_policy(
             origin: OriginFor<T>,
             intent_id: IntentId,
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
-        ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            ensure!(
-                T::CommitteeMembership::is_member(&who),
-                Error::<T>::NotCommitteeMember
-            );
-            ensure!(
-                signatures.len() <= T::MaxCommittee::get() as usize,
-                Error::<T>::TooManySignatures
-            );
+        ) -> DispatchResultWithPostInfo {
+            Self::with_signature_weight(T::WeightInfo::attest_expire_policy(), |checked| {
+                let who = ensure_signed(origin)?;
+                ensure!(
+                    T::CommitteeMembership::is_member(&who),
+                    Error::<T>::NotCommitteeMember
+                );
+                ensure!(
+                    signatures.len() <= T::MaxCommittee::get() as usize,
+                    Error::<T>::TooManySignatures
+                );
 
-            // Hydrate the pending request — every attestor signs over a
-            // payload derived from these stored bytes plus chain state.
-            let request = PolicyExpireRequests::<T>::get(intent_id)
-                .ok_or(Error::<T>::ExpiryRequestMissing)?;
+                // Hydrate the pending request — every attestor signs over a
+                // payload derived from these stored bytes plus chain state.
+                let request = PolicyExpireRequests::<T>::get(intent_id)
+                    .ok_or(Error::<T>::ExpiryRequestMissing)?;
 
-            // TTL gate. Expired requests can't be attested; the keeper
-            // must post fresh evidence (a stale observation could be
-            // stale because the Cardano tx got reorged or the attestor
-            // pool was offline too long).
-            let now = <frame_system::Pallet<T>>::block_number();
-            let now_u64: u64 = now.into();
-            let submitted_u64: u64 = request.submitted_block.into();
-            let age = now_u64.saturating_sub(submitted_u64);
-            let ttl_u64: u64 = T::SettlementRequestTtl::get().into();
-            ensure!(age <= ttl_u64, Error::<T>::ExpiryRequestExpired);
+                // TTL gate. Expired requests can't be attested; the keeper
+                // must post fresh evidence (a stale observation could be
+                // stale because the Cardano tx got reorged or the attestor
+                // pool was offline too long).
+                let now = <frame_system::Pallet<T>>::block_number();
+                let now_u64: u64 = now.into();
+                let submitted_u64: u64 = request.submitted_block.into();
+                let age = now_u64.saturating_sub(submitted_u64);
+                let ttl_u64: u64 = T::SettlementRequestTtl::get().into();
+                ensure!(age <= ttl_u64, Error::<T>::ExpiryRequestExpired);
 
-            // Intent hydration. Still needed even though
-            // request_expire_policy already cross-checked — a settle
-            // could race a parallel attest and terminalize the intent
-            // before this call lands.
-            let mut intent =
-                Intents::<T>::get(intent_id).ok_or(Error::<T>::UnknownPolicy)?;
-            // Already-Expired is idempotent — consume the pending request
-            // and return Ok so a sibling caller that posted late doesn't
-            // see a confusing error.
-            if matches!(intent.status, IntentStatus::Expired) {
+                // Intent hydration. Still needed even though
+                // request_expire_policy already cross-checked — a settle
+                // could race a parallel attest and terminalize the intent
+                // before this call lands.
+                let mut intent = Intents::<T>::get(intent_id).ok_or(Error::<T>::UnknownPolicy)?;
+                // Already-Expired is idempotent — consume the pending request
+                // and return Ok so a sibling caller that posted late doesn't
+                // see a confusing error.
+                if matches!(intent.status, IntentStatus::Expired) {
+                    PolicyExpireRequests::<T>::remove(intent_id);
+                    return Ok(());
+                }
+                ensure!(
+                    !matches!(intent.status, IntentStatus::Settled),
+                    Error::<T>::IntentNotEligibleForExpiry
+                );
+
+                // Re-resolve the canonical policy id from the on-chain intent.
+                // We already cross-checked this against the requester's
+                // witness in request_expire_policy, but the digest must
+                // commit to chain state, so we compute it again here.
+                let resolved_policy_id = Self::resolve_intent_policy_id(&intent)?;
+
+                // Build the canonical EXPP payload + run the M-of-N gate.
+                let chain_id = Self::materios_chain_id_bytes();
+                let mc_genesis = T::MainchainGenesisHash::get();
+                let payload = expire_policy_attested_payload(
+                    &chain_id,
+                    &intent_id,
+                    &resolved_policy_id,
+                    &request.evidence.cardano_tx_hash,
+                    request.evidence.observed_at_depth,
+                    request.evidence.observed_slot,
+                    &mc_genesis,
+                );
+                Self::verify_threshold_signatures::<T::SigVerifier>(
+                    &payload,
+                    &who,
+                    &signatures,
+                    checked,
+                )?;
+
+                // All checks pass — expire the intent. State transition +
+                // index cleanup mirror the legacy `expire_policy_mirror`
+                // exactly; the only delta is the trust gate now requires
+                // M-of-N over falsifiable Cardano evidence.
+                intent.status = IntentStatus::Expired;
+                Intents::<T>::insert(intent_id, intent);
+                Self::remove_from_pending_batches(intent_id);
+
+                // Consume the pending request — canonical post-state is
+                // "intent expired, no pending entry."
                 PolicyExpireRequests::<T>::remove(intent_id);
-                return Ok(());
-            }
-            ensure!(
-                !matches!(intent.status, IntentStatus::Settled),
-                Error::<T>::IntentNotEligibleForExpiry
-            );
 
-            // Re-resolve the canonical policy id from the on-chain intent.
-            // We already cross-checked this against the requester's
-            // witness in request_expire_policy, but the digest must
-            // commit to chain state, so we compute it again here.
-            let resolved_policy_id = Self::resolve_intent_policy_id(&intent)?;
-
-            // Build the canonical EXPP payload + run the M-of-N gate.
-            let chain_id = Self::materios_chain_id_bytes();
-            let mc_genesis = T::MainchainGenesisHash::get();
-            let payload = expire_policy_attested_payload(
-                &chain_id,
-                &intent_id,
-                &resolved_policy_id,
-                &request.evidence.cardano_tx_hash,
-                request.evidence.observed_at_depth,
-                request.evidence.observed_slot,
-                &mc_genesis,
-            );
-            Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
-
-            // All checks pass — expire the intent. State transition +
-            // index cleanup mirror the legacy `expire_policy_mirror`
-            // exactly; the only delta is the trust gate now requires
-            // M-of-N over falsifiable Cardano evidence.
-            intent.status = IntentStatus::Expired;
-            Intents::<T>::insert(intent_id, intent);
-            Self::remove_from_pending_batches(intent_id);
-
-            // Consume the pending request — canonical post-state is
-            // "intent expired, no pending entry."
-            PolicyExpireRequests::<T>::remove(intent_id);
-
-            Self::deposit_event(Event::IntentExpired {
-                intent_id,
-                reason: ExpiryReason::PolicyExpiredOnCardano,
-            });
-            Ok(())
+                Self::deposit_event(Event::IntentExpired {
+                    intent_id,
+                    reason: ExpiryReason::PolicyExpiredOnCardano,
+                });
+                Ok(())
+            })
         }
 
         // -------------------------------------------------------------
         // Task #84 (mis-sec P1) — bond + slash on settlement evidence
         //
-        // Three new extrinsics that bolt onto the spec-220 `request_settle`
-        // + `attest_settle` pair. The bond is OPT-IN — the requester
-        // chooses to reserve `amount` of `Config::Currency` via
-        // `post_settlement_bond`. A watcher who proves the requester's
-        // evidence is fraudulent via `slash_bad_settlement_evidence`
-        // earns `SlashWatcherShareBps / 10_000` of the bond; the rest
-        // goes to the treasury. After `BondReleaseDelayBlocks` post-
-        // attestation with no slash, the requester (or any caller)
-        // releases the bond.
-        //
-        // No surface mutation on `request_settle` — the design avoids
-        // bumping `transaction_version` so in-flight keeper txs stay
-        // valid. Same shape as spec-220's B+D split: ADD new
-        // extrinsics, do not mutate old ones.
+        // `request_settle` and `request_batch_settle` reserve the bond with
+        // the request. A watcher who proves the requester's evidence is
+        // fraudulent via `slash_bad_settlement_evidence` earns
+        // `SlashWatcherShareBps / 10_000` of the bond; the rest goes to the
+        // treasury. After attestation plus `BondReleaseDelayBlocks`, or after
+        // an unattested request expires, any caller releases the bond to its
+        // requester. `post_settlement_bond` bonds requests stored before
+        // request-time bonding.
         // -------------------------------------------------------------
 
-        /// Task #84 (mis-sec P1): the requester reserves `amount` of
-        /// `Config::Currency` against an outstanding `request_settle`
-        /// entry. The reserve is enforceable by
-        /// `slash_bad_settlement_evidence` until either
-        /// `release_settlement_bond` returns it (post-attestation,
-        /// post-delay) or a watcher prosecutes the fraud.
+        /// The requester of an unbonded request stored before request-time
+        /// bonding reserves `amount` of `Config::Currency` against it. The
+        /// reserve is slashable until the request is attested or expires.
         ///
         /// Per-call invariants:
+        /// - Pending request must exist (`SettlementRequestMissing`) and be
+        ///   within `SettlementRequestTtl` (`SettlementRequestExpired`), so
+        ///   no bond lands after its slash window has closed.
         /// - Caller must match the request's `requester` field
         ///   (`NotRequester`).
-        /// - Pending request must exist (`SettlementRequestMissing`).
-        /// - `amount >= Config::MinSettlementBond` (`BondBelowMinimum`).
+        /// - `amount` must be positive and at least
+        ///   `Config::MinSettlementBond` (`BondBelowMinimum`).
         /// - Request must not already be bonded
         ///   (`BondAlreadyReserved`).
         /// - Claim must not already be attested (`RequestAlreadyAttested`)
         ///   — bonds MUST be posted before `attest_settle` lands.
-        /// - Claim must not be in `BondSlashedRequests`
-        ///   (`BondSlashedNoRelease`).
         ///
-        /// On success: `Currency::reserve(who, amount)` succeeds,
+        /// On success: `amount` is reserved under `SETTLEMENT_BOND_RESERVE_ID`,
         /// `ClaimSettlementRequests[claim_id].bond_amount` is rewritten
         /// to `amount`, and `SettlementBondPosted` is emitted.
         #[pallet::call_index(19)]
@@ -4171,19 +4359,13 @@ pub mod pallet {
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
 
-            // Slash-tombstone gate — a slashed claim cannot be re-
-            // bonded. The matching `ClaimSettlementRequests` row was
-            // removed by the slash dispatch, so this guard is the
-            // only place we surface the tombstone meaningfully (the
-            // SettlementRequestMissing path below would also fire,
-            // but BondSlashedNoRelease is the more precise error).
-            ensure!(
-                !BondSlashedRequests::<T>::contains_key(claim_id),
-                Error::<T>::BondSlashedNoRelease
-            );
-
             let mut record = ClaimSettlementRequests::<T>::get(claim_id)
                 .ok_or(Error::<T>::SettlementRequestMissing)?;
+
+            ensure!(
+                !Self::request_expired(record.submitted_block),
+                Error::<T>::SettlementRequestExpired
+            );
 
             // Caller-binding: only the original requester can bond
             // their own request. A third party bonding someone else's
@@ -4194,11 +4376,6 @@ pub mod pallet {
             // contemplates a single bond amount per request — re-bonding
             // would either race with a watcher or double-reserve.
             ensure!(record.bond_amount == 0, Error::<T>::BondAlreadyReserved);
-            // Minimum-bond floor.
-            ensure!(
-                amount >= T::MinSettlementBond::get(),
-                Error::<T>::BondBelowMinimum
-            );
             // Bonds MUST land before attest_settle. Once the claim has
             // flipped to settled (and the pending request consumed),
             // the storage map no longer has the entry, so the
@@ -4211,36 +4388,26 @@ pub mod pallet {
                 ensure!(!claim.settled, Error::<T>::RequestAlreadyAttested);
             }
 
-            // Convert u128 → BalanceOf<T>. We use saturating coercion
-            // via `TryInto`; an overflow surfaces as
-            // `BondAmountConversionOverflow` rather than silently
-            // truncating to `Balance::max_value()`.
-            let balance: BalanceOf<T> = amount
-                .try_into()
-                .map_err(|_| Error::<T>::BondAmountConversionOverflow)?;
-
-            T::Currency::reserve(&who, balance)?;
+            Self::reserve_settlement_bond(claim_id, &who, amount)?;
 
             record.bond_amount = amount;
             ClaimSettlementRequests::<T>::insert(claim_id, record);
 
-            Self::deposit_event(Event::SettlementBondPosted {
-                claim_id,
-                requester: who,
-                amount,
-            });
             Ok(())
         }
 
         /// Task #84 (mis-sec P1): the watcher posts a `FraudProof`
         /// against an outstanding `request_settle` entry. M-of-N
-        /// committee signatures over the canonical FRAU digest attest
+        /// committee signatures over the canonical FRV2 digest attest
         /// the watcher's claim is truthful; the reserved bond is split
         /// `SlashWatcherShareBps / 10_000` to the watcher and the rest
         /// to the treasury PalletId-derived account.
         ///
         /// Per-call invariants:
-        /// - Pending request must exist (`SettlementRequestMissing`).
+        /// - Caller must be a committee member (`NotCommitteeMember`),
+        ///   checked before any signature verification.
+        /// - Pending request must exist (`SettlementRequestMissing`) and be
+        ///   within `SettlementRequestTtl` (`SettlementRequestExpired`).
         /// - Pending request must be bonded (`BondNotReserved`).
         /// - `fraud_proof` must be internally consistent with the
         ///   stored evidence (`FraudProofInvalid`) — e.g., a
@@ -4248,198 +4415,205 @@ pub mod pallet {
         ///   `X != stored.amount_lovelace`.
         /// - `signatures` must clear the same M-of-N threshold
         ///   `attest_settle` uses (`FraudThresholdNotMet`).
-        /// - `signatures` must verify against the canonical FRAU
+        /// - `signatures` must verify against the canonical FRV2
         ///   pre-image (`InvalidSignature` — surfaced by
         ///   `ensure_threshold_signatures`).
         /// - Caller binding: the watcher's own pubkey MUST appear in
         ///   the sig bundle (`ensure_threshold_signatures` enforces).
         ///
-        /// On success: the bond is repatriated via
-        /// `Currency::repatriate_reserved` (watcher gets
-        /// `bond * watcher_bps / 10_000`, treasury gets the rest),
-        /// `BondSlashedRequests[claim_id]` is set, the
+        /// On success: the bond moves out of the requester's
+        /// `SETTLEMENT_BOND_RESERVE_ID` reserve (watcher gets
+        /// `bond * watcher_bps / 10_000`, treasury gets the rest, and a
+        /// shortfall in that reserve is reported in
+        /// `SettlementBondReserveDeficit`),
+        /// `SlashedSettlementRequests[claim_id, request_id]` is set, the
         /// `ClaimSettlementRequests` row is removed (so
         /// `attest_settle` errors with `SettlementRequestMissing`),
-        /// and `SettlementBondSlashed` is emitted.
+        /// and `SettlementBondSlashed` is emitted with the amounts moved.
+        /// Any other request for the claim can then be filed and attested.
         #[pallet::call_index(20)]
-        #[pallet::weight((T::WeightInfo::slash_bad_settlement_evidence(), DispatchClass::Operational, Pays::No))]
+        #[pallet::weight((T::WeightInfo::slash_bad_settlement_evidence()
+            .saturating_add(T::WeightInfo::threshold_signatures(signatures.len().min(T::MaxCommittee::get() as usize) as u32)),
+            DispatchClass::Operational, Pays::No))]
         pub fn slash_bad_settlement_evidence(
             origin: OriginFor<T>,
             claim_id: ClaimId,
             fraud_proof: FraudProof,
             signatures: Vec<(CommitteePubkey, CommitteeSig)>,
-        ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            // Cap sigs len BEFORE any verify cycle — same DoS-gate
-            // pattern as `attest_settle` (Task #75).
-            ensure!(
-                signatures.len() <= T::MaxCommittee::get() as usize,
-                Error::<T>::TooManySignatures
-            );
+        ) -> DispatchResultWithPostInfo {
+            Self::with_signature_weight(T::WeightInfo::slash_bad_settlement_evidence(), |checked| {
+                let who = ensure_signed(origin)?;
+                ensure!(
+                    T::CommitteeMembership::is_member(&who),
+                    Error::<T>::NotCommitteeMember
+                );
+                // Cap sigs len BEFORE any verify cycle — same DoS-gate
+                // pattern as `attest_settle` (Task #75).
+                ensure!(
+                    signatures.len() <= T::MaxCommittee::get() as usize,
+                    Error::<T>::TooManySignatures
+                );
 
-            // Threshold pre-check so the watcher gets the explicit
-            // FraudThresholdNotMet rather than the generic
-            // InsufficientSignatures error from ensure_threshold_signatures
-            // — distinct UX for the slash path. We still let
-            // ensure_threshold_signatures do the per-sig verify and the
-            // caller-binding gate.
-            let effective_threshold = {
-                let stored = MinSignerThreshold::<T>::get();
-                let base = if stored == 0 {
-                    T::DefaultMinSignerThreshold::get()
-                } else {
-                    stored
+                // Threshold pre-check so the watcher gets the explicit
+                // FraudThresholdNotMet rather than the generic
+                // InsufficientSignatures error from ensure_threshold_signatures
+                // — distinct UX for the slash path. We still let
+                // ensure_threshold_signatures do the per-sig verify and the
+                // caller-binding gate.
+                let effective_threshold = {
+                    let stored = MinSignerThreshold::<T>::get();
+                    let base = if stored == 0 {
+                        T::DefaultMinSignerThreshold::get()
+                    } else {
+                        stored
+                    };
+                    base.max(1)
                 };
-                base.max(1)
-            };
-            ensure!(
-                signatures.len() as u32 >= effective_threshold,
-                Error::<T>::FraudThresholdNotMet
-            );
+                ensure!(
+                    signatures.len() as u32 >= effective_threshold,
+                    Error::<T>::FraudThresholdNotMet
+                );
 
-            // Hydrate the pending request.
-            let record = ClaimSettlementRequests::<T>::get(claim_id)
-                .ok_or(Error::<T>::SettlementRequestMissing)?;
+                // Hydrate the pending request.
+                let record = ClaimSettlementRequests::<T>::get(claim_id)
+                    .ok_or(Error::<T>::SettlementRequestMissing)?;
 
-            // Bond-presence gate.
-            ensure!(record.bond_amount > 0, Error::<T>::BondNotReserved);
+                ensure!(
+                    !Self::request_expired(record.submitted_block),
+                    Error::<T>::SettlementRequestExpired
+                );
 
-            // Internal-consistency check on the fraud proof. The
-            // canonical contract: `WrongAmount` / `WrongBeneficiary`
-            // must allege a value DIFFERENT from what the requester
-            // committed to (otherwise there's no fraud being alleged).
-            // `TxNotFound` is always internally consistent — the proof
-            // is the absence of the asserted tx_hash on Cardano,
-            // which the committee's M-of-N attests.
-            match fraud_proof {
-                FraudProof::WrongAmount { actual_lovelace } => {
-                    ensure!(
-                        actual_lovelace
-                            != (record.evidence.amount_lovelace as u128),
-                        Error::<T>::FraudProofInvalid
-                    );
+                // Bond-presence gate.
+                ensure!(record.bond_amount > 0, Error::<T>::BondNotReserved);
+
+                // Internal-consistency check on the fraud proof. The
+                // canonical contract: `WrongAmount` / `WrongBeneficiary`
+                // must allege a value DIFFERENT from what the requester
+                // committed to (otherwise there's no fraud being alleged).
+                // `TxNotFound` is always internally consistent — the proof
+                // is the absence of the asserted tx_hash on Cardano,
+                // which the committee's M-of-N attests.
+                match fraud_proof {
+                    FraudProof::WrongAmount { actual_lovelace } => {
+                        ensure!(
+                            actual_lovelace != (record.evidence.amount_lovelace as u128),
+                            Error::<T>::FraudProofInvalid
+                        );
+                    }
+                    FraudProof::WrongBeneficiary {
+                        actual_payment_hash,
+                    } => {
+                        ensure!(
+                            actual_payment_hash != record.evidence.beneficiary_addr_hash,
+                            Error::<T>::FraudProofInvalid
+                        );
+                    }
+                    FraudProof::TxNotFound => { /* always internally consistent */ }
                 }
-                FraudProof::WrongBeneficiary { actual_payment_hash } => {
-                    ensure!(
-                        actual_payment_hash
-                            != record.evidence.beneficiary_addr_hash,
-                        Error::<T>::FraudProofInvalid
-                    );
-                }
-                FraudProof::TxNotFound => { /* always internally consistent */ }
-            }
 
-            // Build the canonical FRAU pre-image and run the M-of-N
-            // gate (caller-binding, distinct-signer, member-only,
-            // per-sig sr25519 verify) — same routine attest_settle
-            // uses.
-            let chain_id = Self::materios_chain_id_bytes();
-            let payload =
-                slash_bad_settlement_evidence_payload(&chain_id, &claim_id, &fraud_proof);
-            Self::ensure_threshold_signatures(&payload, &who, &signatures)?;
+                // Build the canonical FRV2 pre-image and run the M-of-N
+                // gate (caller-binding, distinct-signer, member-only,
+                // per-sig sr25519 verify) — same routine attest_settle
+                // uses.
+                let chain_id = Self::materios_chain_id_bytes();
+                let payload = slash_bad_settlement_evidence_payload(
+                    &chain_id,
+                    &claim_id,
+                    &record,
+                    &fraud_proof,
+                );
+                Self::verify_threshold_signatures::<T::SigVerifier>(
+                    &payload,
+                    &who,
+                    &signatures,
+                    checked,
+                )?;
 
-            // Compute the watcher / treasury split. We clamp the bps
-            // input into `[0, 10_000]` defensively — a misconfigured
-            // runtime that returned 12_000 would otherwise pay the
-            // watcher more than the bond. Clamp keeps the invariant
-            // `watcher_share + treasury_share == bond_amount`.
-            let raw_bps = T::SlashWatcherShareBps::get();
-            let clamped_bps = raw_bps.min(10_000u32);
-            // u128 math throughout — bond_amount is u128 by the type
-            // contract on SettlementRequestRecord.
-            let bond_u128 = record.bond_amount;
-            let watcher_share_u128: u128 = bond_u128
-                .saturating_mul(clamped_bps as u128)
-                / 10_000u128;
-            let treasury_share_u128: u128 = bond_u128
-                .saturating_sub(watcher_share_u128);
+                // Compute the watcher / treasury split. We clamp the bps
+                // input into `[0, 10_000]` defensively — a misconfigured
+                // runtime that returned 12_000 would otherwise pay the
+                // watcher more than the bond. Clamp keeps the invariant
+                // `watcher_share + treasury_share == bond_amount`.
+                let raw_bps = T::SlashWatcherShareBps::get();
+                let clamped_bps = raw_bps.min(10_000u32);
+                // u128 math throughout — bond_amount is u128 by the type
+                // contract on SettlementRequestRecord.
+                let bond_u128 = record.bond_amount;
+                let watcher_share_u128: u128 =
+                    bond_u128.saturating_mul(clamped_bps as u128) / 10_000u128;
+                let treasury_share_u128: u128 = bond_u128.saturating_sub(watcher_share_u128);
 
-            let requester = record.requester.clone();
-            let treasury_account: T::AccountId =
-                T::SettlementTreasuryPalletId::get().into_account_truncating();
+                let requester = record.requester.clone();
+                let treasury_account: T::AccountId =
+                    T::SettlementTreasuryPalletId::get().into_account_truncating();
 
-            // Convert u128 shares → BalanceOf<T>. We try_into both so a
-            // misconfigured runtime fails LOUDLY rather than silently
-            // truncating.
-            let watcher_balance: BalanceOf<T> = watcher_share_u128
-                .try_into()
-                .map_err(|_| Error::<T>::BondAmountConversionOverflow)?;
-            let treasury_balance: BalanceOf<T> = treasury_share_u128
-                .try_into()
-                .map_err(|_| Error::<T>::BondAmountConversionOverflow)?;
+                // Convert u128 shares → BalanceOf<T>. We try_into both so a
+                // misconfigured runtime fails LOUDLY rather than silently
+                // truncating.
+                let watcher_balance: BalanceOf<T> = watcher_share_u128
+                    .try_into()
+                    .map_err(|_| Error::<T>::BondAmountConversionOverflow)?;
+                let treasury_balance: BalanceOf<T> = treasury_share_u128
+                    .try_into()
+                    .map_err(|_| Error::<T>::BondAmountConversionOverflow)?;
 
-            // Atomic phase: repatriate both halves under one storage
-            // layer so a partial slash doesn't leave funds in a
-            // half-reserved state.
-            frame_support::storage::with_storage_layer::<
-                (),
-                sp_runtime::DispatchError,
-                _,
-            >(|| {
-                if !watcher_balance.is_zero() {
-                    T::Currency::repatriate_reserved(
+                // Each share moves only out of the settlement reserve; a
+                // shortfall there is reported, never taken from the
+                // requester's other reserves.
+                let repatriate = |beneficiary: &T::AccountId,
+                                  share: BalanceOf<T>|
+                 -> Result<u128, DispatchError> {
+                    if share.is_zero() {
+                        return Ok(0);
+                    }
+                    let unpaid = T::Currency::repatriate_reserved_named(
+                        &SETTLEMENT_BOND_RESERVE_ID,
                         &requester,
-                        &who,
-                        watcher_balance,
+                        beneficiary,
+                        share,
                         BalanceStatus::Free,
                     )?;
+                    Ok(share.saturating_sub(unpaid).saturated_into())
+                };
+                let watcher_paid = repatriate(&who, watcher_balance)?;
+                let treasury_paid = repatriate(&treasury_account, treasury_balance)?;
+                let missing_amount = bond_u128
+                    .saturating_sub(watcher_paid)
+                    .saturating_sub(treasury_paid);
+                if missing_amount > 0 {
+                    Self::deposit_event(Event::SettlementBondReserveDeficit {
+                        claim_id,
+                        requester: requester.clone(),
+                        missing_amount,
+                    });
                 }
-                if !treasury_balance.is_zero() {
-                    T::Currency::repatriate_reserved(
-                        &requester,
-                        &treasury_account,
-                        treasury_balance,
-                        BalanceStatus::Free,
-                    )?;
-                }
+
+                // Tombstone + cleanup. Removing the pending request makes
+                // attest_settle error with SettlementRequestMissing, which
+                // is the canonical post-state per the design memo.
+                SlashedSettlementRequests::<T>::insert(
+                    claim_id,
+                    settlement_request_id(&record),
+                    (),
+                );
+                ClaimSettlementRequests::<T>::remove(claim_id);
+
+                Self::deposit_event(Event::SettlementBondSlashed {
+                    claim_id,
+                    requester,
+                    watcher: who,
+                    watcher_share: watcher_paid,
+                    treasury_share: treasury_paid,
+                    fraud_proof,
+                });
                 Ok(())
-            })?;
-
-            // Tombstone + cleanup. Removing the pending request makes
-            // attest_settle error with SettlementRequestMissing, which
-            // is the canonical post-state per the design memo.
-            BondSlashedRequests::<T>::insert(claim_id, ());
-            ClaimSettlementRequests::<T>::remove(claim_id);
-
-            Self::deposit_event(Event::SettlementBondSlashed {
-                claim_id,
-                requester,
-                watcher: who,
-                watcher_share: watcher_share_u128,
-                treasury_share: treasury_share_u128,
-                fraud_proof,
-            });
-            Ok(())
+            })
         }
 
-        /// Task #84 (mis-sec P1): release a posted bond. Typically the
-        /// requester calls this themselves; the dispatch is permissionless
-        /// (`ensure_signed` only) so a keeper / explorer can release on
-        /// the requester's behalf if the requester is offline.
-        ///
-        /// Per-call invariants:
-        /// - Claim must have been attested (the
-        ///   `BondedClaimAttestedAt` map carries the per-claim
-        ///   attestation block) — surfaced as `BondNotReserved` if no
-        ///   bond entry was ever pinned.
-        /// - At least `BondReleaseDelayBlocks` Materios blocks must
-        ///   have elapsed since the attest_settle landed
-        ///   (`BondReleaseTooEarly`).
-        /// - Claim must not be in `BondSlashedRequests`
-        ///   (`BondSlashedNoRelease`).
-        ///
-        /// On success: `Currency::unreserve` returns the bond to the
-        /// requester's free balance, the `BondedClaimAttestedAt` slot
-        /// is cleared, and `SettlementBondReleased` is emitted.
-        ///
-        /// Note: we look up the requester from `BondedClaimAttestedAt`
-        /// + the now-removed `ClaimSettlementRequests` — at the point
-        /// we got here, `attest_settle` already ran and consumed the
-        /// pending entry. We persist the requester identity through
-        /// the `Claim`'s `intent_id` indirection or through a
-        /// dedicated `BondedClaimRequester` map. To keep the storage
-        /// surface flat we store the bonded requester + amount in a
-        /// separate map only at attest time when the bond is present.
+        /// Permissionlessly return a bond to its requester after successful
+        /// attestation plus the release delay, or after an unattested request
+        /// expires. Slashing and attestation remain valid at the TTL boundary;
+        /// expiry release begins on the next block.
         #[pallet::call_index(21)]
         #[pallet::weight((T::WeightInfo::release_settlement_bond(), DispatchClass::Operational, Pays::Yes))]
         pub fn release_settlement_bond(
@@ -4447,20 +4621,19 @@ pub mod pallet {
             claim_id: ClaimId,
         ) -> DispatchResult {
             let _caller = ensure_signed(origin)?;
-            // Slashed tombstone gate.
-            ensure!(
-                !BondSlashedRequests::<T>::contains_key(claim_id),
-                Error::<T>::BondSlashedNoRelease
-            );
-            // Resolve the attested-at block. Absence means EITHER the
-            // request was never bonded OR it was bonded but never
-            // attested OR the bond was already released. The first two
-            // cases are caller bugs (post bond + attest first); the
-            // third case is idempotency. We surface BondNotReserved
-            // uniformly — the caller can read storage to discriminate
-            // if needed.
-            let attested_at = BondedClaimAttestedAt::<T>::get(claim_id)
-                .ok_or(Error::<T>::BondNotReserved)?;
+            let attested_at = match BondedClaimAttestedAt::<T>::get(claim_id) {
+                Some(block) => block,
+                None => {
+                    let request = ClaimSettlementRequests::<T>::get(claim_id)
+                        .ok_or(Error::<T>::BondNotReserved)?;
+                    ensure!(request.bond_amount > 0, Error::<T>::BondNotReserved);
+                    ensure!(
+                        Self::request_expired(request.submitted_block),
+                        Error::<T>::BondReleaseTooEarly
+                    );
+                    return Self::remove_expired_settlement_request(claim_id);
+                }
+            };
 
             // The pending `ClaimSettlementRequests` entry has been
             // consumed by `attest_settle`, so we keep a side-record of
@@ -4478,26 +4651,7 @@ pub mod pallet {
             let delay_u64: u64 = T::BondReleaseDelayBlocks::get().into();
             ensure!(elapsed >= delay_u64, Error::<T>::BondReleaseTooEarly);
 
-            // Convert + unreserve. `unreserve` returns the *remainder*
-            // (i.e., 0 means full success), but we ignore that — the
-            // contract is "return everything we reserved." A nonzero
-            // remainder would mean the chain saw a slash via some other
-            // path (impossible in our pallet design; defensive only).
-            let balance: BalanceOf<T> = bond_amount
-                .try_into()
-                .map_err(|_| Error::<T>::BondAmountConversionOverflow)?;
-            let _remainder = T::Currency::unreserve(&requester, balance);
-
-            // Cleanup so a second call surfaces BondNotReserved (idempotency).
-            BondedClaimAttestedAt::<T>::remove(claim_id);
-            BondedClaimRequester::<T>::remove(claim_id);
-
-            Self::deposit_event(Event::SettlementBondReleased {
-                claim_id,
-                requester,
-                amount: bond_amount,
-            });
-            Ok(())
+            Self::refund_settlement_bond(claim_id, requester, bond_amount)
         }
     }
 
@@ -4748,15 +4902,16 @@ pub mod pallet {
         /// hard-rejects with `Error::DeprecatedExtrinsic` so old keepers
         /// cannot ride the trust-vacuous path past the audit fix.
         ///
-        /// `StcaCutoverBlock = 0` is the "not yet scheduled" sentinel — both
-        /// paths remain open while the migration hasn't run. The migration
-        /// stamps `frame_system::block_number + 50` on first invocation, so
-        /// the cutover is automatic once the runtime upgrade includes this
-        /// pallet's spec-N migration.
+        /// A zero cutover is closed once storage version 1 is present,
+        /// including fresh genesis. Older versions retain the migration's
+        /// grace window; nonzero cutovers are inclusive.
         pub fn ensure_legacy_settle_path_open() -> DispatchResult {
             let cutover = StcaCutoverBlock::<T>::get();
-            // Zero sentinel = migration hasn't run yet; legacy still open.
             if cutover == BlockNumberFor::<T>::default() {
+                ensure!(
+                    SettlementStorageVersion::<T>::get() < 1,
+                    Error::<T>::DeprecatedExtrinsic
+                );
                 return Ok(());
             }
             let now = <frame_system::Pallet<T>>::block_number();
@@ -4775,6 +4930,10 @@ pub mod pallet {
         pub fn ensure_legacy_expire_path_open() -> DispatchResult {
             let cutover = PolicyExpireCutoverBlock::<T>::get();
             if cutover == BlockNumberFor::<T>::default() {
+                ensure!(
+                    SettlementStorageVersion::<T>::get() < 2,
+                    Error::<T>::DeprecatedExtrinsic
+                );
                 return Ok(());
             }
             let now = <frame_system::Pallet<T>>::block_number();
@@ -4826,20 +4985,24 @@ pub mod pallet {
         /// (`who`) itself MUST appear as one of the signers — this binds the
         /// on-chain origin to the multisig bundle so a stale bundle can't be
         /// replayed by a non-signing member.
-        ///
-        /// Task #174: visibility lifted to `pub` so the sibling
-        /// `settle_batch_atomic` extrinsic (#177) and any future M-of-N call
-        /// in the pallet share one verification routine. The function is
-        /// intentionally NOT hoisted into a separate `sig_verify.rs` module
-        /// because it depends on `T::CommitteeMembership`, `T::SigVerifier`,
-        /// and the pallet-internal `MinSignerThreshold` storage — extracting
-        /// it would only move the call surface, not the dependency graph,
-        /// while creating a merge-conflict footprint for #177.
         pub fn ensure_threshold_signatures(
             payload: &[u8; 32],
             who: &T::AccountId,
             signatures: &[(CommitteePubkey, CommitteeSig)],
         ) -> DispatchResult {
+            Self::verify_threshold_signatures::<T::SigVerifier>(payload, who, signatures, &mut 0)
+        }
+
+        pub(crate) fn verify_threshold_signatures<V: VerifyCommitteeSignature>(
+            payload: &[u8; 32],
+            who: &T::AccountId,
+            signatures: &[(CommitteePubkey, CommitteeSig)],
+            checked: &mut u32,
+        ) -> DispatchResult {
+            ensure!(
+                signatures.len() <= T::MaxCommittee::get() as usize,
+                Error::<T>::TooManySignatures
+            );
             let effective_threshold = {
                 let stored = MinSignerThreshold::<T>::get();
                 let base = if stored == 0 {
@@ -4861,36 +5024,225 @@ pub mod pallet {
 
             let mut seen: alloc::vec::Vec<CommitteePubkey> =
                 alloc::vec::Vec::with_capacity(signatures.len());
-            let mut caller_present = false;
-            for (pubkey, sig) in signatures.iter() {
-                // Duplicate-signer check (Issue #7: prevent "2-of-2 by one
-                // caller pasting the same sig twice").
+            ensure!(
+                signatures.iter().any(|(key, _)| key == &caller_pubkey),
+                Error::<T>::InsufficientSignatures
+            );
+            // Every entry passes the duplicate and membership checks before
+            // any signature is verified. `checked` counts scanned entries and
+            // each is charged a full signature, which covers its scan and its
+            // verification whichever check fails.
+            for (pubkey, _) in signatures.iter() {
+                *checked = checked.saturating_add(1);
                 ensure!(!seen.contains(pubkey), Error::<T>::DuplicateSigner);
-                // Every signer must be a current committee member.
                 let account = T::CommitteeMembership::account_of_pubkey(pubkey)
                     .ok_or(Error::<T>::SignerNotCommitteeMember)?;
                 ensure!(
                     T::CommitteeMembership::is_member(&account),
                     Error::<T>::SignerNotCommitteeMember
                 );
-                // sr25519 verify via T::SigVerifier (pluggable so tests can
-                // swap in a deterministic stub — see `MockSigVerifier` in
-                // tests.rs). Signatures in prod are sr25519 per spec §3.1.
-                if !T::SigVerifier::verify(pubkey, sig, payload) {
-                    return Err(Error::<T>::InvalidSignature.into());
-                }
-                if pubkey == &caller_pubkey {
-                    caller_present = true;
-                }
                 seen.push(*pubkey);
             }
-            ensure!(caller_present, Error::<T>::InsufficientSignatures);
+            for (pubkey, sig) in signatures.iter() {
+                ensure!(
+                    V::verify(pubkey, sig, payload),
+                    Error::<T>::InvalidSignature
+                );
+            }
+            Ok(())
+        }
 
-            // Effective count of distinct signers must meet the threshold.
+        fn with_signature_weight(
+            base: Weight,
+            dispatch: impl FnOnce(&mut u32) -> DispatchResult,
+        ) -> DispatchResultWithPostInfo {
+            use frame_support::dispatch::WithPostDispatchInfo;
+            let mut checked = 0;
+            let result = dispatch(&mut checked);
+            let actual = base.saturating_add(T::WeightInfo::threshold_signatures(checked));
+            result
+                .map(|()| Some(actual).into())
+                .map_err(|error| error.with_weight(actual))
+        }
+
+        #[cfg(feature = "try-runtime")]
+        fn settlement_storage_digest() -> [u8; 32] {
+            use frame_support::traits::PalletInfoAccess;
+            let prefix = Self::name_hash();
+            let mut digest = [0u8; 32];
+            let mut key = prefix.to_vec();
+            while let Some(next) =
+                sp_io::storage::next_key(&key).filter(|next| next.starts_with(&prefix))
+            {
+                let value = sp_io::storage::get(&next).map(|value| value.to_vec());
+                digest = sp_io::hashing::blake2_256(&(digest, &next, value).encode());
+                key = next;
+            }
+            digest
+        }
+
+        fn request_expired(submitted: BlockNumberFor<T>) -> bool {
+            let now: u64 = frame_system::Pallet::<T>::block_number().into();
+            let submitted: u64 = submitted.into();
+            let ttl: u64 = T::SettlementRequestTtl::get().into();
+            now.saturating_sub(submitted) > ttl
+        }
+
+        fn remove_expired_settlement_request(claim_id: ClaimId) -> DispatchResult {
+            if let Some(request) = ClaimSettlementRequests::<T>::get(claim_id) {
+                ensure!(
+                    Self::request_expired(request.submitted_block),
+                    Error::<T>::SettlementRequestAlreadyExists
+                );
+                Self::discard_settlement_request(claim_id, request)?;
+            }
+            Ok(())
+        }
+
+        /// Removes an unattested request and refunds its bond.
+        fn discard_settlement_request(
+            claim_id: ClaimId,
+            request: SettlementRequestRecord<T::AccountId, BlockNumberFor<T>>,
+        ) -> DispatchResult {
+            if request.bond_amount > 0 {
+                Self::refund_settlement_bond(claim_id, request.requester, request.bond_amount)?;
+            }
+            ClaimSettlementRequests::<T>::remove(claim_id);
+            Ok(())
+        }
+
+        /// Checks evidence for a claim the way every request and supersede
+        /// does, returning the claim and its voucher.
+        fn checked_settlement_target(
+            claim_id: ClaimId,
+            evidence: &SettlementEvidence,
+        ) -> Result<(Claim, Voucher), DispatchError> {
             ensure!(
-                seen.len() as u32 >= effective_threshold,
-                Error::<T>::InsufficientSignatures
+                evidence.mainchain_genesis_hash == T::MainchainGenesisHash::get(),
+                Error::<T>::WrongMainchainGenesis
             );
+            ensure!(
+                evidence.observed_at_depth >= T::MinFinalityDepth::get(),
+                Error::<T>::FinalityDepthBelowMinimum
+            );
+            ensure!(
+                evidence.observed_at_depth <= MAX_OBSERVED_DEPTH,
+                Error::<T>::FinalityDepthAboveMaximum
+            );
+            let claim = Claims::<T>::get(claim_id).ok_or(Error::<T>::ClaimNotFound)?;
+            ensure!(!claim.settled, Error::<T>::AlreadySettled);
+            let voucher = Vouchers::<T>::get(claim_id).ok_or(Error::<T>::VoucherMissing)?;
+            ensure!(
+                evidence.amount_lovelace == voucher.amount_ada,
+                Error::<T>::SettlementEvidenceMismatch
+            );
+            let (payment_hash, _stake_hash) =
+                crate::voucher_canonicalize::split_type0_address_bytes(
+                    voucher.beneficiary_cardano_addr.as_slice(),
+                )
+                .map_err(|_| Error::<T>::InvalidBeneficiaryAddress)?;
+            ensure!(
+                evidence.beneficiary_addr_hash == payment_hash,
+                Error::<T>::SettlementEvidenceMismatch
+            );
+            Ok((claim, voucher))
+        }
+
+        /// Marks an attested claim settled, retires its intent and releases
+        /// its pool coverage.
+        fn settle_attested_claim(
+            claim_id: ClaimId,
+            mut claim: Claim,
+            cardano_tx_hash: [u8; 32],
+            settled_direct: bool,
+        ) {
+            claim.settled = true;
+            claim.settled_direct = settled_direct;
+            claim.cardano_tx_hash = cardano_tx_hash;
+            let intent_id = claim.intent_id;
+            let amount = claim.amount_ada;
+            Claims::<T>::insert(claim_id, claim);
+            if let Some(mut intent) = Intents::<T>::get(intent_id) {
+                intent.status = IntentStatus::Settled;
+                Intents::<T>::insert(intent_id, intent);
+            }
+            Self::remove_from_pending_batches(intent_id);
+            PoolUtilization::<T>::mutate(|u| {
+                u.outstanding_coverage_ada = u.outstanding_coverage_ada.saturating_sub(amount);
+                u.total_nav_ada = u.total_nav_ada.saturating_sub(amount);
+            });
+            Self::deposit_event(Event::ClaimSettled {
+                claim_id,
+                cardano_tx_hash,
+                settled_direct,
+            });
+        }
+
+        /// Replaces an expired request, refuses a request instance that was
+        /// already slashed, and reserves the new request's bond.
+        fn store_settlement_request(
+            claim_id: ClaimId,
+            record: SettlementRequestRecord<T::AccountId, BlockNumberFor<T>>,
+        ) -> DispatchResult {
+            Self::remove_expired_settlement_request(claim_id)?;
+            ensure!(
+                !SlashedSettlementRequests::<T>::contains_key(
+                    claim_id,
+                    settlement_request_id(&record)
+                ),
+                Error::<T>::BondSlashedNoRelease
+            );
+            Self::reserve_settlement_bond(claim_id, &record.requester, record.bond_amount)?;
+            ClaimSettlementRequests::<T>::insert(claim_id, record);
+            Ok(())
+        }
+
+        fn reserve_settlement_bond(
+            claim_id: ClaimId,
+            requester: &T::AccountId,
+            amount: u128,
+        ) -> DispatchResult {
+            ensure!(
+                amount > 0 && amount >= T::MinSettlementBond::get(),
+                Error::<T>::BondBelowMinimum
+            );
+            let balance: BalanceOf<T> = amount
+                .try_into()
+                .map_err(|_| Error::<T>::BondAmountConversionOverflow)?;
+            T::Currency::reserve_named(&SETTLEMENT_BOND_RESERVE_ID, requester, balance)?;
+            Self::deposit_event(Event::SettlementBondPosted {
+                claim_id,
+                requester: requester.clone(),
+                amount,
+            });
+            Ok(())
+        }
+
+        fn refund_settlement_bond(
+            claim_id: ClaimId,
+            requester: T::AccountId,
+            bond_amount: u128,
+        ) -> DispatchResult {
+            let balance: BalanceOf<T> = bond_amount
+                .try_into()
+                .map_err(|_| Error::<T>::BondAmountConversionOverflow)?;
+            let missing_amount: u128 =
+                T::Currency::unreserve_named(&SETTLEMENT_BOND_RESERVE_ID, &requester, balance)
+                    .saturated_into();
+            if missing_amount > 0 {
+                Self::deposit_event(Event::SettlementBondReserveDeficit {
+                    claim_id,
+                    requester: requester.clone(),
+                    missing_amount,
+                });
+            }
+            BondedClaimAttestedAt::<T>::remove(claim_id);
+            BondedClaimRequester::<T>::remove(claim_id);
+            Self::deposit_event(Event::SettlementBondReleased {
+                claim_id,
+                requester,
+                amount: bond_amount.saturating_sub(missing_amount),
+            });
             Ok(())
         }
 

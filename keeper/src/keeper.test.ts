@@ -12,23 +12,30 @@ import { KeeperStateStore } from "./state.js";
 import type { ICardanoProvider, SubmittedTx } from "./cardano.js";
 import type {
   BatchPayload,
+  ClaimId,
   KeeperConfig,
   Voucher,
   BatchFairnessProof,
   HexString,
   CommitteePubkey,
+  SettlementEvidence,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
 import {
+  DispatchFailedError,
+  TransactionRejectedError,
   intentId as computeIntentId,
   voucherDigestWithAddress,
   encodeType0AddressCbor,
   splitType0AddressBytes,
+  settleClaimAttestedPayload,
   signPayload,
 } from "@fluxpointstudios/materios-intent-settlement-sdk";
+import { FakeSettlementChain } from "../tests/support/fake-settlement-chain.js";
+import type { StcaPayload } from "../tests/support/fake-settlement-chain.js";
 import { hexToU8a, u8aToHex } from "@polkadot/util";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { computePlutusV3ScriptHash } from "./script-hash.js";
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -175,12 +182,46 @@ function makeValidBfpr(): BatchFairnessProof {
   };
 }
 
-function fakeRpc(overrides: Record<string, any> = {}) {
+/** The STCA payload the pallet rebuilds for `voucher`'s claim. */
+function stcaFor(voucher: Voucher): StcaPayload {
+  const voucherDigest = voucherDigestWithAddress({
+    claimId: voucher.claimId,
+    policyId: voucher.policyId,
+    beneficiaryAddressCbor: encodeType0AddressCbor(
+      splitType0AddressBytes(voucher.beneficiaryCardanoAddr as Uint8Array),
+    ),
+    amountAda: voucher.amountAda,
+    batchFairnessProofDigest: voucher.batchFairnessProofDigest,
+    issuedBlock: voucher.issuedBlock,
+    expirySlotCardano: voucher.expirySlotCardano,
+    materiosChainId: TEST_CHAIN_ID,
+    networkMagic: TEST_NETWORK_MAGIC,
+    aegisPolicyV1ScriptHash: TEST_AEGIS_SCRIPT_HASH,
+    settlementVersion: TEST_SETTLEMENT_VERSION,
+  });
+  return (claimId, evidence, settledDirect) =>
+    settleClaimAttestedPayload({
+      materiosChainId: TEST_CHAIN_ID,
+      claimId,
+      voucherDigest,
+      cardanoTxHash: evidence.cardano_tx_hash,
+      settledDirect,
+      beneficiaryAddrHash: evidence.beneficiary_addr_hash,
+      amountLovelace: evidence.amount_lovelace,
+      observedAtDepth: evidence.observed_at_depth,
+      observedSlot: evidence.observed_slot,
+      mainchainGenesisHash: evidence.mainchain_genesis_hash,
+    });
+}
+
+/** Mock RPC whose settlement calls run against `chain`. */
+function fakeRpc(overrides: Record<string, any> = {}, chain = new FakeSettlementChain(("0x" + "00".repeat(32)) as HexString, () => new Uint8Array())) {
+  const settlement = chain.rpc();
   return {
+    ...settlement,
+    submitExtrinsic: vi.fn(settlement.submitExtrinsic),
     getPendingBatches: vi.fn().mockResolvedValue([]),
     getVoucher: vi.fn().mockResolvedValue(null),
-    getLatestBlockNumber: vi.fn().mockResolvedValue(200),
-    submitExtrinsic: vi.fn().mockResolvedValue({ txHash: "0x" + "aa".repeat(32), blockHash: null }),
     // Default committee state used by Task #76b voucher-sig verification.
     // Tests that need a specific membership snapshot override this.
     getCommitteeState: vi.fn().mockResolvedValue({
@@ -239,6 +280,62 @@ const baseConfig: KeeperConfig = {
   minFinalityDepth: 15,
 };
 
+const CARDANO_TX = ("0x" + "cd".repeat(32)) as HexString;
+const UNFUNDED_ALERT = "keeper account cannot pay for settlement; top up the keeper account";
+const ATTACKER = ("0x" + "e1".repeat(32)) as HexString;
+
+/** A batch, its signed voucher and a keeper settling against a fake chain. */
+function settlementHarness(
+  tmpDir: string,
+  nonce: number,
+  options: { cardano?: ICardanoProvider; batchesOnce?: boolean } = {},
+) {
+  const batch = makeBatch(nonce);
+  const { voucher, pubkeys } = makeSignedVoucher(batch.intentId as unknown as HexString);
+  const claimId = batch.intentId as unknown as ClaimId;
+  const keeperKey = pubkeys[0] as unknown as HexString;
+  const chain = new FakeSettlementChain(keeperKey, stcaFor(voucher));
+  const rpc = fakeRpc(
+    {
+      getPendingBatches: options.batchesOnce
+        ? vi.fn().mockResolvedValueOnce([batch]).mockResolvedValue([])
+        : vi.fn().mockResolvedValue([batch]),
+      getVoucher: vi.fn().mockResolvedValue(voucher),
+    },
+    chain,
+  );
+  const statePath = path.join(tmpDir, `st-${nonce}.json`);
+  const state = new KeeperStateStore(statePath);
+  const logs: Array<{ level: string; msg: string }> = [];
+  const cardano = options.cardano ?? fakeCardano();
+  const keeperWith = (store: KeeperStateStore) =>
+    new Keeper(baseConfig, {
+      rpc: rpc as any,
+      cardano,
+      state: store,
+      keeperCardanoAddr: "addr_test1keeper",
+      policyScriptCbor: PLACEHOLDER_CBOR,
+      fetchFairnessProof: async () => makeValidBfpr(),
+      fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
+      logger: (level, msg) => logs.push({ level, msg }),
+    });
+  const keeper = keeperWith(state);
+  /** A fresh keeper process over whatever the state file holds. */
+  const restart = async () => keeperWith(await KeeperStateStore.load(statePath));
+  /** The evidence the keeper derives for its confirmed payout. */
+  const honest: SettlementEvidence = {
+    cardano_tx_hash: CARDANO_TX,
+    observed_at_depth: 150,
+    observed_slot: 1_000_000n,
+    beneficiary_addr_hash: ("0x" + "ab".repeat(28)) as HexString,
+    amount_lovelace: voucher.amountAda,
+    mainchain_genesis_hash: baseConfig.mainchainGenesisHash,
+  };
+  const methods = () => chain.calls.map((call) => (call.failure ? `${call.method}:${call.failure}` : call.method));
+  const submission = () => state.snapshot.submissions[claimId];
+  return { batch, voucher, claimId, keeperKey, chain, rpc, state, statePath, keeper, restart, logs, honest, methods, submission };
+}
+
 describe("Keeper.runOnce — happy path", () => {
   let tmpDir: string;
 
@@ -246,73 +343,325 @@ describe("Keeper.runOnce — happy path", () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "keeper-"));
   });
 
-  it("observes → submits → confirms → settles an attested+vouchered batch", async () => {
-    const batch = makeBatch(1);
-    const { voucher, pubkeys } = makeSignedVoucher(
-      batch.intentId as unknown as HexString,
+  it.each([500n, 0n])(
+    "settles on chain, then releases its bond of max(MinSettlementBond %s, 1) after the hold",
+    async (minimumBond) => {
+      const h = settlementHarness(tmpDir, 1);
+      h.chain.constants.minSettlementBond = minimumBond;
+      const bond = minimumBond || 1n;
+
+      expect((await h.keeper.runOnce()).batchesSubmitted).toBe(1);
+      const settled = await h.keeper.runOnce();
+
+      expect(settled.batchesSettled).toBe(1);
+      expect(h.chain.settled.has(h.claimId)).toBe(true);
+      expect(h.state.isAlreadySettled(h.claimId)).not.toBeNull();
+      expect(h.methods()).toEqual(["requestSettle", "attestSettle"]);
+      const [, , requestArgs] = h.rpc.submitExtrinsic.mock.calls[0]!;
+      expect(requestArgs).toEqual([h.claimId, CARDANO_TX, false, h.honest, bond]);
+      expect(h.chain.reservedBalance(h.keeperKey)).toBe(bond);
+
+      await h.keeper.runOnce();
+      expect(h.methods()).toEqual(["requestSettle", "attestSettle"]);
+
+      h.chain.block += h.chain.constants.bondReleaseDelayBlocks;
+      const released = await h.keeper.runOnce();
+      expect(h.methods()).toEqual(["requestSettle", "attestSettle", "releaseSettlementBond"]);
+      expect(released.bondsReleased).toBe(1);
+      expect(h.chain.reservedBalance(h.keeperKey)).toBe(0n);
+      expect(h.chain.freeBalance(h.keeperKey)).toBe(10_000n);
+      expect(h.state.trackedBonds()).toEqual([]);
+    },
+  );
+});
+
+describe("Keeper settlement against chain state", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "keeper-"));
+  });
+
+  it("supersedes an unattestable request that front-ran it", async () => {
+    const h = settlementHarness(tmpDir, 21);
+    h.chain.fund(ATTACKER, 500n);
+    h.chain.fileRequest(ATTACKER, h.claimId, { ...h.honest, observed_slot: 999n }, 500n);
+
+    await h.keeper.runOnce();
+    await h.keeper.runOnce();
+
+    expect(h.methods()).toEqual(["supersedeSettlementRequest"]);
+    expect(h.chain.settled.has(h.claimId)).toBe(true);
+    expect(h.state.isAlreadySettled(h.claimId)).not.toBeNull();
+    expect(h.chain.reservedBalance(ATTACKER)).toBe(0n);
+    expect(h.chain.freeBalance(ATTACKER)).toBe(500n);
+    expect(h.chain.reservedBalance(h.keeperKey)).toBe(0n);
+  });
+
+  it("waits out requests it cannot supersede or attest alone, then releases its bond", async () => {
+    const h = settlementHarness(tmpDir, 22);
+    h.chain.threshold = 2;
+    h.chain.fund(ATTACKER, 500n);
+    h.chain.fileRequest(ATTACKER, h.claimId, { ...h.honest, observed_at_depth: 2_160 }, 500n);
+    const expiry = h.chain.block + h.chain.constants.settlementRequestTtl + 1;
+
+    await h.keeper.runOnce();
+    await h.keeper.runOnce();
+    expect(h.methods()).toEqual(["supersedeSettlementRequest:InsufficientSignatures"]);
+    expect(h.state.snapshot.submissions[h.claimId]?.retryAtBlock).toBe(expiry);
+    expect(h.state.isAlreadySettled(h.claimId)).toBeNull();
+
+    await h.keeper.runOnce();
+    expect(h.methods()).toHaveLength(1);
+
+    h.chain.block = expiry;
+    await h.keeper.runOnce();
+    expect(h.methods().slice(1)).toEqual(["requestSettle", "attestSettle:InsufficientSignatures"]);
+    expect(h.chain.reservedBalance(ATTACKER)).toBe(0n);
+    expect(h.chain.reservedBalance(h.keeperKey)).toBe(500n);
+    expect(h.state.snapshot.submissions[h.claimId]?.retryAtBlock).toBe(
+      expiry + h.chain.constants.settlementRequestTtl + 1,
     );
-    const rpc = fakeRpc({
-      getPendingBatches: vi.fn().mockResolvedValue([batch]),
-      getVoucher: vi.fn().mockResolvedValue(voucher),
+
+    await h.keeper.runOnce();
+    expect(h.methods()).toHaveLength(3);
+    expect(h.state.isAlreadySettled(h.claimId)).toBeNull();
+
+    h.chain.attestAsCommittee(h.claimId);
+    await h.keeper.runOnce();
+    expect(h.methods()).toHaveLength(3);
+    expect(h.state.isAlreadySettled(h.claimId)).not.toBeNull();
+
+    h.chain.block += h.chain.constants.bondReleaseDelayBlocks;
+    await h.keeper.runOnce();
+    expect(h.methods().slice(3)).toEqual(["releaseSettlementBond"]);
+    expect(h.chain.reservedBalance(h.keeperKey)).toBe(0n);
+  });
+
+  it("attests a matching request filed by another keeper instead of filing its own", async () => {
+    const h = settlementHarness(tmpDir, 23);
+    const otherKeeper = ("0x" + "e2".repeat(32)) as HexString;
+    h.chain.fund(otherKeeper, 500n);
+    h.chain.fileRequest(otherKeeper, h.claimId, { ...h.honest, observed_at_depth: 100 }, 500n);
+
+    await h.keeper.runOnce();
+    await h.keeper.runOnce();
+
+    expect(h.methods()).toEqual(["attestSettle"]);
+    expect(h.state.isAlreadySettled(h.claimId)).not.toBeNull();
+    expect(h.chain.attested.get(h.claimId)?.requester).toBe(otherKeeper);
+    expect(h.state.trackedBonds()).toEqual([]);
+  });
+
+  it("alerts and keeps the claim open when it cannot fund the bond", async () => {
+    const h = settlementHarness(tmpDir, 24);
+    h.chain.fund(h.keeperKey, -10_000n);
+
+    const metrics = await h.keeper.runOnce();
+
+    expect(h.methods()).toEqual(["requestSettle:InsufficientBalance"]);
+    expect(metrics.settleDispatchFailures).toBe(1);
+    expect(h.state.isAlreadySettled(h.claimId)).toBeNull();
+    expect(h.logs).toContainEqual({ level: "error", msg: UNFUNDED_ALERT });
+
+    h.chain.fund(h.keeperKey, 10_000n);
+    h.chain.block = h.submission()!.retryAtBlock!;
+    await h.keeper.runOnce();
+    expect(h.state.isAlreadySettled(h.claimId)).not.toBeNull();
+  });
+
+  it("alerts when the pool rejects the filing for an unpaid fee, and backs off", async () => {
+    const h = settlementHarness(tmpDir, 33);
+    h.chain.beforeSubmit = (method) => {
+      if (method === "requestSettle") {
+        throw new TransactionRejectedError(
+          "intentSettlement.requestSettle",
+          1010,
+          "Invalid Transaction: Inability to pay some fees , e.g. account balance too low",
+        );
+      }
+    };
+
+    await h.keeper.runOnce();
+
+    expect(h.methods()).toEqual(["requestSettle:Rejected:1010"]);
+    expect(h.logs).toContainEqual({ level: "error", msg: UNFUNDED_ALERT });
+    expect(h.submission()).toMatchObject({ state: "submitted", retryAtBlock: h.chain.block + 10 });
+    await h.keeper.runOnce();
+    expect(h.methods()).toHaveLength(1);
+  });
+
+  it("backs off exponentially after failed filings instead of paying a fee every tick", async () => {
+    const h = settlementHarness(tmpDir, 32);
+    h.chain.beforeSubmit = (method) => {
+      if (method === "requestSettle") {
+        throw new DispatchFailedError(
+          "intentSettlement.requestSettle",
+          "intentSettlement",
+          "WrongMainchainGenesis",
+          ("0x" + "bb".repeat(32)) as HexString,
+        );
+      }
+    };
+    const start = h.chain.block;
+
+    await h.keeper.runOnce();
+    await h.keeper.runOnce();
+    expect(h.methods()).toEqual(["requestSettle:WrongMainchainGenesis"]);
+    expect(h.submission()?.retryAtBlock).toBe(start + 10);
+
+    h.chain.block = start + 10;
+    await h.keeper.runOnce();
+    expect(h.methods()).toHaveLength(2);
+    expect(h.submission()?.retryAtBlock).toBe(start + 30);
+
+    h.chain.beforeSubmit = () => {};
+    h.chain.block = start + 30;
+    await h.keeper.runOnce();
+    expect(h.state.isAlreadySettled(h.claimId)).not.toBeNull();
+  });
+
+  it("defers a payout shallower than the runtime's MinFinalityDepth", async () => {
+    const h = settlementHarness(tmpDir, 34);
+    h.chain.constants.minFinalityDepth = 200;
+
+    await h.keeper.runOnce();
+    expect(h.methods()).toEqual([]);
+
+    h.chain.constants.minFinalityDepth = 15;
+    await h.keeper.runOnce();
+    expect(h.state.isAlreadySettled(h.claimId)).not.toBeNull();
+  });
+
+  it("marks a claim settled only once its settlement is finalized", async () => {
+    const h = settlementHarness(tmpDir, 29);
+    h.chain.finalityLag = 2;
+
+    await h.keeper.runOnce();
+    await h.keeper.runOnce();
+    expect(h.methods()).toEqual(["requestSettle", "attestSettle"]);
+    expect(h.state.isAlreadySettled(h.claimId)).toBeNull();
+
+    h.chain.block += 2;
+    await h.keeper.runOnce();
+    expect(h.methods()).toHaveLength(2);
+    expect(h.state.isAlreadySettled(h.claimId)).not.toBeNull();
+  });
+
+  it("persists bond tracking before filing and releases a bond whose filing outcome was lost", async () => {
+    const h = settlementHarness(tmpDir, 30);
+    let trackedOnDisk: string[] = [];
+    h.chain.beforeSubmit = (method) => {
+      if (method === "requestSettle") {
+        trackedOnDisk = Object.keys(JSON.parse(readFileSync(h.statePath, "utf-8")).heldBonds ?? {});
+      }
+    };
+    h.chain.afterInclusion = (method) => {
+      if (method === "requestSettle") throw new Error("WebSocket closed after broadcast");
+    };
+
+    await h.keeper.runOnce();
+    expect(trackedOnDisk).toEqual([h.claimId]);
+    expect(h.methods()).toEqual(["requestSettle"]);
+
+    h.chain.afterInclusion = () => {};
+    await h.keeper.runOnce();
+    expect(h.methods()).toEqual(["requestSettle", "attestSettle"]);
+    h.chain.block += h.chain.constants.bondReleaseDelayBlocks;
+    await h.keeper.runOnce();
+    expect(h.methods().at(-1)).toBe("releaseSettlementBond");
+    expect(h.chain.reservedBalance(h.keeperKey)).toBe(0n);
+  });
+
+  it("after a restart, releases a bond it holds on chain but no longer tracks", async () => {
+    const h = settlementHarness(tmpDir, 31);
+    await h.keeper.runOnce();
+    expect(h.chain.reservedBalance(h.keeperKey)).toBe(500n);
+    const written = JSON.parse(readFileSync(h.statePath, "utf-8"));
+    delete written.heldBonds;
+    await fs.writeFile(h.statePath, JSON.stringify(written));
+
+    const restarted = await h.restart();
+    h.chain.block += h.chain.constants.bondReleaseDelayBlocks;
+    await restarted.runOnce();
+
+    expect(h.methods()).toEqual(["requestSettle", "attestSettle", "releaseSettlementBond"]);
+    expect(h.chain.reservedBalance(h.keeperKey)).toBe(0n);
+  });
+
+  it("claims at most the runtime's MaxObservedDepth", async () => {
+    const h = settlementHarness(tmpDir, 27);
+    h.chain.constants.maxObservedDepth = 100;
+
+    await h.keeper.runOnce();
+
+    expect(h.methods()).toEqual(["requestSettle", "attestSettle"]);
+    expect((h.chain.calls[0]!.args[3] as SettlementEvidence).observed_at_depth).toBe(100);
+    expect(h.state.isAlreadySettled(h.claimId)).not.toBeNull();
+  });
+
+  it("keeps ticking and persisting when the bond sweep cannot read the runtime", async () => {
+    const h = settlementHarness(tmpDir, 28);
+    await h.keeper.runOnce();
+    expect(h.state.trackedBonds()).toEqual([h.claimId]);
+    h.rpc.getSettlementConstants = () => {
+      throw new Error("runtime lacks intentSettlement.bondReleaseDelayBlocks");
+    };
+
+    await expect(h.keeper.runOnce()).resolves.toBeDefined();
+
+    expect(h.logs).toContainEqual({ level: "error", msg: "bond release sweep failed" });
+    expect(h.state.trackedBonds()).toEqual([h.claimId]);
+  });
+
+  it("records a claim settled by someone else without submitting", async () => {
+    const isConfirmed = vi
+      .fn()
+      .mockResolvedValueOnce({ confirmed: false, currentSlot: 1_000_010n, txSlot: 1_000_000n })
+      .mockResolvedValue({ confirmed: true, currentSlot: 1_003_000n, txSlot: 1_000_000n });
+    const h = settlementHarness(tmpDir, 25, { cardano: fakeCardano({ isConfirmed }) });
+
+    await h.keeper.runOnce();
+    h.chain.settle(h.claimId);
+    await h.keeper.runOnce();
+
+    expect(h.methods()).toEqual([]);
+    expect(h.state.isAlreadySettled(h.claimId)).not.toBeNull();
+  });
+
+  it("keeps a confirmed payout through provider errors and files when the blocking request expires", async () => {
+    const isConfirmed = vi
+      .fn()
+      .mockResolvedValueOnce({ confirmed: true, currentSlot: 1_003_000n, txSlot: 1_000_000n })
+      .mockRejectedValueOnce(new Error("kupo timeout"))
+      .mockResolvedValue({ confirmed: false, currentSlot: 1_003_000n, txSlot: null });
+    const h = settlementHarness(tmpDir, 26, {
+      cardano: fakeCardano({ isConfirmed }),
+      batchesOnce: true,
     });
-    const cardano = fakeCardano();
-    const state = new KeeperStateStore(path.join(tmpDir, "st.json"));
+    h.chain.threshold = 2;
+    h.chain.fund(ATTACKER, 500n);
+    h.chain.fileRequest(ATTACKER, h.claimId, { ...h.honest, observed_slot: 999n }, 500n);
+    const expiry = h.chain.block + h.chain.constants.settlementRequestTtl + 1;
 
-    const keeper = new Keeper(baseConfig, {
-      rpc: rpc as any,
-      cardano,
-      state,
-      keeperCardanoAddr: "addr_test1keeper",
-      policyScriptCbor: PLACEHOLDER_CBOR,
-      fetchFairnessProof: async () => makeValidBfpr(),
-      fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
-      logger: () => {},
-    });
+    await h.keeper.runOnce();
+    await h.keeper.runOnce();
+    await h.keeper.runOnce();
+    expect(h.methods()).toEqual(["supersedeSettlementRequest:InsufficientSignatures"]);
+    expect(isConfirmed).toHaveBeenCalledTimes(1);
+    expect(h.submission()).toMatchObject({ state: "submitted", cardanoTxHash: CARDANO_TX });
 
-    const metricsFirst = await keeper.runOnce();
-    expect(metricsFirst.batchesObserved).toBe(1);
-    expect(metricsFirst.batchesSubmitted).toBe(1);
+    h.chain.block = expiry;
+    await h.keeper.runOnce();
+    expect(h.submission()).toMatchObject({ state: "submitted", cardanoTxHash: CARDANO_TX });
+    expect(h.logs).toContainEqual({ level: "warn", msg: "Cardano confirmation check failed" });
 
-    // Second iteration — the submission should be reconciled to settled.
-    const metricsSecond = await keeper.runOnce();
-    expect(metricsSecond.batchesConfirmed).toBeGreaterThanOrEqual(1);
-    expect(metricsSecond.batchesSettled).toBeGreaterThanOrEqual(1);
-
-    // Task #266 (mis-sec P0): keeper now fires the attested-settle pair
-    // (request_settle + attest_settle) in place of the legacy settle_claim.
-    // Both extrinsics MUST land in order for the claim to flip to settled.
-    const requestCall = rpc.submitExtrinsic.mock.calls.find(
-      (c) => c[0] === "intentSettlement" && c[1] === "requestSettle",
-    );
-    expect(requestCall).toBeDefined();
-    const [, , reqArgs] = requestCall!;
-    expect(reqArgs).toHaveLength(4);
-    // reqArgs[2] = settled_direct boolean — M=1 keeper path is always
-    // false; settled_direct=true is reserved for the 10-min direct-path
-    // fallback (spec §5.7), not the keeper-batch path.
-    expect(reqArgs[2]).toBe(false);
-    // reqArgs[3] = SettlementEvidence object with all six pinned fields.
-    const evidence = reqArgs[3] as Record<string, unknown>;
-    expect(evidence).toHaveProperty("cardano_tx_hash");
-    expect(evidence).toHaveProperty("observed_at_depth");
-    expect(evidence).toHaveProperty("observed_slot");
-    expect(evidence).toHaveProperty("beneficiary_addr_hash");
-    expect(evidence).toHaveProperty("amount_lovelace");
-    expect(evidence).toHaveProperty("mainchain_genesis_hash");
-
-    const attestCall = rpc.submitExtrinsic.mock.calls.find(
-      (c) => c[0] === "intentSettlement" && c[1] === "attestSettle",
-    );
-    expect(attestCall).toBeDefined();
-    const [, , attestArgs] = attestCall!;
-    expect(attestArgs).toHaveLength(2);
-    // attestArgs[1] = M-of-N signature bundle. M=1 in the keeper interim.
-    const signatures = attestArgs[1] as Array<[string, string]>;
-    expect(Array.isArray(signatures)).toBe(true);
-    expect(signatures).toHaveLength(1);
-    const [pubkey, sig] = signatures[0]!;
-    expect(pubkey).toMatch(/^0x[0-9a-f]{64}$/);
-    expect(sig).toMatch(/^0x[0-9a-f]{128}$/);
+    await h.keeper.runOnce();
+    expect(h.methods().slice(1)).toEqual(["requestSettle", "attestSettle:InsufficientSignatures"]);
+    expect(h.chain.requests.get(h.claimId)?.evidence.observed_slot).toBe(1_000_000n);
+    expect(h.chain.reservedBalance(ATTACKER)).toBe(0n);
+    expect(h.submission()).toMatchObject({ state: "submitted", cardanoTxHash: CARDANO_TX });
+    expect(h.state.trackedBonds()).toEqual([h.claimId]);
   });
 });
 
@@ -321,6 +670,38 @@ describe("Keeper.runOnce — failure modes", () => {
 
   beforeEach(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "keeper-"));
+  });
+
+  it("files no settlement request when the runtime lacks a settlement constant", async () => {
+    const batch = makeBatch(1);
+    const { voucher, pubkeys } = makeSignedVoucher(
+      batch.intentId as unknown as HexString,
+    );
+    const rpc = fakeRpc({
+      getSettlementConstants: () => {
+        throw new Error("runtime lacks intentSettlement.minSettlementBond");
+      },
+      getPendingBatches: vi.fn().mockResolvedValue([batch]),
+      getVoucher: vi.fn().mockResolvedValue(voucher),
+    });
+    const state = new KeeperStateStore(path.join(tmpDir, "st.json"));
+    const keeper = new Keeper(baseConfig, {
+      rpc: rpc as any,
+      cardano: fakeCardano(),
+      state,
+      keeperCardanoAddr: "addr_test1keeper",
+      policyScriptCbor: PLACEHOLDER_CBOR,
+      fetchFairnessProof: async () => makeValidBfpr(),
+      fetchCommitteeSnapshot: async () => ({ members: pubkeys, threshold: 1 }),
+      logger: () => {},
+    });
+
+    await keeper.runOnce();
+    const metrics = await keeper.runOnce();
+
+    expect(metrics.batchesSettled).toBe(0);
+    expect(rpc.submitExtrinsic.mock.calls.some((c) => c[1] === "requestSettle")).toBe(false);
+    expect(state.snapshot.settledClaims).toEqual({});
   });
 
   it("double-submit idempotency: already-settled claim is skipped", async () => {

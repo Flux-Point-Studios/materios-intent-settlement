@@ -88,12 +88,12 @@ pub const TAG_CMTT: &[u8; 4] = b"CMTT";
 /// Task #84 (mis-sec P1): domain tag for the `slash_bad_settlement_evidence`
 /// committee-signed payload. The watcher posts a `FraudProof` against an
 /// existing `ClaimSettlementRequests` entry and the M-of-N committee bundle
-/// signs over the canonical FRAU digest binding the chain-id, the claim_id,
-/// and the SCALE-encoded fraud_proof. Domain-separated from
+/// signs over the canonical FRV2 digest binding the chain-id, claim_id,
+/// request identity and SCALE-encoded fraud_proof. Domain-separated from
 /// STCL/STCA/EXPP/STBA/BSTA/ABIN/RVBN/SBIN/CRDP/RVCH/INTA so a sig produced
 /// for any other pallet payload can never replay onto a slash dispatch and
 /// vice versa.
-pub const TAG_FRAU: &[u8; 4] = b"FRAU";
+pub const TAG_FRV2: &[u8; 4] = b"FRV2";
 
 /// Domain-tagged Blake2b-256 hash.
 ///
@@ -454,14 +454,14 @@ pub struct SettlementRequestRecord<AccountId, BlockNumber> {
     /// rejects attest_settle calls older than `Config::SettlementRequestTtl`
     /// blocks via `SettlementRequestExpired`.
     pub submitted_block: BlockNumber,
-    /// Task #84 (mis-sec P1): optional bond amount reserved by the requester
-    /// via `post_settlement_bond`. Zero means "no bond posted" — pre-#84
-    /// behaviour. Nonzero means the requester has reserved this many units
-    /// of `Config::Currency` against this claim; a successful
+    /// Bond reserved by the requester together with the request. Zero
+    /// appears only in records stored before request-time bonding, which
+    /// `post_settlement_bond` can bond until their TTL expires. A nonzero
+    /// bond is held in reserve in `Config::Currency`; a successful
     /// `slash_bad_settlement_evidence` repatriates `SlashWatcherShareBps` of
     /// it to the watcher and the rest to the treasury PalletId.
-    /// `release_settlement_bond` returns it to the requester after
-    /// `BondReleaseDelayBlocks` post-attestation.
+    /// Returned after `BondReleaseDelayBlocks` post-attestation, or when an
+    /// unattested request expires and is released or replaced.
     ///
     /// Field is LAST so adding it is an additive SCALE migration — old
     /// 4-field records decode with `bond_amount: 0` after the v2→v3
@@ -472,7 +472,7 @@ pub struct SettlementRequestRecord<AccountId, BlockNumber> {
 /// Task #84 (mis-sec P1): falsifiable claim that the requester-posted
 /// `SettlementEvidence` is fraudulent. The watcher passes one of these
 /// variants to `slash_bad_settlement_evidence`; the M-of-N committee bundle
-/// over the canonical FRAU digest attests that the watcher's claim is
+/// over the canonical FRV2 digest attests that the watcher's claim is
 /// truthful (i.e., the committee independently observed Cardano and confirms
 /// the requester lied). The pallet *also* cross-checks the proof against the
 /// stored evidence so a watcher cannot post a "fraud proof" whose alleged

@@ -71,6 +71,7 @@ function makeChainSim(opts: { signAcceptDelayMs: number }) {
                     asInBlock: { toHex: () => "0x" + "11".repeat(32) },
                   },
                   isError: false,
+                  events: [{ event: { section: "system", method: "ExtrinsicSuccess", data: [] } }],
                 }),
               5,
             );
@@ -192,6 +193,7 @@ describe("submitExtrinsic nonce race fix (Task #77)", () => {
                       asInBlock: { toHex: () => "0x" + "11".repeat(32) },
                     },
                     isError: false,
+                    events: [{ event: { section: "system", method: "ExtrinsicSuccess", data: [] } }],
                   }),
                 5,
               );

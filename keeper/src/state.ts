@@ -13,6 +13,8 @@ export interface KeeperPersistedState {
   submissions: Record<ClaimId, KeeperSubmission>;
   // Dedup per §5.6: (claim_id, cardano_tx_hash) idempotency key.
   settledClaims: Record<ClaimId, HexString>;
+  /** Claims where the keeper may hold a settlement bond awaiting release. */
+  heldBonds: Record<ClaimId, true>;
   lastSeenCardanoSlot: bigint | null;
   updatedAt: string;
 }
@@ -22,6 +24,7 @@ function emptyState(): KeeperPersistedState {
     cursor: 0,
     submissions: {},
     settledClaims: {},
+    heldBonds: {},
     lastSeenCardanoSlot: null,
     updatedAt: new Date().toISOString(),
   };
@@ -41,12 +44,12 @@ export class KeeperStateStore {
     try {
       const raw = await fs.readFile(filepath, "utf-8");
       const parsed = JSON.parse(raw, (key, value) => {
-        if (key === "lastSeenCardanoSlot" && typeof value === "string") {
+        if ((key === "lastSeenCardanoSlot" || key === "confirmedTxSlot") && typeof value === "string") {
           return BigInt(value);
         }
         return value;
       }) as KeeperPersistedState;
-      return new KeeperStateStore(filepath, parsed);
+      return new KeeperStateStore(filepath, { ...parsed, heldBonds: parsed.heldBonds ?? {} });
     } catch (err: any) {
       if (err.code === "ENOENT") {
         return new KeeperStateStore(filepath);
@@ -112,6 +115,23 @@ export class KeeperStateStore {
 
   isAlreadySettled(claimId: ClaimId): HexString | null {
     return this.state.settledClaims[claimId] ?? null;
+  }
+
+  trackBond(claimId: ClaimId): void {
+    this.state.heldBonds[claimId] = true;
+  }
+
+  untrackBond(claimId: ClaimId): void {
+    delete this.state.heldBonds[claimId];
+  }
+
+  trackedBonds(): ClaimId[] {
+    return Object.keys(this.state.heldBonds) as ClaimId[];
+  }
+
+  /** Every claim with a submission or a settlement record. */
+  knownClaims(): ClaimId[] {
+    return [...new Set([...Object.keys(this.state.submissions), ...Object.keys(this.state.settledClaims)])] as ClaimId[];
   }
 
   setCursor(block: BlockNumber): void {
