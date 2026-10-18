@@ -6,7 +6,7 @@
  */
 
 import { signatureVerify } from "@polkadot/util-crypto";
-import { DispatchFailedError } from "@fluxpointstudios/materios-intent-settlement-sdk";
+import { DispatchFailedError, TransactionRejectedError } from "@fluxpointstudios/materios-intent-settlement-sdk";
 import type {
   AttestedBond,
   ClaimId,
@@ -32,9 +32,17 @@ export class FakeSettlementChain {
     settlementRequestTtl: 2400,
     bondReleaseDelayBlocks: 30,
     maxObservedDepth: 2160,
+    minFinalityDepth: 15,
   };
+  /** Blocks between inclusion and finality. */
+  finalityLag = 0;
+  /** Runs before each submission; may throw to fail it or record a side effect. */
+  beforeSubmit: (method: string) => void = () => {};
+  /** Runs after a submission was included; may throw to lose its outcome. */
+  afterInclusion: (method: string) => void = () => {};
   readonly committee = new Set<HexString>();
   readonly settled = new Set<ClaimId>();
+  private readonly settledAt = new Map<ClaimId, number>();
   readonly requests = new Map<ClaimId, SettlementRequestView>();
   readonly attested = new Map<ClaimId, AttestedBond>();
   readonly calls: Array<{ method: string; args: unknown[]; failure?: string }> = [];
@@ -81,7 +89,7 @@ export class FakeSettlementChain {
       this.attested.set(claimId, { requester: request.requester, amount: request.bondAmount, attestedAt: this.block });
     }
     this.requests.delete(claimId);
-    this.settled.add(claimId);
+    this.settle(claimId);
   }
 
   /** The RPC surface the keeper uses, minus batch and voucher lookups. */
@@ -89,21 +97,26 @@ export class FakeSettlementChain {
     return {
       getLatestBlockNumber: async () => this.block,
       getSettlementRequest: async (claimId: ClaimId) => this.requests.get(claimId) ?? null,
-      isClaimSettled: async (claimId: ClaimId) => this.settled.has(claimId),
+      claimSettlement: async (claimId: ClaimId) => ({
+        best: this.settled.has(claimId),
+        finalized: this.settled.has(claimId) && this.settledAt.get(claimId)! <= this.block - this.finalityLag,
+      }),
       getAttestedBond: async (claimId: ClaimId) => this.attested.get(claimId) ?? null,
       getSettlementConstants: () => this.constants,
       getApi: () => ({ consts: { intentSettlement: { minSettlementBond: this.constants.minSettlementBond } } }),
       getSigner: () => ({ publicKey: hexToBytes(this.signer) }),
       submitExtrinsic: async (section: string, method: string, args: unknown[]) => {
         try {
+          this.beforeSubmit(method);
           this.dispatch(method, args);
           this.calls.push({ method, args });
         } catch (failure) {
-          if (failure instanceof DispatchFailedError) {
-            this.calls.push({ method, args, failure: failure.error });
+          if (failure instanceof DispatchFailedError || failure instanceof TransactionRejectedError) {
+            this.calls.push({ method, args, failure: failure instanceof DispatchFailedError ? failure.error : `Rejected:${failure.code}` });
           }
           throw failure;
         }
+        this.afterInclusion(method);
         return { txHash: ("0x" + "aa".repeat(32)) as HexString, blockHash: ("0x" + "bb".repeat(32)) as HexString };
       },
     };
@@ -144,7 +157,7 @@ export class FakeSettlementChain {
           });
         }
         this.requests.delete(claimId);
-        this.settled.add(claimId);
+        this.settle(claimId);
         return;
       }
       case "supersedeSettlementRequest": {
@@ -162,7 +175,7 @@ export class FakeSettlementChain {
         this.ensureSigned(claimId, evidence, settledDirect, signatures);
         this.unreserve(request!.requester, request!.bondAmount);
         this.requests.delete(claimId);
-        this.settled.add(claimId);
+        this.settle(claimId);
         return;
       }
       case "releaseSettlementBond": {
@@ -184,6 +197,12 @@ export class FakeSettlementChain {
       default:
         throw new Error(`fake chain has no ${method}`);
     }
+  }
+
+  /** Records `claimId` settled at the current block, as any settling call does. */
+  settle(claimId: ClaimId): void {
+    this.settled.add(claimId);
+    this.settledAt.set(claimId, this.block);
   }
 
   private expired(request: SettlementRequestView): boolean {

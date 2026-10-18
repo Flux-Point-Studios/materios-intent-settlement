@@ -73,6 +73,11 @@ export interface SubmittedTx {
 
 export interface ICardanoProvider {
   submitTx(txCborHex: HexString): Promise<SubmittedTx>;
+  /**
+   * `txSlot` is null when the provider found no such transaction. A provider
+   * that cannot answer rejects instead, so callers never mistake an outage
+   * for a rolled-back payout.
+   */
   isConfirmed(
     txHash: HexString,
     confirmationDepthSlots: number,
@@ -133,20 +138,18 @@ export async function createMeshCardanoProvider(
       const slot = await getCurrentSlot();
       return { txHash, submittedAtSlot: slot };
     },
+    // A provider error rejects; only a lookup that succeeds and finds no
+    // outputs reports the transaction missing (txSlot null).
     async isConfirmed(txHash, depth) {
       const current = await getCurrentSlot();
-      try {
-        const utxos = await provider.fetchUTxOs(txHash);
-        if (!utxos || utxos.length === 0) {
-          return { confirmed: false, currentSlot: current, txSlot: null };
-        }
-        const first = utxos[0];
-        const txSlot = BigInt(first?.output?.slotNo ?? first?.slot ?? 0);
-        const confirmed = current - txSlot >= BigInt(depth);
-        return { confirmed, currentSlot: current, txSlot };
-      } catch {
+      const utxos = await provider.fetchUTxOs(txHash);
+      if (!utxos || utxos.length === 0) {
         return { confirmed: false, currentSlot: current, txSlot: null };
       }
+      const first = utxos[0];
+      const txSlot = BigInt(first?.output?.slotNo ?? first?.slot ?? 0);
+      const confirmed = current - txSlot >= BigInt(depth);
+      return { confirmed, currentSlot: current, txSlot };
     },
     getCurrentSlot,
     getLatestBlockTimestamp,

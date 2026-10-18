@@ -44,7 +44,7 @@ export class KeeperStateStore {
     try {
       const raw = await fs.readFile(filepath, "utf-8");
       const parsed = JSON.parse(raw, (key, value) => {
-        if (key === "lastSeenCardanoSlot" && typeof value === "string") {
+        if ((key === "lastSeenCardanoSlot" || key === "confirmedTxSlot") && typeof value === "string") {
           return BigInt(value);
         }
         return value;
@@ -127,6 +127,11 @@ export class KeeperStateStore {
 
   trackedBonds(): ClaimId[] {
     return Object.keys(this.state.heldBonds) as ClaimId[];
+  }
+
+  /** Every claim with a submission or a settlement record. */
+  knownClaims(): ClaimId[] {
+    return [...new Set([...Object.keys(this.state.submissions), ...Object.keys(this.state.settledClaims)])] as ClaimId[];
   }
 
   setCursor(block: BlockNumber): void {

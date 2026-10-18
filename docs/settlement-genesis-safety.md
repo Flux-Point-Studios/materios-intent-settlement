@@ -12,18 +12,36 @@ refunds of replaced requests. Keepers read the exposed runtime constant and
 submit `max(MinSettlementBond, 1)`.
 
 The reference keeper acts on chain state, not on its own submissions. The SDK
-rejects an included extrinsic whose dispatch failed with `DispatchFailedError`,
-naming the module error. The keeper marks a claim settled only when
-`Claims[claim].settled` is true on chain. For a confirmed payout it files a
-request when none is pending (or the pending one expired), attests a pending
-request that records the same payout, and supersedes any other pending
-request. When its single signature cannot clear the threshold for a supersede
-or an attestation, it stops submitting for that claim until the request
-expires and only checks whether the committee settled it. A bond reserve
-failure is logged as an error naming the unfunded keeper account and leaves the
-claim open. The keeper tracks every claim it bonded and releases the bond once
-`BondReleaseDelayBlocks` have passed after attestation, or once its own request
-expired for a payout it is no longer settling.
+rejects every outcome it cannot prove: a failed dispatch (including the inner
+call of a utility, sudo or proxy wrapper) with `DispatchFailedError`, an
+inclusion whose events are unreadable or lack `ExtrinsicSuccess`, or no
+inclusion within the timeout, with `ExtrinsicOutcomeUnknownError`, and a pool
+refusal such as `1010` with `TransactionRejectedError`. The keeper marks a
+claim settled only when `Claims[claim].settled` is true at the finalized head;
+while a settlement is in the best chain but not final it submits nothing more.
+
+Once a payout is confirmed on Cardano, its slot is stored and never cleared:
+a later lookup that fails or misses it is a provider gap, not a rollback. The
+Cardano provider rejects on a provider error and reports a transaction missing
+only when the lookup succeeds and finds nothing. For a confirmed payout the
+keeper files a request when none is pending (or the pending one expired),
+attests a pending request that records the same payout, and supersedes any
+other pending request. When its single signature cannot clear the threshold
+for a supersede or an attestation, it stops submitting and checking Cardano
+for that claim until the request expires, and only checks whether the
+committee settled it. Any other failed submission backs off 10 blocks,
+doubling per consecutive failure up to the request TTL. A bond reserve failure
+or an unpaid-fee rejection is logged as an error naming the unfunded keeper
+account. Evidence must reach both the keeper's configured and the runtime's
+`MinFinalityDepth`.
+
+Every claim the keeper bonds is recorded on disk before the request is filed.
+A fresh keeper process queues every claim in its state file for the bond
+sweep, so bonds survive a crash or a lost submission outcome. The sweep
+releases each keeper bond once `BondReleaseDelayBlocks` have passed after
+attestation, or once the keeper's own request expired for a payout it is no
+longer settling, and stops tracking claims where the chain holds no keeper
+bond.
 
 A request is fresh while `now - submitted_block <= SettlementRequestTtl`.
 Attestation and slashing use that inclusive boundary. On the next block, an
@@ -50,7 +68,11 @@ far-future slot. Such a request can never be attested either, and its
 requester could renew it each TTL. `supersede_settlement_request` closes every
 such shape: the committee supplies its own evidence with M-of-N STCA
 signatures, the same digest `attest_settle` verifies for a request carrying
-that evidence. The evidence passes every `request_settle` check. Any pending
+that evidence. Something must assemble those signatures. Today only the
+reference keeper submits supersedes, alone, so the wedge is closed only while
+`MinSignerThreshold` is 1 and the keeper account is a committee member; at
+M > 1 the committee attestors need a supersede driver, and until then the
+keeper waits for the junk to expire and re-files. The evidence passes every `request_settle` check. Any pending
 request whose evidence or settlement mode differs is removed, its bond is
 refunded rather than slashed (it may be honest but unattestable), and the
 claim settles in the same call. A pending request that already carries the

@@ -196,6 +196,8 @@ describe("E2E happy path — intent → attest → batch → submit → settle",
         mainchainGenesisHash: evidence.mainchain_genesis_hash,
       }),
     );
+    // fakeCardano confirms 200 slots (about 10 blocks) after the payout.
+    chain.constants.minFinalityDepth = 3;
     let keeperPolls = 0;
     const makeRpc = (label: "daemon" | "keeper") => ({
       ...chain.rpc(),

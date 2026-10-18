@@ -1,4 +1,17 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+vi.mock("@meshsdk/core", () => ({
+  KupmiosProvider: class {
+    async fetchProtocolTip() {
+      return { slot: 5_000 };
+    }
+    async fetchUTxOs(txHash: string) {
+      if (txHash === "0xunreachable") throw new Error("kupo timeout");
+      if (txHash === "0xmissing") return [];
+      return [{ output: { slotNo: 4_000 } }];
+    }
+  },
+}));
 import { buildBatchTx, createMeshCardanoProvider } from "./cardano.js";
 import type { Voucher, BatchFairnessProof, HexString } from "@fluxpointstudios/materios-intent-settlement-sdk";
 import { computeKeeperFeeLovelace } from "@fluxpointstudios/materios-intent-settlement-sdk";
@@ -138,5 +151,27 @@ describe("buildBatchTx validity range enforcement (Team B round-2 strict equalit
         validityRange: { lowerBound: 99n, upperBound: 99n },
       }),
     ).rejects.toThrow(/!= current slot/);
+  });
+});
+
+describe("createMeshCardanoProvider.isConfirmed", () => {
+  it("rejects on a provider error rather than reporting the payout missing", async () => {
+    const provider = await createMeshCardanoProvider({
+      network: "preprod",
+      ogmiosUrl: "ws://stub",
+      kupoUrl: "http://stub",
+    });
+
+    await expect(provider.isConfirmed("0xunreachable" as HexString, 10)).rejects.toThrow("kupo timeout");
+    await expect(provider.isConfirmed("0xmissing" as HexString, 10)).resolves.toEqual({
+      confirmed: false,
+      currentSlot: 5_000n,
+      txSlot: null,
+    });
+    await expect(provider.isConfirmed("0xfound" as HexString, 10)).resolves.toEqual({
+      confirmed: true,
+      currentSlot: 5_000n,
+      txSlot: 4_000n,
+    });
   });
 });

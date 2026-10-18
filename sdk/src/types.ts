@@ -151,6 +151,10 @@ export interface KeeperSubmission {
   lastError?: string;
   /** Materios block before which the keeper does not retry settling. */
   retryAtBlock?: BlockNumber;
+  /** Cardano slot of the payout once confirmed; never cleared by a later miss. */
+  confirmedTxSlot?: SlotNumber;
+  /** Consecutive failed settlement submissions, for the retry backoff. */
+  settleFailures?: number;
 }
 
 /** Config knobs for the keeper. */

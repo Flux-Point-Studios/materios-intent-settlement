@@ -11,6 +11,7 @@
 import {
   DispatchFailedError,
   MateriosRpcClient,
+  TransactionRejectedError,
   buildSigBundle,
   computeKeeperFeeLovelace,
   encodeType0AddressCbor,
@@ -111,6 +112,8 @@ export class Keeper {
 
   private halt: HaltState = initialHaltState();
   private stopSignal = false;
+  /** Whether this process has queued every known claim for the bond sweep. */
+  private bondsReconciled = false;
   /**
    * Cached committee snapshot for voucher-sig verification (Task #76b).
    * Refreshed at the top of every `runOnce` so committee rotations are
@@ -189,7 +192,13 @@ export class Keeper {
     const tip = await this.deps.rpc.getLatestBlockNumber().catch(() => cursor);
     this.deps.state.setCursor(tip);
 
-    // (4) settle confirmed payouts on Materios, then return releasable bonds
+    // (4) settle confirmed payouts on Materios, then return releasable bonds.
+    // A fresh process first queues every claim it knows for the bond sweep,
+    // which keeps only those where the chain still holds a keeper bond.
+    if (!this.bondsReconciled) {
+      for (const claimId of this.deps.state.knownClaims()) this.deps.state.trackBond(claimId);
+      this.bondsReconciled = true;
+    }
     await this.reconcileInflight(tip);
     await this.releaseBonds(tip).catch((err: unknown) => {
       this.log("error", "bond release sweep failed", err);
@@ -433,41 +442,38 @@ export class Keeper {
     const subs = Object.values(this.deps.state.snapshot.submissions);
     for (const sub of subs) {
       if (sub.state !== "submitted" || !sub.cardanoTxHash) continue;
-      const conf = await this.deps.cardano
-        .isConfirmed(sub.cardanoTxHash, this.config.confirmationDepthSlots)
-        .catch(() => null);
-      if (!conf) continue;
-      if (conf.txSlot === null && sub.state === "submitted") {
-        // Possible rollback: the tx disappeared. Reset to "observed" so we re-submit.
-        this.metrics.orphanRollbacks += 1;
-        this.deps.state.updateSubmission(sub.claimId, {
-          state: "observed",
-          cardanoTxHash: null,
-          lastError: "orphaned",
-        });
-        continue;
-      }
-      if (!conf.confirmed) continue;
-
-      this.metrics.batchesConfirmed += 1;
       try {
         if (sub.retryAtBlock !== undefined && tip < sub.retryAtBlock) {
-          if (await this.deps.rpc.isClaimSettled(sub.claimId)) {
-            this.deps.state.markSettled(sub.claimId, sub.cardanoTxHash);
-            this.metrics.batchesSettled += 1;
-          }
+          await this.markIfFinalized(sub.claimId, sub.cardanoTxHash);
           continue;
         }
-        const settled = await this.settleOnMaterios(
-          sub.claimId,
-          sub.cardanoTxHash,
-          conf.txSlot,
-          conf.currentSlot,
-          tip,
-        );
-        if (settled) {
-          this.deps.state.markSettled(sub.claimId, sub.cardanoTxHash);
-          this.metrics.batchesSettled += 1;
+        const conf = await this.deps.cardano
+          .isConfirmed(sub.cardanoTxHash, this.config.confirmationDepthSlots)
+          .catch((err: unknown) => {
+            this.log("warn", "Cardano confirmation check failed", { claimId: sub.claimId, err });
+            return null;
+          });
+        if (!conf) continue;
+        // A payout confirmed once stays confirmed: a later miss is a provider
+        // gap, not a rollback, so only an unconfirmed payout can be orphaned.
+        let txSlot = sub.confirmedTxSlot;
+        if (txSlot === undefined) {
+          if (conf.txSlot === null) {
+            this.metrics.orphanRollbacks += 1;
+            this.deps.state.updateSubmission(sub.claimId, {
+              state: "observed",
+              cardanoTxHash: null,
+              lastError: "orphaned",
+            });
+            continue;
+          }
+          if (!conf.confirmed) continue;
+          txSlot = conf.txSlot;
+          this.deps.state.updateSubmission(sub.claimId, { confirmedTxSlot: txSlot });
+          this.metrics.batchesConfirmed += 1;
+        }
+        if (await this.settleOnMaterios(sub.claimId, sub.cardanoTxHash, txSlot, conf.currentSlot, tip)) {
+          await this.markIfFinalized(sub.claimId, sub.cardanoTxHash);
         }
       } catch (err) {
         this.log("error", "attested settle pipeline failed", { claimId: sub.claimId, err });
@@ -476,21 +482,30 @@ export class Keeper {
   }
 
   /**
-   * One settlement step for a confirmed payout; returns whether the claim
-   * is settled on chain afterwards.
+   * Marks the claim settled once its settlement is final on Materios, and
+   * queues it for the bond sweep in case the keeper's bond was attested.
+   */
+  private async markIfFinalized(claimId: ClaimId, cardanoTxHash: HexString): Promise<void> {
+    if (!(await this.deps.rpc.claimSettlement(claimId)).finalized) return;
+    this.deps.state.trackBond(claimId);
+    this.deps.state.markSettled(claimId, cardanoTxHash);
+    this.metrics.batchesSettled += 1;
+  }
+
+  /**
+   * One settlement step for a confirmed payout. Returns whether the claim is
+   * settled at the best block afterwards; it is marked settled locally only
+   * once final. A claim settled but not yet final gets no submission.
    */
   private async settleOnMaterios(
     claimId: ClaimId,
     cardanoTxHash: HexString,
-    txSlot: bigint | null,
+    txSlot: bigint,
     currentSlot: bigint,
     tip: BlockNumber,
   ): Promise<boolean> {
     const rpc = this.deps.rpc;
-    if (await rpc.isClaimSettled(claimId)) return true;
-    if (txSlot === null) {
-      throw new Error("settleOnMaterios: missing Cardano tx slot");
-    }
+    if ((await rpc.claimSettlement(claimId)).best) return true;
     const constants = rpc.getSettlementConstants();
     const voucher = await rpc.getVoucher(claimId);
     if (!voucher) {
@@ -499,7 +514,7 @@ export class Keeper {
     // Cardano blocks arrive about every 20 slots; the pallet enforces the
     // floor and the attestors check the depth against reality.
     const observedDepth = Number((currentSlot - txSlot) / 20n);
-    if (observedDepth < this.config.minFinalityDepth) {
+    if (observedDepth < Math.max(this.config.minFinalityDepth, constants.minFinalityDepth)) {
       this.log("info", "payout below MinFinalityDepth; deferring", { claimId, observedDepth });
       return false;
     }
@@ -515,38 +530,63 @@ export class Keeper {
     const pending = await rpc.getSettlementRequest(claimId);
     let attested = ours;
     if (pending && tip - pending.submittedBlock <= constants.settlementRequestTtl) {
+      if (pending.requester === u8aToHex(rpc.getSigner().publicKey)) this.deps.state.trackBond(claimId);
       if (!recordsPayout(pending, ours)) {
         const failure = await this.submitSettlement(
           "supersedeSettlementRequest",
           [claimId, false, ours, this.settlementSignatures(claimId, voucher, ours)],
           claimId,
         );
-        if (failure === null) return rpc.isClaimSettled(claimId);
+        if (failure === null) return (await rpc.claimSettlement(claimId)).best;
         if (CANNOT_SIGN_ALONE.has(failure)) {
           this.awaitExpiry(claimId, pending, "a request the keeper cannot supersede blocks the claim");
+        } else {
+          this.backOff(claimId, tip, failure);
         }
         return false;
       }
       attested = pending.evidence;
     } else {
       const bond = constants.minSettlementBond > 0n ? constants.minSettlementBond : 1n;
+      // The bond is tracked on disk before filing, so neither a crash nor a
+      // lost outcome can leave it unreleased.
+      this.deps.state.trackBond(claimId);
+      await this.deps.state.flush();
       const failure = await this.submitSettlement(
         "requestSettle",
         [claimId, cardanoTxHash, false, ours, bond],
         claimId,
       );
-      if (failure !== null) return false;
-      this.deps.state.trackBond(claimId);
+      if (failure !== null) {
+        this.backOff(claimId, tip, failure);
+        return false;
+      }
     }
     const failure = await this.submitSettlement(
       "attestSettle",
       [claimId, this.settlementSignatures(claimId, voucher, attested)],
       claimId,
     );
-    if (failure === null) return rpc.isClaimSettled(claimId);
+    if (failure === null) return (await rpc.claimSettlement(claimId)).best;
     const request = CANNOT_SIGN_ALONE.has(failure) ? await rpc.getSettlementRequest(claimId) : null;
-    if (request) this.awaitExpiry(claimId, request, "awaiting the committee's attestation");
+    if (request) {
+      this.awaitExpiry(claimId, request, "awaiting the committee's attestation");
+    } else {
+      this.backOff(claimId, tip, failure);
+    }
     return false;
+  }
+
+  /**
+   * Delays the next settlement attempt for `claimId` after a failed
+   * submission: 10 blocks, doubling with each consecutive failure, capped at
+   * the request TTL. A lost race is retried on the next tick instead.
+   */
+  private backOff(claimId: ClaimId, tip: BlockNumber, failure: string): void {
+    if (RACES.has(failure)) return;
+    const failures = (this.deps.state.snapshot.submissions[claimId]?.settleFailures ?? 0) + 1;
+    const delay = Math.min(10 * 2 ** (failures - 1), this.deps.rpc.getSettlementConstants().settlementRequestTtl);
+    this.deps.state.updateSubmission(claimId, { settleFailures: failures, retryAtBlock: tip + delay });
   }
 
   /**
@@ -609,25 +649,35 @@ export class Keeper {
 
   /**
    * Submits an `intentSettlement` extrinsic. Returns null when it
-   * dispatched, or the dispatch error's name after logging it; other
-   * failures (RPC, transport) propagate.
+   * dispatched, or, after logging it, the dispatch error's name or
+   * `Rejected:<code>` for a pool rejection. An unknown outcome (transport
+   * loss, timeout) propagates; the next tick reads the chain instead.
    */
   private async submitSettlement(method: string, args: unknown[], claimId: ClaimId): Promise<string | null> {
     try {
       await this.deps.rpc.submitExtrinsic("intentSettlement", method, args);
       return null;
     } catch (err) {
-      if (!(err instanceof DispatchFailedError)) throw err;
+      let failure: string;
+      let unfunded: boolean;
+      if (err instanceof DispatchFailedError) {
+        failure = err.error;
+        unfunded = err.pallet === "balances" || err.error.startsWith("Token.");
+      } else if (err instanceof TransactionRejectedError) {
+        failure = `Rejected:${err.code}`;
+        unfunded = err.code === 1010 && /pay/i.test(err.reason);
+      } else {
+        throw err;
+      }
       this.metrics.settleDispatchFailures += 1;
-      const unfunded = err.pallet === "balances" || err.error.startsWith("Token.");
       this.log(
         unfunded ? "error" : "warn",
         unfunded
-          ? "keeper cannot fund the settlement bond; top up the keeper account"
-          : "settlement extrinsic failed in dispatch",
+          ? "keeper account cannot pay for settlement; top up the keeper account"
+          : "settlement extrinsic failed",
         { claimId, method, error: err.message },
       );
-      return err.error;
+      return failure;
     }
   }
 
@@ -687,6 +737,9 @@ export class Keeper {
  */
 /** Dispatch errors that mean the keeper's lone signature cannot clear the threshold. */
 const CANNOT_SIGN_ALONE = new Set(["InsufficientSignatures", "NotCommitteeMember", "SignerNotCommitteeMember"]);
+
+/** Dispatch errors from losing a race to another submitter; the next tick re-reads the chain. */
+const RACES = new Set(["SettlementRequestAlreadyExists", "SettlementRequestMissing", "AlreadySettled"]);
 
 /**
  * Whether a pending request records this payout: the same transaction,
