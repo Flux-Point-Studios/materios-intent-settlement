@@ -20,22 +20,31 @@ use {
 };
 
 /// Version 4 to 5 on a chain that ran before genesis stored its Cardano
-/// network: stores `Ids`, the network its settlement has been binding, in
-/// `CardanoIds`. `Ids` gives none for a chain whose network the runtime does
-/// not know, and that chain keeps version 4 with no ids, so settlement refuses
-/// rather than bind another network. Every other version is left alone.
+/// network: stores `T::CardanoIdsToSeed`, the network its settlement has been
+/// binding, in `CardanoIds`. That gives none for a chain whose network the
+/// runtime does not know, and that chain keeps version 4 with no ids, so
+/// settlement refuses rather than bind another network. Every other version
+/// is left alone.
 ///
-/// Costs a read of the version and one for `Ids`, which looks up which chain
-/// this is, and two writes when it seeds.
-pub struct SeedCardanoIds<T, Ids>(PhantomData<(T, Ids)>);
+/// Costs a read of the version and one for `T::CardanoIdsToSeed`, which looks
+/// up which chain this is, and two writes when it seeds.
+pub struct SeedCardanoIds<T>(PhantomData<T>);
 
-impl<T: Config, Ids: Get<Option<CardanoIdentity>>> OnRuntimeUpgrade for SeedCardanoIds<T, Ids> {
+/// The ids [`SeedCardanoIds`] stores on this chain: `T::CardanoIdsToSeed`'s on
+/// a version-4 chain, none on any other.
+pub(crate) fn ids_to_seed<T: Config>() -> Option<CardanoIdentity> {
+    (SettlementStorageVersion::<T>::get() == NAMED_RESERVE_VERSION)
+        .then(T::CardanoIdsToSeed::get)
+        .flatten()
+}
+
+impl<T: Config> OnRuntimeUpgrade for SeedCardanoIds<T> {
     fn on_runtime_upgrade() -> Weight {
         let db = T::DbWeight::get();
         if SettlementStorageVersion::<T>::get() != NAMED_RESERVE_VERSION {
             return db.reads(1);
         }
-        let Some(ids) = Ids::get() else {
+        let Some(ids) = T::CardanoIdsToSeed::get() else {
             log::error!(
                 target: "runtime::intent-settlement",
                 "no Cardano ids for this chain: settlement stays at storage version {NAMED_RESERVE_VERSION} and refuses every voucher and settlement",
@@ -54,7 +63,7 @@ impl<T: Config, Ids: Get<Option<CardanoIdentity>>> OnRuntimeUpgrade for SeedCard
     #[cfg(feature = "try-runtime")]
     fn pre_upgrade() -> Result<Vec<u8>, TryRuntimeError> {
         let version = SettlementStorageVersion::<T>::get();
-        let seeded = (version == NAMED_RESERVE_VERSION).then(Ids::get).flatten();
+        let seeded = ids_to_seed::<T>();
         ensure!(
             version != NAMED_RESERVE_VERSION || !CardanoIds::<T>::exists(),
             "a version-4 chain already stores Cardano ids"

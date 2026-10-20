@@ -1660,7 +1660,8 @@ fn genesis_safety_metadata_tags_are_the_tags_each_digest_hashes() {
         canonical_voucher_body_with_address, compute_voucher_digest_with_address, ChainIdentity,
     };
     use parity_scale_codec::Decode;
-    let metadata = IntentSettlement::pallet_constants_metadata();
+    let metadata = sp_io::TestExternalities::default()
+        .execute_with(IntentSettlement::pallet_constants_metadata);
     let tag = |name: &str| -> [u8; 4] {
         let constant = metadata
             .iter()

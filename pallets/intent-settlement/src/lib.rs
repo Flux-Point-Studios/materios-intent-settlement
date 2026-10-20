@@ -811,6 +811,11 @@ pub mod pallet {
         #[pallet::constant]
         type SettlementRequestTtl: Get<u32>;
 
+        /// The Cardano network a chain started before genesis stored one has
+        /// been settling against, which [`crate::migrations::SeedCardanoIds`]
+        /// stores; none for a chain whose network the runtime does not know.
+        type CardanoIdsToSeed: Get<Option<CardanoIdentity>>;
+
         /// Currency holding settlement bonds under the
         /// `SETTLEMENT_BOND_RESERVE_ID` named reserve. `pallet_balances`
         /// qualifies when its `ReserveIdentifier` is `[u8; 8]` and
@@ -1361,6 +1366,9 @@ pub mod pallet {
             claim_id: ClaimId,
             requester: T::AccountId,
         },
+        /// Root bound the `aegis_policy_v1` script hash every voucher digest
+        /// commits to from now on.
+        AegisPolicyV1Bound { script_hash: [u8; 28] },
     }
 
     // ---------------------------------------------------------------------
@@ -1634,6 +1642,13 @@ pub mod pallet {
         /// The chain stores no Cardano network to settle against
         /// (`CardanoIds`), so no voucher digest or evidence check can bind one.
         CardanoIdsMissing,
+        /// The chain settles against Cardano mainnet and binds no
+        /// `aegis_policy_v1` script hash yet, or `bind_aegis_policy_v1` was
+        /// given the all-zero hash, which binds none.
+        AegisPolicyV1Unbound,
+        /// `CardanoIds` binds an `aegis_policy_v1` script hash already, and
+        /// one is bound once.
+        AegisPolicyV1AlreadyBound,
     }
 
     // ---------------------------------------------------------------------
@@ -1651,6 +1666,8 @@ pub mod pallet {
         pub min_signer_threshold: u32,
         /// The Cardano network the chain settles against, stored as
         /// `CardanoIds`. `None` stores none, which leaves settlement refusing.
+        /// A mainnet genesis leaves `aegis_policy_v1_script_hash` zero for
+        /// Root to bind with `bind_aegis_policy_v1`.
         pub cardano_ids: Option<CardanoIdentity>,
         #[serde(skip)]
         pub _phantom: core::marker::PhantomData<T>,
@@ -1715,6 +1732,24 @@ pub mod pallet {
         #[pallet::constant_name(MaxObservedDepth)]
         fn max_observed_depth() -> u32 {
             MAX_OBSERVED_DEPTH
+        }
+
+        /// The Cardano network magic every voucher digest binds, read from
+        /// state as [`Pallet::bound_cardano_ids`] gives it; 0 where the chain
+        /// names no Cardano network.
+        #[pallet::constant_name(NetworkMagic)]
+        fn network_magic() -> u32 {
+            Self::bound_cardano_ids().map_or(0, |ids| ids.network_magic)
+        }
+
+        /// The `aegis_policy_v1` script hash every voucher digest binds, read
+        /// from state as [`Pallet::bound_cardano_ids`] gives it; all zero
+        /// until one is bound. `bind_aegis_policy_v1` changes it within a
+        /// spec version, so a client keeping metadata per spec version reads
+        /// it again after that call.
+        #[pallet::constant_name(AegisPolicyV1ScriptHash)]
+        fn aegis_policy_v1_script_hash() -> [u8; 28] {
+            Self::bound_cardano_ids().map_or([0; 28], |ids| ids.aegis_policy_v1_script_hash)
         }
 
         /// Committee-signed digest for `credit_deposit`.
@@ -1811,6 +1846,31 @@ pub mod pallet {
         #[pallet::constant_name(VoucherTag)]
         fn voucher_tag() -> [u8; 4] {
             *TAG_VCHR
+        }
+    }
+
+    impl<T: Config> Pallet<T> {
+        /// The Cardano network this chain settles against, which every
+        /// voucher digest and evidence check binds. Refuses while none is
+        /// stored, and on Cardano mainnet while no Aegis policy is bound: no
+        /// mainnet Aegis validator accepts a voucher bound to none.
+        pub fn cardano_ids() -> Result<CardanoIdentity, DispatchError> {
+            let ids = CardanoIds::<T>::get().ok_or(Error::<T>::CardanoIdsMissing)?;
+            ensure!(
+                ids.network_magic != CARDANO_MAINNET_NETWORK_MAGIC
+                    || ids.aegis_policy_v1_script_hash != [0; 28],
+                Error::<T>::AegisPolicyV1Unbound
+            );
+            Ok(ids)
+        }
+
+        /// The Cardano network the chain's calls bind from the next block on:
+        /// the one `CardanoIds` stores or, before an upgrade's
+        /// [`crate::migrations::SeedCardanoIds`] has run, the one it stores.
+        /// Metadata read in the state of the block that sets new code sees
+        /// that code before its upgrade runs.
+        pub fn bound_cardano_ids() -> Option<CardanoIdentity> {
+            CardanoIds::<T>::get().or_else(crate::migrations::ids_to_seed::<T>)
         }
     }
 
@@ -3783,6 +3843,30 @@ pub mod pallet {
             })
         }
 
+        /// Binds the `aegis_policy_v1` script hash every voucher digest
+        /// commits to, once. A mainnet genesis cannot name it: the policy is
+        /// applied to the chain's own genesis hash. Refuses the all-zero hash
+        /// (`AegisPolicyV1Unbound`), a chain that stores no Cardano network
+        /// (`CardanoIdsMissing`) and one that binds a hash already
+        /// (`AegisPolicyV1AlreadyBound`).
+        #[pallet::call_index(23)]
+        #[pallet::weight((T::WeightInfo::bind_aegis_policy_v1(), DispatchClass::Operational, Pays::No))]
+        pub fn bind_aegis_policy_v1(origin: OriginFor<T>, script_hash: [u8; 28]) -> DispatchResult {
+            ensure_root(origin)?;
+            ensure!(script_hash != [0; 28], Error::<T>::AegisPolicyV1Unbound);
+            CardanoIds::<T>::try_mutate(|stored| {
+                let ids = stored.as_mut().ok_or(Error::<T>::CardanoIdsMissing)?;
+                ensure!(
+                    ids.aegis_policy_v1_script_hash == [0; 28],
+                    Error::<T>::AegisPolicyV1AlreadyBound
+                );
+                ids.aegis_policy_v1_script_hash = script_hash;
+                Ok::<_, Error<T>>(())
+            })?;
+            Self::deposit_event(Event::AegisPolicyV1Bound { script_hash });
+            Ok(())
+        }
+
         /// Task #266 (mis-sec P0): batch parallel of `request_settle`. The
         /// keeper assembles N per-entry `SettlementEvidence` records and
         /// posts them in a single extrinsic. Each entry is validated
@@ -4867,12 +4951,6 @@ pub mod pallet {
                 &Self::cardano_ids()?,
                 voucher,
             )
-        }
-
-        /// The Cardano network this chain settles against, which every
-        /// voucher digest and evidence check binds.
-        pub fn cardano_ids() -> Result<CardanoIdentity, DispatchError> {
-            CardanoIds::<T>::get().ok_or_else(|| Error::<T>::CardanoIdsMissing.into())
         }
 
         /// The canonical voucher digest on this chain, `chain_id`, settling

@@ -120,6 +120,9 @@ parameter_types! {
     /// `post_settlement_bond_rejects_below_min` can exercise the
     /// `BondBelowMinimum` error without spawning a parallel runtime.
     pub static TestMinSettlementBond: u128 = 0u128;
+    /// The Cardano ids `SeedCardanoIds` stores on a version-4 mock chain;
+    /// per-test via `TestCardanoIdsToSeed::set(..)`.
+    pub static TestCardanoIdsToSeed: Option<CardanoIdentity> = None;
     /// Task #84 (mis-sec P1): treasury PalletId — same shape as the
     /// production runtime's `mat/trsy`. Truncated to a u64 via
     /// `into_account_truncating`, so the treasury account in the mock
@@ -255,6 +258,7 @@ impl pallet_intent_settlement::pallet::Config for Test {
     type SettlementVersion = TestSettlementVersion;
     type MinFinalityDepth = TestMinFinalityDepth;
     type SettlementRequestTtl = TestSettlementRequestTtl;
+    type CardanoIdsToSeed = TestCardanoIdsToSeed;
     // Task #84 (mis-sec P1): bond + slash plumbing.
     type Currency = Balances;
     type SlashWatcherShareBps = TestSlashWatcherShareBps;
@@ -341,6 +345,10 @@ impl crate::weights::WeightInfo for BondWeights {
 
     fn request_expire_policy() -> frame_support::weights::Weight {
         frame_support::weights::Weight::from_parts(180_018, 89)
+    }
+
+    fn bind_aegis_policy_v1() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(190_019, 97)
     }
 
     fn expire_intents(n: u32) -> frame_support::weights::Weight {
@@ -7316,6 +7324,7 @@ mod max_submit_batch_boundary {
         type SettlementVersion = TestSettlementVersion;
         type MinFinalityDepth = TestMinFinalityDepth;
         type SettlementRequestTtl = TestSettlementRequestTtl;
+        type CardanoIdsToSeed = ();
         // Task #84 (mis-sec P1): bond + slash plumbing.
         type Currency = Balances;
         type SlashWatcherShareBps = TestSlashWatcherShareBps;

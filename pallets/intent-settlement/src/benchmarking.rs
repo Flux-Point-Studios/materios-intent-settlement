@@ -440,6 +440,7 @@ mod benchmarks {
             Pallet::<Runtime>::test_benchmark_attest_batch_settle,
             Pallet::<Runtime>::test_benchmark_attest_expire_policy,
             Pallet::<Runtime>::test_benchmark_expire_intents,
+            Pallet::<Runtime>::test_benchmark_bind_aegis_policy_v1,
         ] {
             execute_in_integration_runtime(benchmark);
         }
@@ -1068,6 +1069,25 @@ mod benchmarks {
             claim_id,
             proof,
             sp_std::vec![(public.0, signature.0)],
+        );
+    }
+
+    /// Bench `bind_aegis_policy_v1` binding a hash to the stored Cardano ids.
+    #[benchmark]
+    fn bind_aegis_policy_v1() {
+        let ids = crate::pallet::CardanoIds::<T>::get()
+            .expect("the benchmark genesis stores its Cardano ids");
+        crate::pallet::CardanoIds::<T>::put(CardanoIdentity {
+            aegis_policy_v1_script_hash: [0; 28],
+            ..ids
+        });
+
+        #[extrinsic_call]
+        _(RawOrigin::Root, [0xAE; 28]);
+
+        assert_eq!(
+            crate::pallet::CardanoIds::<T>::get().map(|ids| ids.aegis_policy_v1_script_hash),
+            Some([0xAE; 28])
         );
     }
 

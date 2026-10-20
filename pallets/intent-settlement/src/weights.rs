@@ -25,6 +25,9 @@
 //!   attest_settle, attest_expire_policy, request_expire_policy
 //!   and, separately, request_batch_settle, request_batch_vouchers,
 //!   attest_batch_settle.
+//! `bind_aegis_policy_v1` was measured 2026-10-20 in three runs, each holding
+//! the build lock and starting with the CPU at least 90% idle and k10temp at
+//! most 66 C; the slot is the largest of the three (17.0M to 18.1M ref_time).
 //! The rest were measured 2026-10-18: post_settlement_bond,
 //! release_settlement_bond, slash_bad_settlement_evidence, submit_intent,
 //! request_credit_refund and attest_intent, and separately
@@ -98,6 +101,8 @@ pub trait WeightInfo {
     fn expire_intents(n: u32) -> Weight;
     /// `request_expire_policy` pinning evidence for an attested intent.
     fn request_expire_policy() -> Weight;
+    /// `bind_aegis_policy_v1` binding a hash.
+    fn bind_aegis_policy_v1() -> Weight;
 }
 
 /// Base dispatch costs. Threshold-signature work is charged separately by
@@ -623,6 +628,18 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
             .saturating_add(T::DbWeight::get().reads(3))
             .saturating_add(T::DbWeight::get().writes(1))
     }
+    /// Storage: `IntentSettlement::CardanoIds` (r:1 w:1)
+    /// Proof: `IntentSettlement::CardanoIds` (`max_values`: Some(1), `max_size`: Some(64), added: 559, mode: `MaxEncodedLen`)
+    fn bind_aegis_policy_v1() -> Weight {
+        // Proof Size summary in bytes:
+        //  Measured:  `305`
+        //  Estimated: `1549`
+        // Minimum execution time: 15_960_000 picoseconds.
+        Weight::from_parts(18_095_000, 0)
+            .saturating_add(Weight::from_parts(0, 1549))
+            .saturating_add(T::DbWeight::get().reads(1))
+            .saturating_add(T::DbWeight::get().writes(1))
+    }
 }
 
 /// Unit-test default. Mirrors the auto-generated curve at a slightly higher
@@ -691,5 +708,8 @@ impl WeightInfo for () {
     }
     fn request_expire_policy() -> Weight {
         Weight::from_parts(620_000_000, 22_000)
+    }
+    fn bind_aegis_policy_v1() -> Weight {
+        Weight::from_parts(630_000_000, 23_000)
     }
 }

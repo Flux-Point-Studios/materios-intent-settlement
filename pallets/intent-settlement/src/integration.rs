@@ -249,6 +249,7 @@ impl pallet_intent_settlement::pallet::Config for Testnet {
     type SettlementVersion = TestSettlementVersion;
     type MinFinalityDepth = TestMinFinalityDepth;
     type SettlementRequestTtl = TestSettlementRequestTtl;
+    type CardanoIdsToSeed = ();
     // Task #84 (mis-sec P1): bond + slash plumbing.
     type Currency = Balances;
     type SlashWatcherShareBps = TestSlashWatcherShareBps;
@@ -751,6 +752,42 @@ fn the_voucher_digest_binds_the_stored_cardano_network() {
             }
         });
     }
+}
+
+/// A mainnet genesis cannot name the Aegis policy applied to its own hash,
+/// so Root binds it after launch. A bundle signed over the digest that binds
+/// that policy fails while none is bound and verifies once Root binds it.
+#[test]
+fn a_voucher_signed_for_the_aegis_policy_root_binds_verifies_once_bound() {
+    new_ext().execute_with(|| {
+        let (alice, _bob, _charlie) = committee_accounts();
+        let (intent_id, claim_id, bfpr, voucher, payload) = rv_setup_attested(&user_account());
+        pallet_intent_settlement::pallet::CardanoIds::<Testnet>::put(CardanoIdentity {
+            aegis_policy_v1_script_hash: [0; 28],
+            ..TEST_CARDANO_IDS
+        });
+        let sigs = vec![sign_with("//Alice", &payload), sign_with("//Bob", &payload)];
+        let request = |sigs| {
+            IntentSettlement::request_voucher(
+                RuntimeOrigin::signed(alice.clone()),
+                claim_id,
+                intent_id,
+                voucher.clone(),
+                bfpr.clone(),
+                sigs,
+            )
+            .map_err(|refused| refused.error)
+        };
+        assert_eq!(
+            request(sigs.clone()),
+            Err(pallet_intent_settlement::pallet::Error::<Testnet>::InvalidSignature.into())
+        );
+        assert_ok!(IntentSettlement::bind_aegis_policy_v1(
+            RuntimeOrigin::root(),
+            TEST_CARDANO_IDS.aegis_policy_v1_script_hash
+        ));
+        assert_ok!(request(sigs));
+    });
 }
 
 #[test]

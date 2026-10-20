@@ -320,15 +320,13 @@ pub struct CardanoIdentity {
     /// Blake2b-256 of the network's `shelley-genesis.json`.
     pub mainchain_genesis_hash: [u8; 32],
     /// Blake2b-224 script hash of the deployed `aegis_policy_v1` validator,
-    /// all zero where none is deployed.
+    /// all zero where none is bound.
     pub aegis_policy_v1_script_hash: [u8; 28],
 }
 
 impl CardanoIdentity {
     /// Refuses ids that name no Cardano network, or name Cardano mainnet only
-    /// in part. Mainnet's magic and Shelley genesis hash come together, and a
-    /// mainnet chain settles against the Aegis policy deployed there; a test
-    /// network may have none deployed.
+    /// in part: mainnet's magic and Shelley genesis hash come together.
     pub fn check(&self) -> Result<(), &'static str> {
         if self.network_magic == 0 {
             return Err("Cardano network magic 0 names no Cardano network");
@@ -336,15 +334,11 @@ impl CardanoIdentity {
         if self.mainchain_genesis_hash == [0; 32] {
             return Err("an all-zero Shelley genesis hash names no Cardano network");
         }
-        let mainnet_magic = self.network_magic == CARDANO_MAINNET_NETWORK_MAGIC;
-        if mainnet_magic != (self.mainchain_genesis_hash == CARDANO_MAINNET_SHELLEY_GENESIS_HASH) {
+        if (self.network_magic == CARDANO_MAINNET_NETWORK_MAGIC)
+            != (self.mainchain_genesis_hash == CARDANO_MAINNET_SHELLEY_GENESIS_HASH)
+        {
             return Err(
                 "Cardano mainnet's network magic and Shelley genesis hash name it only together",
-            );
-        }
-        if mainnet_magic && self.aegis_policy_v1_script_hash == [0; 28] {
-            return Err(
-                "Cardano mainnet ids with no aegis_policy_v1 script hash bind no Aegis policy",
             );
         }
         Ok(())
