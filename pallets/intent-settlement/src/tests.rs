@@ -6,6 +6,9 @@
 #[path = "genesis_safety_tests.rs"]
 mod genesis_safety;
 
+#[path = "cardano_ids_tests.rs"]
+mod cardano_ids;
+
 use crate as pallet_intent_settlement;
 use crate::pallet::{IsCommitteeMember, VerifyCommitteeSignature};
 use crate::types::*;
@@ -87,13 +90,6 @@ parameter_types! {
     /// zero so unit tests fail loudly if a runtime forgets to plumb the
     /// chain_id into a pre-image helper.
     pub const TestMateriosChainId: H256 = H256([0x73u8; 32]);
-    /// Task #73: preprod-shaped network magic (not real-cardano-1, just a
-    /// stable test marker).
-    pub const TestNetworkMagic: u32 = 1u32;
-    /// Task #73: 28-byte placeholder script-hash for the deployed Aiken
-    /// `aegis_policy_v1`. Distinct from zero so unit tests catch a runtime
-    /// that forgets to wire the constant.
-    pub const TestAegisPolicyV1ScriptHash: [u8; 28] = [0x42u8; 28];
     /// Task #73: settlement-protocol version 1 (initial; bumps coordinated
     /// across pallet + SDK + Aiken validator).
     pub const TestSettlementVersion: u32 = 1u32;
@@ -107,11 +103,6 @@ parameter_types! {
     /// Materios blocks. 100 blocks for unit-test ergonomics — production
     /// uses 2400 (~4h) per design memo §3.4.
     pub const TestSettlementRequestTtl: u32 = 100u32;
-    /// Task #266 (mis-sec P0): pinned Cardano genesis hash for the test
-    /// runtime. Distinct from zero so a unit test that forgets to wire
-    /// the constant fails loudly. Production runtimes plumb the actual
-    /// preprod / mainnet network-magic-derived genesis hash.
-    pub const TestMainchainGenesisHash: [u8; 32] = [0x65u8; 32];
     /// Task #84 (mis-sec P1): 50% watcher / 50% treasury split — the
     /// design-memo §6 #9 starting point. Production runtimes can bump
     /// via governance.
@@ -129,6 +120,9 @@ parameter_types! {
     /// `post_settlement_bond_rejects_below_min` can exercise the
     /// `BondBelowMinimum` error without spawning a parallel runtime.
     pub static TestMinSettlementBond: u128 = 0u128;
+    /// The Cardano ids `SeedCardanoIds` stores on a version-4 mock chain;
+    /// per-test via `TestCardanoIdsToSeed::set(..)`.
+    pub static TestCardanoIdsToSeed: Option<CardanoIdentity> = None;
     /// Task #84 (mis-sec P1): treasury PalletId — same shape as the
     /// production runtime's `mat/trsy`. Truncated to a u64 via
     /// `into_account_truncating`, so the treasury account in the mock
@@ -136,6 +130,14 @@ parameter_types! {
     /// distinct from accounts 1/2/3/100/101 used elsewhere in the suite).
     pub const TestSettlementTreasuryPalletId: PalletId = PalletId(*b"mat/trsy");
 }
+
+/// The Cardano network the mock chains settle against. Each id is distinct
+/// from zero, so a digest or check that drops one fails.
+pub const TEST_CARDANO_IDS: CardanoIdentity = CardanoIdentity {
+    network_magic: 1,
+    mainchain_genesis_hash: [0x65; 32],
+    aegis_policy_v1_script_hash: [0x42; 28],
+};
 
 /// Issue #4 helper: our tests use `u64` AccountIds. Derive a synthetic
 /// `CommitteePubkey` by left-padding the u64's little-endian bytes into the
@@ -253,12 +255,10 @@ impl pallet_intent_settlement::pallet::Config for Test {
     type MaxVoucherBatch = MaxVoucherBatch;
     type MaxSubmitBatch = MaxSubmitBatch;
     type MateriosChainId = TestMateriosChainId;
-    type NetworkMagic = TestNetworkMagic;
-    type AegisPolicyV1ScriptHash = TestAegisPolicyV1ScriptHash;
     type SettlementVersion = TestSettlementVersion;
     type MinFinalityDepth = TestMinFinalityDepth;
     type SettlementRequestTtl = TestSettlementRequestTtl;
-    type MainchainGenesisHash = TestMainchainGenesisHash;
+    type CardanoIdsToSeed = TestCardanoIdsToSeed;
     // Task #84 (mis-sec P1): bond + slash plumbing.
     type Currency = Balances;
     type SlashWatcherShareBps = TestSlashWatcherShareBps;
@@ -341,6 +341,14 @@ impl crate::weights::WeightInfo for BondWeights {
 
     fn attest_expire_policy() -> frame_support::weights::Weight {
         frame_support::weights::Weight::from_parts(160_016, 79)
+    }
+
+    fn request_expire_policy() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(180_018, 89)
+    }
+
+    fn bind_aegis_policy_v1() -> frame_support::weights::Weight {
+        frame_support::weights::Weight::from_parts(190_019, 97)
     }
 
     fn expire_intents(n: u32) -> frame_support::weights::Weight {
@@ -431,6 +439,7 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
         );
         // Issue #7: seed the M-of-N floor (tests default to the preprod 2-of-N).
         pallet_intent_settlement::pallet::MinSignerThreshold::<Test>::put(2u32);
+        pallet_intent_settlement::pallet::CardanoIds::<Test>::put(TEST_CARDANO_IDS);
     });
     ext
 }
@@ -1183,6 +1192,7 @@ fn genesis_with_zero_ttl_uses_default() {
         claim_ttl: 0,
         pool_utilization: PoolUtilizationParams::default(),
         min_signer_threshold: 0,
+        cardano_ids: Some(TEST_CARDANO_IDS),
         _phantom: core::marker::PhantomData,
     }
     .assimilate_storage(&mut t)
@@ -3073,11 +3083,11 @@ fn voucher_setup() -> (IntentId, ClaimId, BatchFairnessProof, Voucher, [u8; 32])
             stake_hash: &stake,
         },
     );
-    let aegis_script = TestAegisPolicyV1ScriptHash::get();
+    let aegis_script = TEST_CARDANO_IDS.aegis_policy_v1_script_hash;
     let voucher_digest = crate::voucher_canonicalize::compute_voucher_digest_with_address(
         crate::voucher_canonicalize::ChainIdentity {
             materios_chain_id: &TEST_CHAIN_ID,
-            network_magic: TestNetworkMagic::get(),
+            network_magic: TEST_CARDANO_IDS.network_magic,
             aegis_policy_script_hash: &aegis_script,
             settlement_version: TestSettlementVersion::get(),
         },
@@ -4894,8 +4904,8 @@ fn fixture_min_finality_depth_default_matches_design_memo() {
 
 fn settled_evidence_for(voucher: &Voucher, depth: u32, slot: u64) -> SettlementEvidence {
     // Build a SettlementEvidence that's internally consistent with the
-    // on-chain voucher. The TestMainchainGenesisHash fixture matches the
-    // pallet Config; the depth and slot are exposed as parameters so
+    // on-chain voucher. It names the Shelley genesis the mock stores; the
+    // depth and slot are exposed as parameters so
     // individual tests can probe the finality + slot gates.
     let (payment_hash, _stake_hash) =
         crate::voucher_canonicalize::split_type0_address_bytes(
@@ -4908,7 +4918,7 @@ fn settled_evidence_for(voucher: &Voucher, depth: u32, slot: u64) -> SettlementE
         observed_slot: slot,
         beneficiary_addr_hash: payment_hash,
         amount_lovelace: voucher.amount_ada,
-        mainchain_genesis_hash: TestMainchainGenesisHash::get(),
+        mainchain_genesis_hash: TEST_CARDANO_IDS.mainchain_genesis_hash,
     }
 }
 
@@ -5395,7 +5405,7 @@ fn task266_attest_settle_payload_pins_voucher_digest_against_attack_a5() {
             "Per-claim voucher digests MUST differ — recycling defense lives here"
         );
 
-        let mc_g = TestMainchainGenesisHash::get();
+        let mc_g = TEST_CARDANO_IDS.mainchain_genesis_hash;
         let payment_hash: [u8; 28] = {
             let raw = voucher_a.beneficiary_cardano_addr.as_slice();
             let (p, _s) =
@@ -5452,7 +5462,7 @@ fn task266_stca_payload_domain_separated_from_legacy_stcl() {
         0,
         0,
         0,
-        &TestMainchainGenesisHash::get(),
+        &TEST_CARDANO_IDS.mainchain_genesis_hash,
     );
     assert_ne!(stcl, stca, "STCL and STCA digests MUST be domain-separated");
 }
@@ -5566,12 +5576,12 @@ fn task266_migration_flags_existing_settled_claims() {
         // Run the migration via the on_runtime_upgrade hook.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         // Post-migration: settled claim is flagged (idempotent — already
-        // set by legacy settle), the version reaches the current one
-        // through every chained step, and both cutovers are scheduled.
+        // set by legacy settle), the version reaches the last one the hook
+        // takes through every chained step, and both cutovers are scheduled.
         assert!(PreAuditSettlement::<Test>::get(claim_id));
         assert_eq!(
             SettlementStorageVersion::<Test>::get(),
-            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION
+            pallet_intent_settlement::NAMED_RESERVE_VERSION
         );
         let stca_cutover = pallet_intent_settlement::pallet::StcaCutoverBlock::<Test>::get();
         assert!(stca_cutover > 0u64);
@@ -5582,7 +5592,7 @@ fn task266_migration_flags_existing_settled_claims() {
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         assert_eq!(
             SettlementStorageVersion::<Test>::get(),
-            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION
+            pallet_intent_settlement::NAMED_RESERVE_VERSION
         );
     });
 }
@@ -5647,21 +5657,21 @@ fn task266_migration_truncation_recovers_to_full_progress() {
             .count();
         assert_eq!(flagged_after_2, 3, "second run drains tail to full flag set");
         // After v0→v1 completes, the same invocation chains every later
-        // step, so the terminal version is the current one.
+        // step, so the terminal version is the last one the hook takes.
         assert_eq!(
             SettlementStorageVersion::<Test>::get(),
-            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION,
-            "version reaches the current one after the chained steps complete"
+            pallet_intent_settlement::NAMED_RESERVE_VERSION,
+            "version reaches the hook's last one after the chained steps complete"
         );
         let cutover_after_2 = StcaCutoverBlock::<Test>::get();
         assert_eq!(cutover_after_1, cutover_after_2,
                    "STCA cutover MUST NOT slide between runs");
-        // Third run: idempotent — version already current, early-return.
+        // Third run: idempotent — version already migrated, early-return.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         assert_eq!(StcaCutoverBlock::<Test>::get(), cutover_after_2);
         assert_eq!(
             SettlementStorageVersion::<Test>::get(),
-            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION
+            pallet_intent_settlement::NAMED_RESERVE_VERSION
         );
     });
 }
@@ -5871,7 +5881,7 @@ fn task266_stca_payload_parity_fixture_f() {
     let amount: u64 = 1_500_000;
     let depth: u32 = 15;
     let slot: u64 = 12_345_678;
-    let mc_g = [0x65u8; 32]; // matches TestMainchainGenesisHash
+    let mc_g = TEST_CARDANO_IDS.mainchain_genesis_hash;
     let digest_false = pallet_intent_settlement::settle_claim_attested_payload(
         &TEST_CHAIN_ID,
         &claim,
@@ -5975,7 +5985,7 @@ fn good_expiry_evidence_for_buy(
         cardano_tx_hash: [0xCFu8; 32],
         observed_at_depth: depth,
         observed_slot: slot,
-        mainchain_genesis_hash: TestMainchainGenesisHash::get(),
+        mainchain_genesis_hash: TEST_CARDANO_IDS.mainchain_genesis_hash,
         policy_id_witness: product_id,
     }
 }
@@ -6222,7 +6232,7 @@ fn task267_request_expire_policy_rejects_refund_credit_intent() {
             cardano_tx_hash: [0xCDu8; 32],
             observed_at_depth: TestMinFinalityDepth::get(),
             observed_slot: 1,
-            mainchain_genesis_hash: TestMainchainGenesisHash::get(),
+            mainchain_genesis_hash: TEST_CARDANO_IDS.mainchain_genesis_hash,
             policy_id_witness: H256::from([0u8; 32]),
         };
         assert_noop!(
@@ -6542,7 +6552,7 @@ fn task267_expp_payload_parity_fixture_g() {
     let tx = [0x33u8; 32];
     let depth: u32 = 15;
     let slot: u64 = 12_345_678;
-    let mc_g = [0x65u8; 32]; // matches TestMainchainGenesisHash
+    let mc_g = TEST_CARDANO_IDS.mainchain_genesis_hash;
     let digest = pallet_intent_settlement::expire_policy_attested_payload(
         &TEST_CHAIN_ID,
         &intent_id,
@@ -6607,10 +6617,10 @@ fn task267_migration_flags_existing_expired_intents() {
             "TTL sweep does NOT flag (only legacy expire_policy_mirror does); the migration is what catches these"
         );
         // Run the migration. Version starts at 0; this chains every step
-        // in one call. Post: PreAuditExpiry flagged, version current.
+        // in one call. Post: PreAuditExpiry flagged, version migrated.
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         assert!(PreAuditExpiry::<Test>::get(iid));
-        assert_eq!(SettlementStorageVersion::<Test>::get(), pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION);
+        assert_eq!(SettlementStorageVersion::<Test>::get(), pallet_intent_settlement::NAMED_RESERVE_VERSION);
         let cutover =
             pallet_intent_settlement::pallet::PolicyExpireCutoverBlock::<Test>::get();
         assert!(cutover > 0u64);
@@ -6631,7 +6641,7 @@ fn task267_attest_expire_policy_payload_rebuild_pins_chain_state() {
         // seed into product_id).
         assert_ne!(pid_a, pid_b, "Per-intent policy ids must differ for the test");
 
-        let mc_g = TestMainchainGenesisHash::get();
+        let mc_g = TEST_CARDANO_IDS.mainchain_genesis_hash;
         let tx = [0xCFu8; 32];
         let depth: u32 = 15;
         let slot: u64 = 1;
@@ -6750,7 +6760,7 @@ fn bond_v2_to_v3_migration_fills_zero() {
         assert_eq!(row2.bond_amount, 0u128, "row 2 bond defaults to zero");
         assert_eq!(
             SettlementStorageVersion::<Test>::get(),
-            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION,
+            pallet_intent_settlement::NAMED_RESERVE_VERSION,
             "the v2→v3 walk completes and chains into the later steps"
         );
     });
@@ -6793,7 +6803,7 @@ fn bond_v2_to_v3_truncation_recovery() {
         let _ = <IntentSettlement as frame_support::traits::OnRuntimeUpgrade>::on_runtime_upgrade();
         assert_eq!(
             SettlementStorageVersion::<Test>::get(),
-            pallet_intent_settlement::SETTLEMENT_STORAGE_VERSION,
+            pallet_intent_settlement::NAMED_RESERVE_VERSION,
             "the second run drains the tail"
         );
     });
@@ -7249,13 +7259,10 @@ mod max_submit_batch_boundary {
         pub const MaxSubmitBatch: u32 = 256;
         // #73 chain-identity fixtures.
         pub const TestMateriosChainId: H256 = H256([0x73u8; 32]);
-        pub const TestNetworkMagic: u32 = 1u32;
-        pub const TestAegisPolicyV1ScriptHash: [u8; 28] = [0x42u8; 28];
         pub const TestSettlementVersion: u32 = 1u32;
         // Task #266 (mis-sec P0): attested-settle config.
         pub const TestMinFinalityDepth: u32 = 3u32;
         pub const TestSettlementRequestTtl: u32 = 100u32;
-        pub const TestMainchainGenesisHash: [u8; 32] = [0x65u8; 32];
         // Task #84 (mis-sec P1): bond + slash config (mirrors outer mock).
         pub const TestSlashWatcherShareBps: u32 = 5_000u32;
         pub const TestBondReleaseDelayBlocks: u32 = 30u32;
@@ -7314,12 +7321,10 @@ mod max_submit_batch_boundary {
         type MaxVoucherBatch = MaxVoucherBatch;
         type MaxSubmitBatch = MaxSubmitBatch;
         type MateriosChainId = TestMateriosChainId;
-        type NetworkMagic = TestNetworkMagic;
-        type AegisPolicyV1ScriptHash = TestAegisPolicyV1ScriptHash;
         type SettlementVersion = TestSettlementVersion;
         type MinFinalityDepth = TestMinFinalityDepth;
         type SettlementRequestTtl = TestSettlementRequestTtl;
-        type MainchainGenesisHash = TestMainchainGenesisHash;
+        type CardanoIdsToSeed = ();
         // Task #84 (mis-sec P1): bond + slash plumbing.
         type Currency = Balances;
         type SlashWatcherShareBps = TestSlashWatcherShareBps;

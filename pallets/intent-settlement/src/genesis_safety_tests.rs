@@ -13,6 +13,7 @@ fn genesis_ext() -> sp_io::TestExternalities {
                 total_nav_ada: 10_000_000,
                 outstanding_coverage_ada: 0,
             },
+            cardano_ids: Some(TEST_CARDANO_IDS),
             ..Default::default()
         },
         ..Default::default()
@@ -671,7 +672,7 @@ fn genesis_safety_expired_policy_request_can_be_replaced_after_cutover() {
             cardano_tx_hash: [0x81; 32],
             observed_at_depth: 15,
             observed_slot: 123,
-            mainchain_genesis_hash: TestMainchainGenesisHash::get(),
+            mainchain_genesis_hash: TEST_CARDANO_IDS.mainchain_genesis_hash,
             policy_id_witness: IntentSettlement::resolve_intent_policy_id(&intent).expect("policy"),
         };
         assert_ok!(IntentSettlement::request_expire_policy(
@@ -1144,7 +1145,7 @@ fn genesis_safety_upgrade_checks_accept_legacy_migrations_and_genesis() {
             assert_ok!(<IntentSettlement as Hooks<u64>>::try_state(100));
             assert_eq!(
                 SettlementStorageVersion::<Test>::get(),
-                crate::SETTLEMENT_STORAGE_VERSION
+                version.max(crate::NAMED_RESERVE_VERSION)
             );
         });
     }
@@ -1559,7 +1560,7 @@ fn genesis_safety_upgrade_moves_outstanding_bonds_to_the_settlement_reserve() {
 
         assert_eq!(
             SettlementStorageVersion::<Test>::get(),
-            crate::SETTLEMENT_STORAGE_VERSION
+            crate::NAMED_RESERVE_VERSION
         );
         assert_eq!(settlement_reserve(ALICE), 500);
         assert_eq!(Balances::reserved_balance(ALICE), 600);
@@ -1659,7 +1660,8 @@ fn genesis_safety_metadata_tags_are_the_tags_each_digest_hashes() {
         canonical_voucher_body_with_address, compute_voucher_digest_with_address, ChainIdentity,
     };
     use parity_scale_codec::Decode;
-    let metadata = IntentSettlement::pallet_constants_metadata();
+    let metadata = sp_io::TestExternalities::default()
+        .execute_with(IntentSettlement::pallet_constants_metadata);
     let tag = |name: &str| -> [u8; 4] {
         let constant = metadata
             .iter()
