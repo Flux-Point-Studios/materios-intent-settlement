@@ -16,6 +16,7 @@
 
 use crate as pallet_intent_settlement;
 use crate::pallet::{IsCommitteeMember, VerifyCommitteeSignature};
+use crate::tests::TEST_CARDANO_IDS;
 use crate::types::*;
 use crate::{
     credit_deposit_payload, expire_policy_attested_payload, request_voucher_payload,
@@ -85,15 +86,12 @@ parameter_types! {
     /// unit-test fixture so tests that share helpers can't accidentally
     /// substitute the wrong constant).
     pub const TestMateriosChainId: H256 = H256([0x73u8; 32]);
-    pub const TestNetworkMagic: u32 = 1u32;
-    pub const TestAegisPolicyV1ScriptHash: [u8; 28] = [0x42u8; 28];
     pub const TestSettlementVersion: u32 = 1u32;
     /// Task #266 (mis-sec P0): integration-runtime values for the
     /// attested-settle path. Mirror the unit-test fixtures so cross-suite
     /// helpers can hand back the same canonical pre-image inputs.
     pub const TestMinFinalityDepth: u32 = 3u32;
     pub const TestSettlementRequestTtl: u32 = 100u32;
-    pub const TestMainchainGenesisHash: [u8; 32] = [0x65u8; 32];
     // Task #84 (mis-sec P1): bond + slash integration-runtime config.
     pub const TestSlashWatcherShareBps: u32 = 5_000u32;
     pub const TestBondReleaseDelayBlocks: u32 = 30u32;
@@ -205,11 +203,11 @@ fn integration_voucher_digest(voucher: &Voucher) -> [u8; 32] {
             stake_hash: &stake,
         },
     );
-    let aegis_script = TestAegisPolicyV1ScriptHash::get();
+    let aegis_script = TEST_CARDANO_IDS.aegis_policy_v1_script_hash;
     crate::voucher_canonicalize::compute_voucher_digest_with_address(
         crate::voucher_canonicalize::ChainIdentity {
             materios_chain_id: &TEST_CHAIN_ID,
-            network_magic: TestNetworkMagic::get(),
+            network_magic: TEST_CARDANO_IDS.network_magic,
             aegis_policy_script_hash: &aegis_script,
             settlement_version: TestSettlementVersion::get(),
         },
@@ -248,12 +246,9 @@ impl pallet_intent_settlement::pallet::Config for Testnet {
     type MaxVoucherBatch = MaxVoucherBatch;
     type MaxSubmitBatch = MaxSubmitBatch;
     type MateriosChainId = TestMateriosChainId;
-    type NetworkMagic = TestNetworkMagic;
-    type AegisPolicyV1ScriptHash = TestAegisPolicyV1ScriptHash;
     type SettlementVersion = TestSettlementVersion;
     type MinFinalityDepth = TestMinFinalityDepth;
     type SettlementRequestTtl = TestSettlementRequestTtl;
-    type MainchainGenesisHash = TestMainchainGenesisHash;
     // Task #84 (mis-sec P1): bond + slash plumbing.
     type Currency = Balances;
     type SlashWatcherShareBps = TestSlashWatcherShareBps;
@@ -286,9 +281,15 @@ fn user_account() -> sp_runtime::AccountId32 {
 }
 
 pub(crate) fn new_ext() -> sp_io::TestExternalities {
-    let t = frame_system::GenesisConfig::<Testnet>::default()
+    let mut t = frame_system::GenesisConfig::<Testnet>::default()
         .build_storage()
         .unwrap();
+    // Genesis storage rather than the overlay, so the Cardano ids survive the
+    // database wipe between benchmark runs, as a benchmark genesis's do.
+    t.top.insert(
+        pallet_intent_settlement::pallet::CardanoIds::<Testnet>::hashed_key().to_vec(),
+        TEST_CARDANO_IDS.encode(),
+    );
     let mut ext = sp_io::TestExternalities::new(t);
     ext.execute_with(|| {
         System::set_block_number(1);
@@ -703,6 +704,53 @@ fn task174_request_voucher_t2_happy_path_real_sr25519() {
                 .unwrap();
         assert_eq!(intent.status, IntentStatus::Vouchered);
     });
+}
+
+/// The voucher digest commits to the Cardano network the chain stores: a
+/// bundle signed over the digest of the stored network verifies, and the same
+/// bundle fails once the chain stores another network magic or Aegis policy.
+#[test]
+fn the_voucher_digest_binds_the_stored_cardano_network() {
+    let other_magic = CardanoIdentity {
+        network_magic: 2,
+        ..TEST_CARDANO_IDS
+    };
+    let other_policy = CardanoIdentity {
+        aegis_policy_v1_script_hash: [0x43; 28],
+        ..TEST_CARDANO_IDS
+    };
+    for (stored, verifies) in [
+        (TEST_CARDANO_IDS, true),
+        (other_magic, false),
+        (other_policy, false),
+    ] {
+        new_ext().execute_with(|| {
+            let (alice, _bob, _charlie) = committee_accounts();
+            let (intent_id, claim_id, bfpr, voucher, payload) = rv_setup_attested(&user_account());
+            pallet_intent_settlement::pallet::CardanoIds::<Testnet>::put(stored);
+            let sigs = vec![sign_with("//Alice", &payload), sign_with("//Bob", &payload)];
+            let minted = IntentSettlement::request_voucher(
+                RuntimeOrigin::signed(alice),
+                claim_id,
+                intent_id,
+                voucher,
+                bfpr,
+                sigs,
+            )
+            .map_err(|refused| refused.error);
+            if verifies {
+                assert_ok!(minted);
+            } else {
+                assert_eq!(
+                    minted,
+                    Err(
+                        pallet_intent_settlement::pallet::Error::<Testnet>::InvalidSignature.into()
+                    ),
+                    "{stored:?}"
+                );
+            }
+        });
+    }
 }
 
 #[test]
@@ -1437,7 +1485,7 @@ fn task266_full_lifecycle_attested_settle_real_sr25519() {
                 .unwrap();
             p
         };
-        let mc_genesis = TestMainchainGenesisHash::get();
+        let mc_genesis = TEST_CARDANO_IDS.mainchain_genesis_hash;
         let evidence = SettlementEvidence {
             cardano_tx_hash: [0xDE; 32],
             observed_at_depth: TestMinFinalityDepth::get(),
@@ -1586,7 +1634,7 @@ fn task267_full_lifecycle_attested_expire_real_sr25519() {
 
         // Block 4: NEW PATH — request_expire_policy + attest_expire_policy.
         System::set_block_number(4);
-        let mc_genesis = TestMainchainGenesisHash::get();
+        let mc_genesis = TEST_CARDANO_IDS.mainchain_genesis_hash;
         let evidence = ExpiryEvidence {
             cardano_tx_hash: [0xEF; 32],
             observed_at_depth: TestMinFinalityDepth::get(),
@@ -1667,7 +1715,7 @@ fn genesis_safety_fraud_bundle_cannot_slash_a_replacement_request() {
             observed_slot: 123,
             beneficiary_addr_hash: [0x22; 28],
             amount_lovelace: 1_000,
-            mainchain_genesis_hash: TestMainchainGenesisHash::get(),
+            mainchain_genesis_hash: TEST_CARDANO_IDS.mainchain_genesis_hash,
         };
         let proof = FraudProof::TxNotFound;
         let mut legacy_body = TEST_CHAIN_ID.to_vec();
@@ -1798,7 +1846,7 @@ fn genesis_safety_supersede_signatures_bind_the_supplied_evidence() {
             observed_slot: 12_345_678,
             beneficiary_addr_hash: payment_hash,
             amount_lovelace: voucher.amount_ada,
-            mainchain_genesis_hash: TestMainchainGenesisHash::get(),
+            mainchain_genesis_hash: TEST_CARDANO_IDS.mainchain_genesis_hash,
         };
         let mut junk = honest;
         junk.observed_slot = 1;
@@ -1820,7 +1868,7 @@ fn genesis_safety_supersede_signatures_bind_the_supplied_evidence() {
             voucher.amount_ada,
             honest.observed_at_depth,
             honest.observed_slot,
-            &TestMainchainGenesisHash::get(),
+            &TEST_CARDANO_IDS.mainchain_genesis_hash,
         );
         let signatures = vec![sign_with("//Alice", &stca), sign_with("//Bob", &stca)];
         let mut tampered = honest;

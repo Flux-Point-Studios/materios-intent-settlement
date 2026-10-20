@@ -279,6 +279,79 @@ impl Default for PoolUtilizationParams {
 }
 
 // ---------------------------------------------------------------------------
+// Cardano network identity
+// ---------------------------------------------------------------------------
+
+/// Cardano mainnet's network magic: the `networkMagic` of the
+/// `shelley-genesis.json` its environment publishes
+/// (book.world.dev.cardano.org/environments/mainnet).
+pub const CARDANO_MAINNET_NETWORK_MAGIC: u32 = 764_824_073;
+
+/// Cardano mainnet's Shelley genesis hash: blake2b-256 of that
+/// `shelley-genesis.json`, which mainnet's `config.json` publishes as
+/// `ShelleyGenesisHash`.
+pub const CARDANO_MAINNET_SHELLEY_GENESIS_HASH: [u8; 32] = [
+    0x1a, 0x3b, 0xe3, 0x8b, 0xcb, 0xb7, 0x91, 0x19, 0x69, 0x28, 0x37, 0x16, 0xad, 0x7a, 0xa5, 0x50,
+    0x25, 0x02, 0x26, 0xb7, 0x6a, 0x61, 0xfc, 0x51, 0xcc, 0x9a, 0x9a, 0x35, 0xd9, 0x27, 0x6d, 0x81,
+];
+
+/// The Cardano network a chain settles against. Every voucher digest the
+/// committee signs commits to `network_magic` and
+/// `aegis_policy_v1_script_hash`, and all settlement and expiry evidence must
+/// name `mainchain_genesis_hash`, so a bundle signed for one Cardano network
+/// or Aegis deployment never settles on another.
+#[derive(
+    Clone,
+    Copy,
+    Encode,
+    Decode,
+    TypeInfo,
+    MaxEncodedLen,
+    RuntimeDebug,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct CardanoIdentity {
+    /// The `networkMagic` of the network's Shelley genesis.
+    pub network_magic: u32,
+    /// Blake2b-256 of the network's `shelley-genesis.json`.
+    pub mainchain_genesis_hash: [u8; 32],
+    /// Blake2b-224 script hash of the deployed `aegis_policy_v1` validator,
+    /// all zero where none is deployed.
+    pub aegis_policy_v1_script_hash: [u8; 28],
+}
+
+impl CardanoIdentity {
+    /// Refuses ids that name no Cardano network, or name Cardano mainnet only
+    /// in part. Mainnet's magic and Shelley genesis hash come together, and a
+    /// mainnet chain settles against the Aegis policy deployed there; a test
+    /// network may have none deployed.
+    pub fn check(&self) -> Result<(), &'static str> {
+        if self.network_magic == 0 {
+            return Err("Cardano network magic 0 names no Cardano network");
+        }
+        if self.mainchain_genesis_hash == [0; 32] {
+            return Err("an all-zero Shelley genesis hash names no Cardano network");
+        }
+        let mainnet_magic = self.network_magic == CARDANO_MAINNET_NETWORK_MAGIC;
+        if mainnet_magic != (self.mainchain_genesis_hash == CARDANO_MAINNET_SHELLEY_GENESIS_HASH) {
+            return Err(
+                "Cardano mainnet's network magic and Shelley genesis hash name it only together",
+            );
+        }
+        if mainnet_magic && self.aegis_policy_v1_script_hash == [0; 28] {
+            return Err(
+                "Cardano mainnet ids with no aegis_policy_v1 script hash bind no Aegis policy",
+            );
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Runtime-API payloads
 // ---------------------------------------------------------------------------
 
@@ -404,8 +477,8 @@ pub struct SubmitIntentEntry {
 /// Per design memo §3.3, none of these fields are recomputed off chain state
 /// at attest time — they are the requester's claim. The runtime cross-checks
 /// `amount_lovelace` / `beneficiary_addr_hash` against the stored `Voucher`
-/// (matching) and `mainchain_genesis_hash` against the pinned `MainchainGenesisHash`
-/// runtime constant (preprod vs mainnet pinning); future task #84 ships a
+/// (matching) and `mainchain_genesis_hash` against the Shelley genesis hash the
+/// chain stores in `CardanoIds` (preprod vs mainnet pinning); future task #84 ships a
 /// permissionless slash route that lets a watcher prove `cardano_tx_hash`
 /// /`observed_slot` are fraudulent.
 #[derive(
@@ -429,8 +502,8 @@ pub struct SettlementEvidence {
     /// `claim.amount_ada` (= `voucher.amount_ada`) at attest time.
     pub amount_lovelace: u64,
     /// 32-byte Cardano genesis hash (preprod vs mainnet vs preview).
-    /// Cross-checked against `Config::MainchainGenesisHash` at attest time so
-    /// a preprod sig bundle can never settle a mainnet claim or vice versa.
+    /// Cross-checked against the stored `CardanoIds` at request time so a
+    /// preprod sig bundle can never settle a mainnet claim or vice versa.
     pub mainchain_genesis_hash: [u8; 32],
 }
 
@@ -537,8 +610,8 @@ pub struct SettleAttestedBatchEntry {
 ///
 /// Per design memo §3.3, none of these fields are recomputed off chain state
 /// at attest time — they are the requester's claim. The runtime cross-checks
-/// `mainchain_genesis_hash` against the pinned `MainchainGenesisHash` runtime
-/// constant (preprod vs mainnet pinning) and `observed_at_depth` against
+/// `mainchain_genesis_hash` against the Shelley genesis hash the chain stores
+/// in `CardanoIds` (preprod vs mainnet pinning) and `observed_at_depth` against
 /// `MinFinalityDepth`. The `policy_id_witness` field is cross-checked against
 /// the on-chain intent's resolved policy id so the requester cannot bind an
 /// expire observation to the wrong intent (recycling defense). Future task
@@ -558,9 +631,8 @@ pub struct ExpiryEvidence {
     /// Cardano slot of the expiring tx (the slot of the block it landed in).
     pub observed_slot: u64,
     /// 32-byte Cardano genesis hash (preprod vs mainnet vs preview).
-    /// Cross-checked against `Config::MainchainGenesisHash` at request time
-    /// so a preprod sig bundle can never expire a mainnet intent or vice
-    /// versa.
+    /// Cross-checked against the stored `CardanoIds` at request time so a
+    /// preprod sig bundle can never expire a mainnet intent or vice versa.
     pub mainchain_genesis_hash: [u8; 32],
     /// 32-byte witness of the policy id the requester observed expiring on
     /// Cardano. Cross-checked against the on-chain intent's resolved policy

@@ -94,6 +94,8 @@ pub trait WeightInfo {
     /// The `on_initialize` expiry sweep over `n` pending BuyPolicy intents,
     /// each removed from a full `PendingBatches`.
     fn expire_intents(n: u32) -> Weight;
+    /// `request_expire_policy` pinning evidence for an attested intent.
+    fn request_expire_policy() -> Weight;
 }
 
 /// Base dispatch costs. Threshold-signature work is charged separately by
@@ -575,6 +577,9 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
             .saturating_add(T::DbWeight::get().writes((1_u64).saturating_mul(n.into())))
             .saturating_add(Weight::from_parts(0, 3119).saturating_mul(n.into()))
     }
+    fn request_expire_policy() -> Weight {
+        Weight::from_parts(35_000_000, 0)
+    }
 }
 
 /// Unit-test default. Mirrors the auto-generated curve at a slightly higher
@@ -640,5 +645,8 @@ impl WeightInfo for () {
     }
     fn expire_intents(n: u32) -> Weight {
         Weight::from_parts(10_000, 0).saturating_add(Weight::from_parts(610_000_000, 21_000).saturating_mul(n.into()))
+    }
+    fn request_expire_policy() -> Weight {
+        Weight::from_parts(620_000_000, 22_000)
     }
 }

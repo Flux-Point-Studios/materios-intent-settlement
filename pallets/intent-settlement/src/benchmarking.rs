@@ -223,9 +223,17 @@ where
         observed_slot: 12_345_678,
         beneficiary_addr_hash: payment_hash,
         amount_lovelace: 1_000,
-        mainchain_genesis_hash: T::MainchainGenesisHash::get(),
+        mainchain_genesis_hash: stored_mainchain_genesis::<T>(),
     };
     (claim_id, evidence)
+}
+
+/// The Shelley genesis hash the benchmarked chain's genesis stores, which
+/// every piece of evidence names.
+fn stored_mainchain_genesis<T: Config>() -> [u8; 32] {
+    crate::pallet::CardanoIds::<T>::get()
+        .expect("the benchmark genesis stores its Cardano ids")
+        .mainchain_genesis_hash
 }
 
 fn intent_of<T: Config>(claim_id: ClaimId) -> IntentId {
@@ -875,13 +883,12 @@ mod benchmarks {
             },
         );
 
-        let mc_g = T::MainchainGenesisHash::get();
         let depth = T::MinFinalityDepth::get();
         let evidence = ExpiryEvidence {
             cardano_tx_hash: [0xCFu8; 32],
             observed_at_depth: depth,
             observed_slot: 12_345_678,
-            mainchain_genesis_hash: mc_g,
+            mainchain_genesis_hash: stored_mainchain_genesis::<T>(),
             policy_id_witness: product_id,
         };
 
@@ -906,7 +913,7 @@ mod benchmarks {
             cardano_tx_hash: [0xCFu8; 32],
             observed_at_depth: T::MinFinalityDepth::get(),
             observed_slot: 12_345_678,
-            mainchain_genesis_hash: T::MainchainGenesisHash::get(),
+            mainchain_genesis_hash: stored_mainchain_genesis::<T>(),
             policy_id_witness: BENCH_PRODUCT,
         };
         crate::pallet::PolicyExpireRequests::<T>::insert(

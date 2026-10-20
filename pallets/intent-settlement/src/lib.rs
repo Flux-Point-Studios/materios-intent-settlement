@@ -19,6 +19,7 @@
 extern crate alloc;
 
 pub use pallet::*;
+pub mod migrations;
 mod signature_weights;
 pub mod types;
 pub mod voucher_canonicalize;
@@ -115,8 +116,15 @@ pub const STCA_CUTOVER_GRACE: u32 = 50;
 /// path before the old route closes).
 pub const EXPP_CUTOVER_GRACE: u32 = 50;
 
-/// `SettlementStorageVersion` written at genesis and by the final migration step.
-pub const SETTLEMENT_STORAGE_VERSION: u32 = 4;
+/// `SettlementStorageVersion` written at genesis and by
+/// [`migrations::SeedCardanoIds`].
+pub const SETTLEMENT_STORAGE_VERSION: u32 = 5;
+
+/// The settlement storage version at which bonds sit under
+/// `SETTLEMENT_BOND_RESERVE_ID`: the last step the pallet's own
+/// `on_runtime_upgrade` takes. [`migrations::SeedCardanoIds`] takes a chain
+/// from here to `SETTLEMENT_STORAGE_VERSION`.
+pub const NAMED_RESERVE_VERSION: u32 = 4;
 
 /// Balances named-reserve identifier holding every settlement bond. Refunds
 /// and slashes move at most this reserve's amount, never another pallet's.
@@ -526,7 +534,7 @@ pub fn expire_policy_attested_payload(
 /// mirror reconstructs the same byte stream from raw bytes per entry.
 ///
 /// All per-entry inputs are either chain-state-derived (`voucher_digest` from
-/// `Vouchers[claim_id]`, `mainchain_genesis_hash` from runtime config) or
+/// `Vouchers[claim_id]`, `mainchain_genesis_hash` from `CardanoIds`) or
 /// requester-committed in the matching `ClaimSettlementRequests[claim_id]`
 /// record, so committee members independently compute the same digest from
 /// the chain state at attest time.
@@ -561,7 +569,7 @@ pub fn attest_batch_settle_payload(
 /// Plain-bytes view of one attested-batch entry used by
 /// [`attest_batch_settle_payload`]. The pallet hydrates this struct at
 /// attest time from on-chain state (`ClaimSettlementRequests`,
-/// `Vouchers`, `MainchainGenesisHash`) so all attestors recompute the
+/// `Vouchers`, `CardanoIds`) so all attestors recompute the
 /// same byte stream without trusting any requester-supplied digest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchAttestEntryBytes {
@@ -760,21 +768,6 @@ pub mod pallet {
         #[pallet::constant]
         type MateriosChainId: Get<sp_core::H256>;
 
-        /// Task #73: Cardano network magic (1 = preprod, 764824073 = mainnet,
-        /// 2 = preview). Encoded LE u32 in the voucher digest pre-image so a
-        /// preprod-signed voucher can never settle on mainnet (or vice versa).
-        #[pallet::constant]
-        type NetworkMagic: Get<u32>;
-
-        /// Task #73: 28-byte blake2b224 hash of the deployed `aegis_policy_v1`
-        /// Aiken validator. Pinned into the voucher digest pre-image so a
-        /// signed voucher is bound to the SPECIFIC policy script that's
-        /// currently the on-chain source of truth — pre/post Aiken redeploy
-        /// or pre/post `aiken blueprint apply` changes domain-separate
-        /// automatically.
-        #[pallet::constant]
-        type AegisPolicyV1ScriptHash: Get<[u8; 28]>;
-
         /// Task #73: Settlement-protocol semver. Bumped on any breaking
         /// pre-image change so pre-bump and post-bump bundles are
         /// domain-separated even when all other fields collide.
@@ -817,14 +810,6 @@ pub mod pallet {
         /// requests don't pin storage.
         #[pallet::constant]
         type SettlementRequestTtl: Get<u32>;
-
-        /// Task #266 (mis-sec P0): pinned 32-byte Cardano-network genesis
-        /// hash. `attest_settle` rejects bundles whose
-        /// `SettlementEvidence.mainchain_genesis_hash` does not match this
-        /// constant, preventing preprod attestations landing on mainnet
-        /// runtime and vice versa.
-        #[pallet::constant]
-        type MainchainGenesisHash: Get<[u8; 32]>;
 
         /// Currency holding settlement bonds under the
         /// `SETTLEMENT_BOND_RESERVE_ID` named reserve. `pallet_balances`
@@ -1067,8 +1052,9 @@ pub mod pallet {
     /// settlements grandfathered, STCA path live + cutover scheduled);
     /// v2 = post-#267 (legacy expire_policy_mirror grandfathered + EXPP
     /// path live + expire-cutover scheduled); v3 includes settlement bonds;
-    /// v4 holds them under `SETTLEMENT_BOND_RESERVE_ID`. Fresh genesis
-    /// starts at `SETTLEMENT_STORAGE_VERSION` with both legacy paths closed.
+    /// v4 holds them under `SETTLEMENT_BOND_RESERVE_ID`; v5 stores the
+    /// Cardano network in `CardanoIds`. Fresh genesis starts at
+    /// `SETTLEMENT_STORAGE_VERSION` with both legacy paths closed.
     #[pallet::storage]
     pub type SettlementStorageVersion<T: Config> = StorageValue<_, u32, ValueQuery>;
 
@@ -1183,6 +1169,13 @@ pub mod pallet {
         BoundedVec<ClaimId, ConstU32<MAX_SETTLE_BATCH>>,
         ValueQuery,
     >;
+
+    /// The Cardano network this chain settles against. Genesis stores it, and
+    /// [`crate::migrations::SeedCardanoIds`] on a chain that ran before
+    /// genesis did. While it is absent, every call that computes a voucher
+    /// digest or checks Cardano evidence refuses with `CardanoIdsMissing`.
+    #[pallet::storage]
+    pub type CardanoIds<T: Config> = StorageValue<_, CardanoIdentity, OptionQuery>;
 
     // ---------------------------------------------------------------------
     // Events
@@ -1520,7 +1513,7 @@ pub mod pallet {
         /// vulnerable to a same-epoch rollback (attack A4 in the design memo).
         FinalityDepthBelowMinimum,
         /// Task #266 (mis-sec P0): the requester's
-        /// `mainchain_genesis_hash` disagrees with `Config::MainchainGenesisHash`.
+        /// `mainchain_genesis_hash` disagrees with the one stored in `CardanoIds`.
         /// A preprod sig bundle cannot settle a mainnet claim and vice versa —
         /// this is the network-isolation guarantee #73 establishes for the
         /// Materios side, extended here to the Cardano side.
@@ -1638,6 +1631,9 @@ pub mod pallet {
         /// The pending request already carries this evidence and mode;
         /// attest it with `attest_settle` instead.
         SupersedeMatchesRequest,
+        /// The chain stores no Cardano network to settle against
+        /// (`CardanoIds`), so no voucher digest or evidence check can bind one.
+        CardanoIdsMissing,
     }
 
     // ---------------------------------------------------------------------
@@ -1653,8 +1649,23 @@ pub mod pallet {
         /// Issue #7: M-of-N bar for `credit_deposit`/`settle_claim`. Zero
         /// means "use DefaultMinSignerThreshold from Config".
         pub min_signer_threshold: u32,
+        /// The Cardano network the chain settles against, stored as
+        /// `CardanoIds`. `None` stores none, which leaves settlement refusing.
+        pub cardano_ids: Option<CardanoIdentity>,
         #[serde(skip)]
         pub _phantom: core::marker::PhantomData<T>,
+    }
+
+    impl<T: Config> GenesisConfig<T> {
+        /// A genesis names the Cardano network it settles against, as
+        /// [`CardanoIdentity::check`] accepts it. `build` cannot refuse the
+        /// default config, which FRAME builds in its own tests, so the runtime
+        /// calls this from `GenesisBuilder::build_state`.
+        pub fn ensure_cardano_ids(&self) -> Result<(), &'static str> {
+            self.cardano_ids
+                .ok_or("intent-settlement genesis names no Cardano network: set cardanoIds")?
+                .check()
+        }
     }
 
     #[pallet::genesis_build]
@@ -1682,6 +1693,12 @@ pub mod pallet {
             SettlementStorageVersion::<T>::put(SETTLEMENT_STORAGE_VERSION);
             StcaCutoverBlock::<T>::put(BlockNumberFor::<T>::from(0u32));
             PolicyExpireCutoverBlock::<T>::put(BlockNumberFor::<T>::from(0u32));
+            if let Some(ids) = self.cardano_ids {
+                if let Err(refusal) = ids.check() {
+                    panic!("intent-settlement genesis: {refusal}");
+                }
+                CardanoIds::<T>::put(ids);
+            }
         }
     }
 
@@ -1939,12 +1956,19 @@ pub mod pallet {
                     0 => expp.is_zero(),
                     1 => !stca.is_zero(),
                     2 => !stca.is_zero() && !expp.is_zero(),
-                    3 | SETTLEMENT_STORAGE_VERSION => stca.is_zero() == expp.is_zero(),
+                    3 | NAMED_RESERVE_VERSION | SETTLEMENT_STORAGE_VERSION => {
+                        stca.is_zero() == expp.is_zero()
+                    }
                     _ => false,
                 },
                 "settlement cutovers inconsistent with storage version"
             );
-            if version == SETTLEMENT_STORAGE_VERSION {
+            ensure!(
+                version < SETTLEMENT_STORAGE_VERSION
+                    || CardanoIds::<T>::get().is_some_and(|ids| ids.check().is_ok()),
+                "settlement storage version 5 holds no valid Cardano ids"
+            );
+            if version >= NAMED_RESERVE_VERSION {
                 let mut owed = alloc::collections::BTreeMap::<T::AccountId, u128>::new();
                 let pending = ClaimSettlementRequests::<T>::iter_values()
                     .map(|request| (request.requester, request.bond_amount));
@@ -2235,7 +2259,7 @@ pub mod pallet {
                         });
                     }
                 }
-                SettlementStorageVersion::<T>::put(SETTLEMENT_STORAGE_VERSION);
+                SettlementStorageVersion::<T>::put(NAMED_RESERVE_VERSION);
             }
 
             total
@@ -2440,28 +2464,11 @@ pub mod pallet {
                 //
                 // #79: voucher_digest is the chain-identity-bound CBOR form (the
                 // legacy SCALE form is gone). The pallet computes from voucher
-                // fields + chain-config so the keeper's mirror digest cannot
+                // fields + chain state so the keeper's mirror digest cannot
                 // diverge.
                 let chain_id = Self::materios_chain_id_bytes();
-                let aegis_script_hash = T::AegisPolicyV1ScriptHash::get();
-                let beneficiary_cbor =
-                    Self::beneficiary_cbor_for(&voucher.beneficiary_cardano_addr)?;
                 let voucher_digest_pre =
-                    crate::voucher_canonicalize::compute_voucher_digest_with_address(
-                        crate::voucher_canonicalize::ChainIdentity {
-                            materios_chain_id: &chain_id,
-                            network_magic: T::NetworkMagic::get(),
-                            aegis_policy_script_hash: &aegis_script_hash,
-                            settlement_version: T::SettlementVersion::get(),
-                        },
-                        &voucher.claim_id,
-                        &voucher.policy_id,
-                        &beneficiary_cbor,
-                        voucher.amount_ada,
-                        &voucher.batch_fairness_proof_digest,
-                        voucher.issued_block,
-                        voucher.expiry_slot_cardano,
-                    );
+                    Self::voucher_digest(&chain_id, &Self::cardano_ids()?, &voucher)?;
                 let voucher_payload = request_voucher_payload(
                     &chain_id,
                     &claim_id,
@@ -3276,13 +3283,7 @@ pub mod pallet {
                     // (legacy SCALE form is gone) so the keeper's mirror digest is
                     // guaranteed to match.
                     let chain_id = Self::materios_chain_id_bytes();
-                    let aegis_script_hash = T::AegisPolicyV1ScriptHash::get();
-                    let chain_identity = crate::voucher_canonicalize::ChainIdentity {
-                        materios_chain_id: &chain_id,
-                        network_magic: T::NetworkMagic::get(),
-                        aegis_policy_script_hash: &aegis_script_hash,
-                        settlement_version: T::SettlementVersion::get(),
-                    };
+                    let cardano = Self::cardano_ids()?;
                     let mut tuples: alloc::vec::Vec<(ClaimId, IntentId, [u8; 32], [u8; 32])> =
                         alloc::vec::Vec::with_capacity(n);
                     for entry in entries.iter() {
@@ -3296,19 +3297,8 @@ pub mod pallet {
                             entry.voucher.batch_fairness_proof_digest == bfpr_digest,
                             Error::<T>::FairnessDigestMismatch
                         );
-                        let beneficiary_cbor =
-                            Self::beneficiary_cbor_for(&entry.voucher.beneficiary_cardano_addr)?;
                         let voucher_digest =
-                            crate::voucher_canonicalize::compute_voucher_digest_with_address(
-                                chain_identity,
-                                &entry.voucher.claim_id,
-                                &entry.voucher.policy_id,
-                                &beneficiary_cbor,
-                                entry.voucher.amount_ada,
-                                &entry.voucher.batch_fairness_proof_digest,
-                                entry.voucher.issued_block,
-                                entry.voucher.expiry_slot_cardano,
-                            );
+                            Self::voucher_digest(&chain_id, &cardano, &entry.voucher)?;
                         tuples.push((entry.claim_id, entry.intent_id, voucher_digest, bfpr_digest));
                     }
 
@@ -3519,7 +3509,7 @@ pub mod pallet {
         /// Per-call invariants:
         /// - `evidence.observed_at_depth >= Config::MinFinalityDepth`
         ///   (`FinalityDepthBelowMinimum`).
-        /// - `evidence.mainchain_genesis_hash == Config::MainchainGenesisHash`
+        /// - `evidence.mainchain_genesis_hash` is the one stored in `CardanoIds`
         ///   (`WrongMainchainGenesis`).
         /// - Claim must exist (`ClaimNotFound`) and not already be settled
         ///   (`AlreadySettled`).
@@ -3576,7 +3566,7 @@ pub mod pallet {
         /// pipeline. The committee submits M-of-N signatures over the
         /// canonical STCA payload, which the pallet rebuilds from the
         /// stored `ClaimSettlementRequests` entry + the on-chain
-        /// `voucher_digest` + the pinned `MainchainGenesisHash`. The
+        /// `voucher_digest` + the stored `CardanoIds`. The
         /// requester cannot influence the digest after `request_settle`
         /// landed — it's wholly determined by chain state.
         ///
@@ -3650,7 +3640,9 @@ pub mod pallet {
                 // Re-derive voucher_digest from the on-chain voucher. Same
                 // canonical pre-image as `request_voucher` / RVCH, so all
                 // committee members see the same bytes.
-                let voucher_digest = Self::compute_canonical_voucher_digest(&voucher)?;
+                let chain_id = Self::materios_chain_id_bytes();
+                let cardano = Self::cardano_ids()?;
+                let voucher_digest = Self::voucher_digest(&chain_id, &cardano, &voucher)?;
 
                 // Re-derive payment-key hash from the on-chain voucher address.
                 // We already cross-checked this against the requester's
@@ -3663,8 +3655,6 @@ pub mod pallet {
                     .map_err(|_| Error::<T>::InvalidBeneficiaryAddress)?;
 
                 // Build the canonical STCA payload + run the M-of-N gate.
-                let chain_id = Self::materios_chain_id_bytes();
-                let mc_genesis = T::MainchainGenesisHash::get();
                 let payload = settle_claim_attested_payload(
                     &chain_id,
                     &claim_id,
@@ -3675,7 +3665,7 @@ pub mod pallet {
                     claim.amount_ada,
                     request.evidence.observed_at_depth,
                     request.evidence.observed_slot,
-                    &mc_genesis,
+                    &cardano.mainchain_genesis_hash,
                 );
                 Self::verify_threshold_signatures::<T::SigVerifier>(
                     &payload,
@@ -3757,17 +3747,19 @@ pub mod pallet {
                     Error::<T>::SupersedeMatchesRequest
                 );
 
+                let chain_id = Self::materios_chain_id_bytes();
+                let cardano = Self::cardano_ids()?;
                 let payload = settle_claim_attested_payload(
-                    &Self::materios_chain_id_bytes(),
+                    &chain_id,
                     &claim_id,
-                    &Self::compute_canonical_voucher_digest(&voucher)?,
+                    &Self::voucher_digest(&chain_id, &cardano, &voucher)?,
                     &evidence.cardano_tx_hash,
                     settled_direct,
                     &evidence.beneficiary_addr_hash,
                     claim.amount_ada,
                     evidence.observed_at_depth,
                     evidence.observed_slot,
-                    &T::MainchainGenesisHash::get(),
+                    &cardano.mainchain_genesis_hash,
                 );
                 Self::verify_threshold_signatures::<T::SigVerifier>(
                     &payload,
@@ -3909,7 +3901,7 @@ pub mod pallet {
                     // is about to hash. Any missing/expired request fails the batch
                     // before any sig verifications run.
                     let chain_id = Self::materios_chain_id_bytes();
-                    let mc_genesis = T::MainchainGenesisHash::get();
+                    let cardano = Self::cardano_ids()?;
                     let now = <frame_system::Pallet<T>>::block_number();
                     let now_u64: u64 = now.into();
                     let ttl_u64: u64 = T::SettlementRequestTtl::get().into();
@@ -3936,7 +3928,7 @@ pub mod pallet {
                         let claim = Claims::<T>::get(*cid).ok_or(Error::<T>::ClaimNotFound)?;
                         ensure!(!claim.settled, Error::<T>::AlreadySettled);
                         let voucher = Vouchers::<T>::get(*cid).ok_or(Error::<T>::VoucherMissing)?;
-                        let voucher_digest = Self::compute_canonical_voucher_digest(&voucher)?;
+                        let voucher_digest = Self::voucher_digest(&chain_id, &cardano, &voucher)?;
                         let (payment_hash, _stake_hash) =
                             crate::voucher_canonicalize::split_type0_address_bytes(
                                 voucher.beneficiary_cardano_addr.as_slice(),
@@ -3955,7 +3947,7 @@ pub mod pallet {
                             amount_ada: claim.amount_ada,
                             depth: request.evidence.observed_at_depth,
                             slot: request.evidence.observed_slot,
-                            mc_genesis,
+                            mc_genesis: cardano.mainchain_genesis_hash,
                         });
                         hydrated_amounts.push(claim.amount_ada);
                         hydrated_direct.push(request.settled_direct);
@@ -4079,7 +4071,7 @@ pub mod pallet {
         /// Per-call invariants:
         /// - `evidence.observed_at_depth >= Config::MinFinalityDepth`
         ///   (`FinalityDepthBelowMinimum`).
-        /// - `evidence.mainchain_genesis_hash == Config::MainchainGenesisHash`
+        /// - `evidence.mainchain_genesis_hash` is the one stored in `CardanoIds`
         ///   (`WrongMainchainGenesis`).
         /// - `evidence.cardano_tx_hash == cardano_tx_hash` argument
         ///   (`ExpiryEvidenceMismatch`).
@@ -4100,7 +4092,7 @@ pub mod pallet {
         ///   `SettlementRequestTtl` before re-posting; this preempts a
         ///   request-flapper attack.
         #[pallet::call_index(17)]
-        #[pallet::weight((Weight::from_parts(35_000_000, 0), DispatchClass::Operational, Pays::Yes))]
+        #[pallet::weight((T::WeightInfo::request_expire_policy(), DispatchClass::Operational, Pays::Yes))]
         pub fn request_expire_policy(
             origin: OriginFor<T>,
             intent_id: IntentId,
@@ -4121,7 +4113,7 @@ pub mod pallet {
             // expire a mainnet intent and vice versa.
             ensure!(
                 attestation_evidence.mainchain_genesis_hash
-                    == T::MainchainGenesisHash::get(),
+                    == Self::cardano_ids()?.mainchain_genesis_hash,
                 Error::<T>::WrongMainchainGenesis
             );
 
@@ -4190,7 +4182,7 @@ pub mod pallet {
         /// pipeline. The committee submits M-of-N signatures over the
         /// canonical EXPP payload, which the pallet rebuilds from the
         /// stored `PolicyExpireRequests` entry + the on-chain intent's
-        /// resolved policy id + the pinned `MainchainGenesisHash`. The
+        /// resolved policy id + the stored `CardanoIds`. The
         /// requester cannot influence the digest after
         /// `request_expire_policy` landed — it's wholly determined by
         /// chain state.
@@ -4279,16 +4271,14 @@ pub mod pallet {
                 let resolved_policy_id = Self::resolve_intent_policy_id(&intent)?;
 
                 // Build the canonical EXPP payload + run the M-of-N gate.
-                let chain_id = Self::materios_chain_id_bytes();
-                let mc_genesis = T::MainchainGenesisHash::get();
                 let payload = expire_policy_attested_payload(
-                    &chain_id,
+                    &Self::materios_chain_id_bytes(),
                     &intent_id,
                     &resolved_policy_id,
                     &request.evidence.cardano_tx_hash,
                     request.evidence.observed_at_depth,
                     request.evidence.observed_slot,
-                    &mc_genesis,
+                    &Self::cardano_ids()?.mainchain_genesis_hash,
                 );
                 Self::verify_threshold_signatures::<T::SigVerifier>(
                     &payload,
@@ -4872,16 +4862,34 @@ pub mod pallet {
         pub fn compute_canonical_voucher_digest(
             voucher: &Voucher,
         ) -> Result<[u8; 32], DispatchError> {
-            let chain_id = Self::materios_chain_id_bytes();
-            let aegis_script_hash = T::AegisPolicyV1ScriptHash::get();
+            Self::voucher_digest(
+                &Self::materios_chain_id_bytes(),
+                &Self::cardano_ids()?,
+                voucher,
+            )
+        }
+
+        /// The Cardano network this chain settles against, which every
+        /// voucher digest and evidence check binds.
+        pub fn cardano_ids() -> Result<CardanoIdentity, DispatchError> {
+            CardanoIds::<T>::get().ok_or_else(|| Error::<T>::CardanoIdsMissing.into())
+        }
+
+        /// The canonical voucher digest on this chain, `chain_id`, settling
+        /// against `cardano`.
+        fn voucher_digest(
+            chain_id: &[u8; 32],
+            cardano: &CardanoIdentity,
+            voucher: &Voucher,
+        ) -> Result<[u8; 32], DispatchError> {
             let beneficiary_cbor =
                 Self::beneficiary_cbor_for(&voucher.beneficiary_cardano_addr)?;
             Ok(
                 crate::voucher_canonicalize::compute_voucher_digest_with_address(
                     crate::voucher_canonicalize::ChainIdentity {
-                        materios_chain_id: &chain_id,
-                        network_magic: T::NetworkMagic::get(),
-                        aegis_policy_script_hash: &aegis_script_hash,
+                        materios_chain_id: chain_id,
+                        network_magic: cardano.network_magic,
+                        aegis_policy_script_hash: &cardano.aegis_policy_v1_script_hash,
                         settlement_version: T::SettlementVersion::get(),
                     },
                     &voucher.claim_id,
@@ -5118,7 +5126,7 @@ pub mod pallet {
             evidence: &SettlementEvidence,
         ) -> Result<(Claim, Voucher), DispatchError> {
             ensure!(
-                evidence.mainchain_genesis_hash == T::MainchainGenesisHash::get(),
+                evidence.mainchain_genesis_hash == Self::cardano_ids()?.mainchain_genesis_hash,
                 Error::<T>::WrongMainchainGenesis
             );
             ensure!(
