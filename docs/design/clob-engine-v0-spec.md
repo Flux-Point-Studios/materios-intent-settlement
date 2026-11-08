@@ -11,7 +11,7 @@
 
 Per CLAUDE.md doctrine: name the asset this makes more valuable, the moment it ships.
 
-1. **SaturnSwap (the brand)** — currently runs an off-chain orderbook + Hydra-L2 settlement. The very reason Materios exists is so SaturnSwap is not constrained by Hydra throughput, head-channel ceremony, and the eUTxO contention model. Shipping `pallet-clob` is the move that takes SaturnSwap from "Cardano CLOB on a Hydra head" → "Cardano CLOB on a Cardano-anchored L2 that does 250+ substrate TPS today."
+1. **SaturnSwap (the brand)** — currently runs an off-chain orderbook. Materios exists so SaturnSwap is not constrained by the eUTxO contention model. Shipping `pallet-clob` makes SaturnSwap a Cardano CLOB on a Cardano-anchored L2 that does 250+ substrate TPS today.
 
 2. **`pallet-intent-settlement`** — the settlement bond + slash pattern, the M-of-N committee, the voucher pipeline, and the Cardano L1 label-8746 anchor flow are all reused. `pallet-clob` does NOT introduce a new trust root.
 
@@ -61,7 +61,7 @@ If `pallet-clob` ships well, every existing Materios primitive (oracle, intent-s
 | **dYdX v4 (CosmosSDK app-chain)** | Native pallet on the L2, no smart-contract overhead, governance-gated market registration. | The custom Cosmos consensus — we already run partner-chains Aura + GRANDPA, no reason to fork it. |
 | **Serum (Solana CLOB)** | Discrete-event price-time priority. Crank-keeper pattern as a v1 fallback. | The crank-keeper-must-run-frequently model — we have deterministic blocks and `on_initialize`, no off-chain crank required for v0. |
 | **GMX / dYdX perp** | N/A — perps already designed in `pallet-perp-engine`. | N/A |
-| **SaturnSwap existing Hydra orderbook** | Maker-volume indexing pattern (PR #4 records to L1), GraphQL surface shape for the frontend. | Hydra L2 head-channel settlement — the whole reason we're building this pallet. Replace it. |
+| **SaturnSwap existing orderbook** | GraphQL surface shape for the frontend. | Its off-chain settlement path. `pallet-clob` replaces it. |
 | **Substrate `pallet-assets`** | Use unmodified as the asset ledger. Multi-asset support, mint/burn governance, freeze/thaw built-in. | Don't write a custom multi-asset ledger. |
 | **Polkadot SDK `frame-system::on_initialize`** | Run the matching engine at the start of each block, deterministic, weight-budgeted. | Don't run matching at end-of-block (`on_finalize`) — that limits proof_size and is less ergonomic for events ordering. |
 
@@ -657,4 +657,4 @@ PR chain shape (mirrors `pallet-perp-engine`'s PR-A → PR-E):
 
 Sec-review CLEAN gates on every PR. Production-quality first try, same posture as perp-engine v0.
 
-After this lands: `pallet-mm-rebate` v0 (designed in `mm-rebate-program-design.md`) is the next pallet, and the SaturnSwap frontend rewires from Hydra to Materios — both tracked separately.
+After this lands: `pallet-mm-rebate` v0 (designed in `mm-rebate-program-design.md`) is the next pallet, and the SaturnSwap frontend rewires to Materios — both tracked separately.
